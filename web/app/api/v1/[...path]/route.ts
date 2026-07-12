@@ -136,6 +136,14 @@ function upstreamHeaders(request: NextRequest, backendToken: string): Headers {
   if (backendToken) headers.set("Authorization", `Bearer ${backendToken}`)
   headers.set("X-Forwarded-Host", request.nextUrl.host)
   headers.set("X-Forwarded-Proto", request.nextUrl.protocol.replace(":", ""))
+  // So backend rate limits are per browser, not collapsed onto 127.0.0.1.
+  const forwardedFor = request.headers.get("x-forwarded-for")
+  const clientIp = request.headers.get("x-real-ip") ?? request.ip
+  if (forwardedFor) {
+    headers.set("X-Forwarded-For", forwardedFor)
+  } else if (clientIp) {
+    headers.set("X-Forwarded-For", clientIp)
+  }
   return headers
 }
 

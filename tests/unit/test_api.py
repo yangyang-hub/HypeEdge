@@ -801,11 +801,19 @@ class TestAuthentication:
         with pytest.raises(RuntimeError, match="AUTH_TOKEN"):
             create_api(app_mock)
 
-    def test_non_loopback_rejects_missing_auth_token(self):
+    def test_mainnet_non_loopback_rejects_missing_auth_token(self):
         app_mock = _make_mock_app()
+        app_mock.settings.environment = "mainnet"
         app_mock.settings.api.host = "0.0.0.0"
-        with pytest.raises(RuntimeError, match="non-loopback"):
+        with pytest.raises(RuntimeError, match="AUTH_TOKEN"):
             create_api(app_mock)
+
+    def test_testnet_non_loopback_allows_missing_auth_token(self):
+        app_mock = _make_mock_app()
+        app_mock.settings.environment = "testnet"
+        app_mock.settings.api.host = "0.0.0.0"
+        api_app = create_api(app_mock, cors_origins=[])
+        assert api_app.state.role_tokens == ()
 
     @pytest.mark.asyncio
     async def test_empty_cors_list_disables_cors(self):

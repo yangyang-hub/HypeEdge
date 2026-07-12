@@ -20,9 +20,8 @@ pnpm install
 pnpm dev
 ```
 
-dev/testnet 保留本地数据库默认值以方便开发；mainnet 不接受这些默认凭证。实盘部署前必须阅读
-[`docs/deployment.md`](docs/deployment.md)，通过环境变量注入 Agent Wallet、Postgres、后端 API token
-和 Dashboard Basic Auth 凭证。
+dev/testnet 默认可按**纯内网、无鉴权**运行（API/Dashboard 凭证留空）；mainnet 必须注入 Agent Wallet、
+Postgres 与 admin API token。详见 [`docs/deployment.md`](docs/deployment.md)。
 
 ## 质量检查
 

@@ -23,7 +23,7 @@ from hypeedge.api.errors import (
     problem_response,
     validation_problem_handler,
 )
-from hypeedge.api.security import SlidingWindowLimiter
+from hypeedge.api.security import SlidingWindowLimiter, client_ip_for_rate_limit
 
 logger = structlog.get_logger(__name__)
 
@@ -41,15 +41,13 @@ def create_api(hype_app: Any, cors_origins: list[str] | None = None) -> FastAPI:
     environment = str(hype_app.settings.environment)
     api_settings = getattr(hype_app.settings, "api", None)
     role_tokens = configured_role_tokens(api_settings) if api_settings is not None else ()
-    configured_host = getattr(api_settings, "host", "127.0.0.1") if api_settings is not None else "127.0.0.1"
-    api_host = configured_host if isinstance(configured_host, str) else "127.0.0.1"
     admin_tokens = [token for token, role in role_tokens if role is ApiRole.ADMIN]
     if environment == "mainnet" and not any(len(token) >= 32 for token in admin_tokens):
         raise RuntimeError(
             "HYPE_API__ADMIN_TOKEN or HYPE_API__AUTH_TOKEN with at least 32 characters is required on mainnet"
         )
-    if api_host not in {"127.0.0.1", "::1", "localhost"} and not role_tokens:
-        raise RuntimeError("An API role token is required when the API listens on a non-loopback address")
+    # Intranet / home-lab (dev|testnet): tokens may be empty → /api runs as local-admin with no Bearer.
+    # mainnet always requires an admin token (check above), so an open listener is never unauthenticated.
 
     feature_settings = getattr(hype_app.settings, "features", None)
     configured_api_v1 = getattr(feature_settings, "api_v1", None)
@@ -93,7 +91,7 @@ def create_api(hype_app: Any, cors_origins: list[str] | None = None) -> FastAPI:
         request.state.actor_role = ""
         protected = request.url.path.startswith("/api")
         is_mutation = request.method not in {"GET", "HEAD", "OPTIONS"}
-        client_host = request.client.host if request.client is not None else "unknown"
+        client_host = client_ip_for_rate_limit(request)
         response: Response | None = None
         request_limit = int(getattr(api_settings, "request_rate_limit_per_minute", 600))
         if not app.state.request_limiter.allow(f"request:{client_host}", request_limit):

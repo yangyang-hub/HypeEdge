@@ -103,7 +103,7 @@ class TestSettings:
 
         assert settings.backfill.backfill_window_days == 7
         assert settings.backtest.monte_carlo_simulations == 1000
-        assert settings.api.host == "127.0.0.1"
+        assert settings.api.host == "0.0.0.0"
         assert settings.api.port == 37001
         assert settings.features.v2_trading_enabled is True
         assert settings.features.legacy_execution is False

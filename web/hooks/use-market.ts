@@ -10,17 +10,23 @@ function isLoopbackHost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1"
 }
 
-/** Resolve market WS base; only enable direct WS on loopback pages. */
+/**
+ * Resolve market WS base for the browser.
+ * Backend Origin checks use api.cors_origins; market WS is public read-only.
+ * LAN pages should set NEXT_PUBLIC_HYPEEDGE_MARKET_WS_URL=ws://<lan-ip>:37001.
+ */
 function resolveMarketWsBase(configured: string | undefined): string | undefined {
   const trimmed = configured?.replace(/\/$/, "")
   if (!trimmed || typeof window === "undefined") return undefined
   try {
-    const wsHost = new URL(trimmed).hostname
+    const wsUrl = new URL(trimmed)
+    if (wsUrl.protocol !== "ws:" && wsUrl.protocol !== "wss:") return undefined
     const pageHost = window.location.hostname
-    // HypeEdge API listens on 127.0.0.1. Opening the dashboard via a LAN IP
-    // (e.g. http://192.168.x.x:34001) must use the Next.js REST proxy instead.
-    if (!isLoopbackHost(pageHost) || !isLoopbackHost(wsHost)) {
-      return undefined
+    // Local pages prefer loopback WS to avoid hairpin NAT to the LAN IP.
+    if (isLoopbackHost(pageHost) && !isLoopbackHost(wsUrl.hostname)) {
+      // Prefer loopback WS when browsing locally to avoid hairpin NAT issues.
+      wsUrl.hostname = pageHost === "::1" ? "127.0.0.1" : pageHost
+      return wsUrl.toString().replace(/\/$/, "")
     }
     return trimmed
   } catch {

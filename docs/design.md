@@ -381,7 +381,8 @@ Postgres 关键表：
 
 - **实时推送策略**：账户/持仓/订单数据使用 SSE（Server-Sent Events）推送变更，行情数据前端直连 Hyperliquid WS（跳过后端中转以降低延迟）。低频数据（策略状态、风控面板）使用 SWR 轮询（5s 间隔）。
 - **API 响应格式**：统一 `{ "ok": true, "data": ... }` 或 `{ "ok": false, "error": "..." }`。
-- **认证**：本地部署阶段用简单 token 或 IP 白名单，不引入复杂 OAuth。
+- **认证**：纯内网 `dev`/`testnet` 默认可无鉴权（token 与 Dashboard 凭证留空）；需要时再启用分级 Bearer。
+  `mainnet` 强制 admin token。不引入复杂 OAuth。详见 `docs/deployment.md`。
 
 ---
 
@@ -472,6 +473,9 @@ Postgres 关键表：
   弱默认密码或未启用 TLS 时拒绝启动。
 - Dashboard BFF 按 viewer/operator/admin 分别使用服务端 Basic 凭据和对应 `HYPEEDGE_*_API_TOKEN`；浏览器
   不可读取后端 Bearer token。旧单用户变量仅保留 viewer 兼容权限。
+- **纯内网 lab（`dev` / `testnet`）允许不配置任何 API token 与 Dashboard Basic Auth**：HTTP `/api`
+  以本机信任身份运行；前提是进程只部署在受信私网，不得对公网开放。一旦配置任一 API token，则恢复强制 Bearer。
+  `mainnet` 始终要求 admin API token，且非回环监听时禁止无 token 启动。
 - 推荐使用主机/云 secret manager 或权限为 600 的 systemd `EnvironmentFile`；所有密钥文件必须保持在
   `.gitignore` 中。
 - **所有密钥文件纳入 `.gitignore`**，绝不提交到版本控制。
@@ -625,9 +629,11 @@ Alembic 管理，应用启动禁止 `create_all`。
 - API mutation 的成功、失败、重放与 key 冲突均写入 `api_audit`；首次命令的完成状态与审计记录在同一
   Postgres 事务提交。mainnet 不允许退回进程内幂等实现。
 - 浏览器使用 HttpOnly/Secure/SameSite session；mutation 校验 CSRF 与权限，mainnet 无认证配置时拒绝启动。
+- **部署模式**：纯内网 `dev`/`testnet` 可将全部 API token 与 Dashboard 凭证留空（无鉴权）；配置任一 token
+  后立即强制 Bearer。`mainnet` 始终要求 admin token。详见 [`deployment.md`](deployment.md)「纯内网部署」。
 - API token/session 使用三级 RBAC：`viewer` 只读，`operator` 可下单、撤单、平仓和启停策略，`admin` 才可
   触发或重置 Kill Switch。旧 `auth_token` 仅作为 admin token 的兼容入口；权限拒绝同样写入 API 审计。
-- 每个已配置的 API token 至少 32 个随机字符且互不重复。Dashboard BFF 必须按 viewer/operator/admin
+- 每个已配置的 API token 至少 32 个随机字符且互不重复。启用鉴权时，Dashboard BFF 必须按 viewer/operator/admin
   使用独立 Basic 凭据和对应后端 token；旧单用户配置仅保留 viewer 权限，不能隐式获得 admin。
 - HTTP API 对请求、mutation 和认证失败分别限速。公开行情 WebSocket 只接受允许的浏览器 Origin，设置
   全局/每 IP 连接上限、独立小队列和每连接消息速率上限，慢客户端不得放大 EventBus 内存占用。

@@ -133,11 +133,12 @@ backtest:
   monte_carlo_simulations: 1000
 
 api:
-  host: 127.0.0.1
+  # LAN dashboard / market WS for intranet lab (no auth when tokens empty; mainnet forbids this)
+  host: 0.0.0.0
   port: 37001
-  request_rate_limit_per_minute: 600
-  mutation_rate_limit_per_minute: 60
-  auth_failure_limit_per_minute: 10
+  request_rate_limit_per_minute: 6000
+  mutation_rate_limit_per_minute: 120
+  auth_failure_limit_per_minute: 120
   market_ws_max_connections: 100
   market_ws_max_connections_per_ip: 5
   market_ws_queue_size: 64

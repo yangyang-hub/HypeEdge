@@ -3,6 +3,40 @@
 生产部署遵循 fail-closed：mainnet 缺少 Agent Wallet、Postgres 或 API 凭证时，配置加载直接失败；
 敏感值不得写入 `configs/*.yaml`、systemd unit 或前端 `NEXT_PUBLIC_*` 变量。
 
+## 纯内网部署（dev / testnet，推荐默认）
+
+本仓库的个人 lab 默认按**纯内网、无鉴权**运行：
+
+| 项 | 约定 |
+|---|---|
+| 网络边界 | 仅局域网 / 受信私网；**不要**把 API 或 Dashboard 暴露到公网 |
+| `HYPE_ENV` | `dev` 或 `testnet` |
+| API 监听 | `configs/{dev,testnet}.yaml` 中 `api.host: 0.0.0.0`（可用 `HYPE_API__HOST` 覆盖） |
+| API token | **全部留空**：未配置 token 时 `/api` 以本机信任的 `local-admin` 身份运行，不校验 Bearer |
+| Dashboard | `web/.env.local` 中 Basic Auth 与 `HYPEEDGE_*_API_TOKEN` **全部留空**，页面不弹登录 |
+| 行情 WS | `NEXT_PUBLIC_HYPEEDGE_MARKET_WS_URL=ws://<主机局域网IP>:37001`；Origin 须在 `api.cors_origins` |
+| Next 代理 | `HYPEEDGE_BACKEND_URL=http://127.0.0.1:37001`（同机 loopback，不要写成局域网 IP） |
+
+约束：
+
+- **一旦配置任一 `HYPE_API__*TOKEN`，所有 `/api` 请求都必须带合法 Bearer**；此时 Dashboard 也必须配置完整的 Basic Auth 三元组，否则代理无法转发。
+- 若 `.env` 已清空 token 但后端未重启，进程仍会按旧配置要求 Bearer；Dashboard 无凭证时会先 401，随后在鉴权失败限流下变成 **429**。修改鉴权相关配置后必须重启 `hypeedge`。
+- **mainnet 不适用无鉴权模式**：必须配置 admin API token；非回环监听时同样强制 token。
+- 行情 WebSocket（`/ws/v1/market`）本身是只读公开通道，靠 `cors_origins` 与连接限速约束，与 HTTP `/api` 鉴权开关独立。
+
+最小内网启动：
+
+```bash
+# 仓库根
+set -a && source .env && set +a
+uv run alembic upgrade head
+uv run hypeedge
+
+# 另一终端
+cd web && pnpm dev
+# 浏览器打开 http://<局域网IP>:34001
+```
+
 ## mainnet 必需变量
 
 | 变量 | 用途 | 要求 |
@@ -50,8 +84,9 @@ uv run hypeedge
 
 上线前确认：
 
-- 后端 API 只绑定 loopback，或位于 TLS 反向代理/受信私网之后；
-- Dashboard 经 HTTPS 暴露，Basic Auth 凭证已配置；
+- **纯内网 lab（dev/testnet）**：API 可绑 `0.0.0.0` 且不配 token；确认防火墙/路由不会把 34001/37001 暴露到公网；
+- **mainnet**：后端 API 只绑定 loopback，或位于 TLS 反向代理/受信私网之后，且已配置 admin token；
+- Dashboard：内网无鉴权可留空凭证；若启用了 API token，则须同时配置 Dashboard Basic Auth；
 - Postgres schema 已迁移且数据库不可用时交易保持关闭；
 - testnet 门禁全部通过后才切换 `HYPE_ENV=mainnet`。
 
