@@ -15,14 +15,15 @@ const STATUS_META: Record<
 }
 
 export interface StrategyStatusChipProps {
-  state: StrategyLifecycleState | string
+  state?: StrategyLifecycleState | string | null
   className?: string
 }
 
 export function StrategyStatusChip({ state, className }: StrategyStatusChipProps) {
-  const meta = STATUS_META[state as StrategyLifecycleState] ?? {
-    label: state,
-    title: state.toUpperCase(),
+  const normalized = (state ?? "stopped").toString().toLowerCase() as StrategyLifecycleState
+  const meta = STATUS_META[normalized] ?? {
+    label: normalized || "unknown",
+    title: (normalized || "unknown").toUpperCase(),
     className: "bg-bg-active text-text-secondary",
   }
   return (

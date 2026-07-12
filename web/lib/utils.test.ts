@@ -11,8 +11,10 @@ describe("formatting helpers", () => {
     expect(formatPct(0.1234)).toBe("12.34%")
   })
 
-  it("formats timestamps as YYYY-MM-DD HH:mm:ss", () => {
-    expect(formatDateTime("2026-07-11T12:34:56Z")).toMatch(/^2026-07-11 12:34:56$/)
+  it("formats timestamps in Asia/Shanghai as YYYY-MM-DD HH:mm:ss", () => {
+    // 12:34:56Z → 20:34:56 CST (UTC+8)
+    expect(formatDateTime("2026-07-11T12:34:56Z")).toBe("2026-07-11 20:34:56")
+    expect(formatDateTime(null)).toBe("—")
   })
 
   it("preserves decimal strings beyond JavaScript safe integer precision", () => {

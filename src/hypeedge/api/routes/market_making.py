@@ -79,22 +79,48 @@ def _safe(value: Any) -> Any:  # noqa: ANN401
     return value
 
 
-def _strategy_payload(value: Any) -> Any:  # noqa: ANN401
+def _strategy_payload(value: Any, *, actual_state: str | None = None) -> Any:  # noqa: ANN401
     definition = getattr(value, "definition", None)
     if definition is None:
-        return _safe(value)
+        payload = _safe(value)
+        if isinstance(payload, dict) and "actual_state" not in payload and "status" in payload:
+            payload["actual_state"] = payload["status"]
+        return payload
+    desired = definition.desired_state.value
     return {
         "strategy_id": str(definition.strategy_id),
         "strategy_type": definition.strategy_type,
         "sub_account": str(definition.sub_account),
         "symbol": str(definition.symbol),
-        "desired_state": definition.desired_state.value,
+        "desired_state": desired,
+        "actual_state": actual_state or desired,
         "desired_config_version": definition.desired_config_revision,
+        "desired_config_version_id": definition.desired_config_revision,
+        "effective_config_version_id": None,
         "revision": definition.revision,
         "metadata": _safe(getattr(value, "metadata", {})),
         "archived_at": _safe(getattr(value, "archived_at", None)),
         "created_at": _safe(getattr(value, "created_at", None)),
         "updated_at": _safe(getattr(value, "updated_at", None)),
+    }
+
+
+def _legacy_trend_payload(legacy: Any) -> dict[str, Any]:
+    status = str(getattr(getattr(legacy, "status", None), "value", "stopped"))
+    return {
+        "strategy_id": str(legacy.strategy_id),
+        "strategy_type": "trend_follow",
+        "status": status,
+        "actual_state": status,
+        "desired_state": status if status in {"running", "shadow", "paused"} else "stopped",
+        "symbol": legacy.params.symbol,
+        "sub_account": None,
+        "desired_config_version_id": None,
+        "effective_config_version_id": None,
+        "revision": 0,
+        "archived_at": None,
+        "created_at": None,
+        "updated_at": None,
     }
 
 
@@ -150,20 +176,21 @@ async def list_strategies(app: AppDep) -> dict[str, Any]:
         legacy = getattr(app, "strategy", None)
         if legacy is None:
             return {"ok": True, "data": []}
-        return {
-            "ok": True,
-            "data": [
-                {
-                    "strategy_id": str(legacy.strategy_id),
-                    "strategy_type": "trend_follow",
-                    "status": legacy.status.value,
-                    "symbol": legacy.params.symbol,
-                    "revision": 0,
-                }
-            ],
-        }
+        return {"ok": True, "data": [_legacy_trend_payload(legacy)]}
     records = await repository.list_strategy_instances()
-    return {"ok": True, "data": [_strategy_payload(record) for record in records]}
+    payloads: list[Any] = []
+    get_runtime = getattr(repository, "get_runtime", None)
+    for record in records:
+        actual_state: str | None = None
+        if get_runtime is not None:
+            try:
+                runtime = await get_runtime(StrategyId(str(record.definition.strategy_id)))
+                actual = getattr(runtime, "actual_state", None)
+                actual_state = actual.value if isinstance(actual, Enum) else (str(actual) if actual else None)
+            except StrategyRegistrationError:
+                actual_state = None
+        payloads.append(_strategy_payload(record, actual_state=actual_state))
+    return {"ok": True, "data": payloads}
 
 
 @router.post("/strategies")
@@ -207,13 +234,23 @@ async def create_strategy(
 
 @router.get("/strategies/{strategy_id}")
 async def get_strategy(strategy_id: str, app: AppDep) -> dict[str, Any]:
+    repository = _repository(app)
     try:
-        record = await _repository(app).get_strategy_instance(StrategyId(strategy_id))
+        record = await repository.get_strategy_instance(StrategyId(strategy_id))
     except StrategyRegistrationError as exc:
         raise ApiProblem(404, "STRATEGY_NOT_FOUND", "Strategy was not found") from exc
     if record is None:
         raise ApiProblem(404, "STRATEGY_NOT_FOUND", "Strategy was not found")
-    return {"ok": True, "data": _strategy_payload(record)}
+    actual_state: str | None = None
+    get_runtime = getattr(repository, "get_runtime", None)
+    if get_runtime is not None:
+        try:
+            runtime = await get_runtime(StrategyId(strategy_id))
+            actual = getattr(runtime, "actual_state", None)
+            actual_state = actual.value if isinstance(actual, Enum) else (str(actual) if actual else None)
+        except StrategyRegistrationError:
+            actual_state = None
+    return {"ok": True, "data": _strategy_payload(record, actual_state=actual_state)}
 
 
 @router.patch("/strategies/{strategy_id}")

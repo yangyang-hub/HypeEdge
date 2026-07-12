@@ -19,7 +19,7 @@ from hypeedge.app import HypeEdgeApp
 from hypeedge.core.enums import MarketMakerLifecycle, OrderStatus, StrategyStatus
 from hypeedge.core.exceptions import ExecutionError
 from hypeedge.core.models import AccountState, Candle, FundingRate, L2BookSnapshot, L2Level, Order, Position
-from hypeedge.core.types import Cloid, Price, Size, StrategyId, Symbol, Timestamp, Usd
+from hypeedge.core.types import Cloid, Price, Size, StrategyId, SubAccount, Symbol, Timestamp, Usd
 from hypeedge.market_data.instrument_cache import InstrumentInfo
 from hypeedge.risk.checker import RiskChecker, RiskLimits
 from hypeedge.risk.kill_switch import KillSwitch
@@ -235,14 +235,25 @@ class TestMarketMakingControlPlane:
         repository = MagicMock()
         repository.list_strategy_instances = AsyncMock(
             return_value=[
-                {
-                    "strategy_id": "mm-btc-1",
-                    "strategy_type": "market_maker",
-                    "symbol": "BTC",
-                    "desired_state": "shadow",
-                    "revision": 3,
-                }
+                SimpleNamespace(
+                    definition=SimpleNamespace(
+                        strategy_id=StrategyId("mm-btc-1"),
+                        strategy_type="market_maker",
+                        sub_account=SubAccount("mm-btc-1"),
+                        symbol=Symbol("BTC"),
+                        desired_state=MarketMakerLifecycle.SHADOW,
+                        desired_config_revision=1,
+                        revision=3,
+                    ),
+                    metadata={},
+                    archived_at=None,
+                    created_at=datetime(2026, 7, 12, tzinfo=UTC),
+                    updated_at=datetime(2026, 7, 12, tzinfo=UTC),
+                )
             ]
+        )
+        repository.get_runtime = AsyncMock(
+            return_value=SimpleNamespace(actual_state=MarketMakerLifecycle.SHADOW)
         )
         app_mock.market_making_repository = repository
         api_app = create_api(app_mock)
@@ -250,7 +261,25 @@ class TestMarketMakingControlPlane:
             response = await client.get("/api/v1/strategies")
 
         assert response.status_code == 200
-        assert response.json()["data"][0]["strategy_type"] == "market_maker"
+        item = response.json()["data"][0]
+        assert item["strategy_type"] == "market_maker"
+        assert item["actual_state"] == "shadow"
+        assert item["desired_state"] == "shadow"
+
+    @pytest.mark.asyncio
+    async def test_lists_legacy_trend_strategy_with_actual_state(self):
+        app_mock = _make_mock_app()
+        app_mock.market_making_repository = None
+        api_app = create_api(app_mock)
+        async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+            response = await client.get("/api/v1/strategies")
+
+        assert response.status_code == 200
+        item = response.json()["data"][0]
+        assert item["strategy_id"] == "trend_v1"
+        assert item["strategy_type"] == "trend_follow"
+        assert item["actual_state"] == "running"
+        assert item["status"] == "running"
 
     @pytest.mark.asyncio
     async def test_lifecycle_requires_if_match_and_dispatches_to_supervisor(self):

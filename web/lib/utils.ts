@@ -5,6 +5,9 @@ import Decimal from "decimal.js"
 import { twMerge } from "tailwind-merge"
 import type { DecimalString } from "@/lib/types"
 
+/** Display timezone for all UI timestamps (storage remains UTC). */
+export const DISPLAY_TIME_ZONE = "Asia/Shanghai"
+
 export function cn(...inputs: ClassValue[]) {
   return twMerge(clsx(inputs))
 }
@@ -56,6 +59,7 @@ export function formatTime(isoString: string | null): string {
   if (!isoString) return "—"
   const d = new Date(isoString)
   return d.toLocaleString("en-US", {
+    timeZone: DISPLAY_TIME_ZONE,
     hour: "2-digit",
     minute: "2-digit",
     second: "2-digit",
@@ -67,8 +71,14 @@ export function formatDateTime(isoString: string | null): string {
   if (!isoString) return "—"
   const d = new Date(isoString)
   const parts = new Intl.DateTimeFormat("en-CA", {
-    year: "numeric", month: "2-digit", day: "2-digit",
-    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+    timeZone: DISPLAY_TIME_ZONE,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
   }).formatToParts(d)
   const get = (type: Intl.DateTimeFormatPartTypes) => parts.find((part) => part.type === type)?.value ?? ""
   return `${get("year")}-${get("month")}-${get("day")} ${get("hour")}:${get("minute")}:${get("second")}`

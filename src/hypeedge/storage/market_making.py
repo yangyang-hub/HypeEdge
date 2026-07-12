@@ -1399,6 +1399,9 @@ class PostgresMarketMakingRepository:
     async def get_strategy_instance(self, strategy_id: StrategyId) -> StrategyInstanceView:
         return await self.state_store.get_strategy_instance(strategy_id)
 
+    async def get_runtime(self, strategy_id: StrategyId) -> Any:
+        return await self.state_store.get_runtime(strategy_id)
+
     async def update_strategy_metadata(
         self,
         strategy_id: StrategyId,
