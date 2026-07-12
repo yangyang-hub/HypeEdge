@@ -16,8 +16,8 @@ import {
   ShieldAlert,
 } from "lucide-react"
 import { useState } from "react"
-import { Sidebar } from "@/components/layout/sidebar"
-import { StatusBar } from "@/components/layout/status-bar"
+import { AppShell } from "@/components/layout/app-shell"
+import { StrategyStatusChip } from "@/components/ui/strategy-status-chip"
 import {
   activateMarketMakerConfig,
   createMarketMakerConfig,
@@ -44,7 +44,7 @@ import type {
 import { cn, formatDateTime, formatPct, formatPrice, formatSize, formatUsd, pnlColor } from "@/lib/utils"
 
 const PnlChart = dynamic(() => import("@/components/market-making/pnl-chart").then((module) => module.PnlChart), {
-  loading: () => <div className="h-64 animate-pulse rounded-lg bg-zinc-800/60" aria-label="正在加载 PnL 图表" />,
+  loading: () => <div className="h-64 animate-pulse rounded-md bg-bg-active" aria-label="正在加载 PnL 图表" />,
   ssr: false,
 })
 
@@ -87,25 +87,23 @@ export function MarketMakingWorkspace({ strategyId }: MarketMakingWorkspaceProps
   }
 
   return (
-    <div className="flex h-screen">
-      <Sidebar />
-      <div className="flex min-w-0 flex-1 flex-col overflow-hidden">
-        <main id="main-content" className="flex-1 space-y-5 overflow-y-auto p-3 md:p-6">
+    <AppShell>
+        <main id="main-content" className="flex-1 space-y-5 overflow-y-auto p-3 md:p-5">
           <header className="space-y-3">
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
-                <Link href="/strategy" className="mb-2 inline-flex items-center gap-1 text-sm text-zinc-400 hover:text-white">
+                <Link href="/strategy" className="mb-2 inline-flex items-center gap-1 text-sm text-text-secondary hover:text-text-primary">
                   <ArrowLeft className="h-4 w-4" aria-hidden="true" /> 返回策略列表
                 </Link>
                 <h2 className="text-2xl font-bold tracking-tight">做市工作台 · {strategyId}</h2>
-                <p className="mt-1 text-sm text-zinc-500">
+                <p className="mt-1 text-sm text-text-tertiary">
                   REST 权威快照 · SSE 可靠事实 · WebSocket 高频数据仅用于显示
                 </p>
               </div>
               <button
                 type="button"
                 onClick={() => void snapshot.resync()}
-                className="inline-flex min-h-10 items-center gap-2 rounded-lg border border-zinc-700 px-3 text-sm hover:bg-zinc-800"
+                className="inline-flex h-8 items-center gap-2 rounded-md border border-border-strong px-3 text-sm text-text-primary hover:bg-bg-hover"
               >
                 <RefreshCw className="h-4 w-4" aria-hidden="true" /> 全量同步
               </button>
@@ -119,7 +117,7 @@ export function MarketMakingWorkspace({ strategyId }: MarketMakingWorkspaceProps
           </header>
 
           {state?.kill_switch_active ? (
-            <div className="flex items-center gap-3 rounded-xl border border-critical bg-critical/15 p-4 text-critical" role="alert">
+            <div className="flex items-center gap-3 rounded-md border border-critical bg-critical/15 p-4 text-critical" role="alert">
               <ShieldAlert className="h-6 w-6 shrink-0" aria-hidden="true" />
               <div>
                 <p className="font-bold">Kill Switch 已触发：做市不得增加风险</p>
@@ -129,12 +127,12 @@ export function MarketMakingWorkspace({ strategyId }: MarketMakingWorkspaceProps
           ) : null}
 
           {snapshot.error ? (
-            <div className="rounded-xl border border-loss bg-loss/10 p-4 text-sm text-loss" role="alert">
+            <div className="rounded-md border border-loss bg-loss/10 p-4 text-sm text-loss" role="alert">
               权威快照获取失败：{snapshot.error instanceof Error ? snapshot.error.message : "未知错误"}
             </div>
           ) : null}
 
-          <nav className="flex gap-2 overflow-x-auto border-b border-zinc-800 pb-3 text-sm" aria-label="做市工作台分区">
+          <nav className="flex gap-2 overflow-x-auto border-b border-border-default pb-3 text-sm" aria-label="做市工作台分区">
             {[
               ["overview", "Overview"],
               ["quotes", "Quotes"],
@@ -145,7 +143,7 @@ export function MarketMakingWorkspace({ strategyId }: MarketMakingWorkspaceProps
               ["config", "Config"],
               ["events", "Events"],
             ].map(([href, label]) => (
-              <a key={href} href={`#${href}`} className="whitespace-nowrap rounded-md px-2 py-1 text-zinc-400 hover:bg-zinc-800 hover:text-white">
+              <a key={href} href={`#${href}`} className="whitespace-nowrap rounded-md px-2 py-1 text-text-secondary hover:bg-bg-hover hover:text-white">
                 {label}
               </a>
             ))}
@@ -179,15 +177,13 @@ export function MarketMakingWorkspace({ strategyId }: MarketMakingWorkspaceProps
           />
           <EventsPanel events={snapshot.events} />
         </main>
-        <StatusBar />
-      </div>
-    </div>
+    </AppShell>
   )
 }
 
 function Panel({ id, title, icon, children }: { id: string; title: string; icon: React.ReactNode; children: React.ReactNode }) {
   return (
-    <section id={id} className="scroll-mt-4 rounded-xl border border-zinc-800 bg-zinc-900 p-4 md:p-5">
+    <section id={id} className="scroll-mt-4 rounded-md border border-border-default bg-bg-panel p-4 md:p-5">
       <h3 className="mb-4 flex items-center gap-2 font-semibold">
         {icon} {title}
       </h3>
@@ -198,7 +194,7 @@ function Panel({ id, title, icon, children }: { id: string; title: string; icon:
 
 function SnapshotTime({ observedAt, stale }: { observedAt: string | null; stale: boolean }) {
   return (
-    <span className={cn("text-xs", stale ? "font-semibold text-warning" : "text-zinc-500")}>
+    <span className={cn("text-xs", stale ? "font-semibold text-warning" : "text-text-tertiary")}>
       {stale ? "STALE · " : ""}更新 {formatDateTime(observedAt)}
     </span>
   )
@@ -239,11 +235,16 @@ function OverviewPanel({
 }) {
   return (
     <Panel id="overview" title="Overview" icon={<Activity className="h-4 w-4" aria-hidden="true" />}>
-      {isLoading && !state ? <div className="h-24 animate-pulse rounded-lg bg-zinc-800/60" /> : null}
+      {isLoading && !state ? <div className="h-24 animate-pulse rounded-md bg-bg-active" /> : null}
       {state ? (
         <div className="space-y-4">
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-5">
-            <Metric label="实际状态" value={state.actual_state.toUpperCase()} accent={state.actual_state === "faulted" ? "loss" : "default"} />
+            <div className="rounded-md bg-bg-elevated p-3">
+              <p className="text-xs text-text-tertiary">实际状态</p>
+              <div className="mt-1">
+                <StrategyStatusChip state={state.actual_state} />
+              </div>
+            </div>
             <Metric label="会话模式" value={state.session_mode ?? "—"} />
             <Metric label="Quote uptime" value={state.quote_uptime_pct ? formatPct(state.quote_uptime_pct) : "—"} />
             <Metric label="Runtime revision" value={String(state.runtime_revision)} />
@@ -251,8 +252,8 @@ function OverviewPanel({
           </div>
           <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-4">
             {Object.entries(state.freshness).map(([name, freshness]) => (
-              <div key={name} className="flex items-center justify-between rounded-lg bg-zinc-950/70 px-3 py-2 text-sm">
-                <span className="text-zinc-400">{name}</span>
+              <div key={name} className="flex items-center justify-between rounded-md bg-bg-elevated px-3 py-2 text-sm">
+                <span className="text-text-secondary">{name}</span>
                 <span className={cn(freshness.status === "fresh" ? "text-profit" : "text-warning")}>
                   {freshness.status} {freshness.age_ms === null ? "" : `${freshness.age_ms}ms`}
                 </span>
@@ -263,7 +264,7 @@ function OverviewPanel({
           {state.alerts.length > 0 ? (
             <div className="space-y-2">
               {state.alerts.map((alert) => (
-                <div key={alert.id} className={cn("flex gap-2 rounded-lg p-3 text-sm", alert.severity === "critical" ? "bg-loss/10 text-loss" : "bg-warning/10 text-warning")}>
+                <div key={alert.id} className={cn("flex gap-2 rounded-md p-3 text-sm", alert.severity === "critical" ? "bg-loss/10 text-loss" : "bg-warning/10 text-warning")}>
                   <AlertTriangle className="h-4 w-4 shrink-0" aria-hidden="true" /> {alert.message}
                 </div>
               ))}
@@ -278,8 +279,8 @@ function OverviewPanel({
 
 function Metric({ label, value, accent = "default" }: { label: string; value: string; accent?: "default" | "loss" }) {
   return (
-    <div className="rounded-lg bg-zinc-950/70 p-3">
-      <p className="text-xs text-zinc-500">{label}</p>
+    <div className="rounded-md bg-bg-elevated p-3">
+      <p className="text-xs text-text-tertiary">{label}</p>
       <p className={cn("mt-1 font-mono text-lg font-semibold", accent === "loss" && "text-loss")}>{value}</p>
     </div>
   )
@@ -301,7 +302,7 @@ function LifecycleControls({
   onAction: (action: (typeof LIFECYCLE_ACTIONS)[number]) => void
 }) {
   return (
-    <section className="rounded-xl border border-zinc-800 bg-zinc-900 p-4">
+    <section className="rounded-md border border-border-default bg-bg-panel p-4">
       <div className="flex flex-wrap gap-2">
         {LIFECYCLE_ACTIONS.map((action) => (
           <button
@@ -310,8 +311,8 @@ function LifecycleControls({
             disabled={!state || state.kill_switch_active && action !== "stop"}
             onClick={() => onAction(action)}
             className={cn(
-              "rounded-lg border border-zinc-700 px-3 py-2 text-sm uppercase hover:bg-zinc-800 disabled:cursor-not-allowed disabled:opacity-40",
-              action === "stop" || action === "drain" ? "text-warning" : "text-zinc-200",
+              "rounded-md border border-border-strong px-3 py-2 text-sm uppercase hover:bg-bg-hover disabled:cursor-not-allowed disabled:opacity-40",
+              action === "stop" || action === "drain" ? "text-warning" : "text-text-primary",
             )}
           >
             {action}
@@ -319,7 +320,7 @@ function LifecycleControls({
         ))}
       </div>
       {pendingAction && state?.environment === "mainnet" ? (
-        <div className="mt-3 rounded-lg border border-warning bg-warning/10 p-3">
+        <div className="mt-3 rounded-md border border-warning bg-warning/10 p-3">
           <label className="block text-sm text-warning" htmlFor="lifecycle-confirmation">
             MAINNET 二阶段确认：输入 CONFIRM MAINNET {pendingAction.toUpperCase()}
           </label>
@@ -328,9 +329,9 @@ function LifecycleControls({
               id="lifecycle-confirmation"
               value={confirmation}
               onChange={(event) => onConfirmationChange(event.target.value)}
-              className="min-w-72 rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-sm"
+              className="min-w-72 rounded-md border border-border-strong bg-bg-elevated px-3 py-2 font-mono text-sm"
             />
-            <button type="button" onClick={() => onAction(pendingAction)} className="rounded-md bg-warning px-3 py-2 text-sm font-bold text-zinc-950">
+            <button type="button" onClick={() => onAction(pendingAction)} className="rounded-md bg-warning px-3 py-2 text-sm font-bold text-bg-base">
               确认执行
             </button>
           </div>
@@ -359,7 +360,7 @@ function QuotesPanel({ snapshot, overlay }: { snapshot?: MarketMakingQuotesSnaps
           <ExternalReferenceDetails reference={externalReference} />
           <div className="overflow-x-auto">
             <table className="w-full min-w-[780px] text-left text-sm">
-              <thead className="text-xs uppercase text-zinc-500">
+              <thead className="text-xs uppercase text-text-tertiary">
                 <tr><th className="p-2">Side</th><th>State</th><th>Desired</th><th>Live / Remaining</th><th>Edge</th><th>Revision</th><th>Age</th></tr>
               </thead>
               <tbody>
@@ -377,18 +378,18 @@ function QuotesPanel({ snapshot, overlay }: { snapshot?: MarketMakingQuotesSnaps
 function ExternalReferenceSummary({ reference }: { reference?: ExternalReferenceSnapshot | null }) {
   if (!reference) {
     return (
-      <div className="rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-sm text-zinc-500">
+      <div className="rounded-md border border-border-default bg-bg-elevated px-3 py-2 text-sm text-text-tertiary">
         External reference 未启用 · Hyperliquid 本地盘口为公平价主锚
       </div>
     )
   }
   return (
-    <div className="flex flex-wrap items-center gap-3 rounded-lg border border-zinc-800 bg-zinc-950/70 px-3 py-2 text-sm">
+    <div className="flex flex-wrap items-center gap-3 rounded-md border border-border-default bg-bg-elevated px-3 py-2 text-sm">
       <span className="font-medium">External · {reference.source ?? "unknown"}</span>
       <ExternalQualityBadge quality={reference.quality ?? "disabled"} />
-      <span className="text-zinc-400">age {formatAge(reference.age_ms)}</span>
-      <span className="text-zinc-400">weight {formatNullablePct(reference.effective_weight)}</span>
-      <span className="text-xs text-zinc-500">Reference only · HL local anchor</span>
+      <span className="text-text-secondary">age {formatAge(reference.age_ms)}</span>
+      <span className="text-text-secondary">weight {formatNullablePct(reference.effective_weight)}</span>
+      <span className="text-xs text-text-tertiary">Reference only · HL local anchor</span>
     </div>
   )
 }
@@ -396,7 +397,7 @@ function ExternalReferenceSummary({ reference }: { reference?: ExternalReference
 function ExternalReferenceDetails({ reference }: { reference?: ExternalReferenceSnapshot | null }) {
   if (!reference) return null
   return (
-    <div className="space-y-3 rounded-lg border border-zinc-800 bg-zinc-950/70 p-3">
+    <div className="space-y-3 rounded-md border border-border-default bg-bg-elevated p-3">
       <div className="flex flex-wrap items-center justify-between gap-2">
         <div className="flex items-center gap-2">
           <span className="font-medium">
@@ -404,7 +405,7 @@ function ExternalReferenceDetails({ reference }: { reference?: ExternalReference
           </span>
           <ExternalQualityBadge quality={reference.quality ?? "disabled"} />
         </div>
-        <span className="text-xs text-zinc-500">Reference only · Hyperliquid local book remains the anchor</span>
+        <span className="text-xs text-text-tertiary">Reference only · Hyperliquid local book remains the anchor</span>
       </div>
       <div className="grid grid-cols-2 gap-3 lg:grid-cols-4 xl:grid-cols-8">
         <Metric label="Raw price" value={formatNullablePrice(reference.raw_price ?? null)} />
@@ -429,7 +430,7 @@ function ExternalQualityBadge({ quality }: { quality: ExternalReferenceQuality }
         quality === "healthy"
           ? "bg-profit/15 text-profit"
           : quality === "disabled"
-            ? "bg-zinc-800 text-zinc-400"
+            ? "bg-bg-active text-text-secondary"
             : "bg-warning/15 text-warning",
       )}
     >
@@ -453,7 +454,7 @@ function formatNullablePct(value: DecimalString | null | undefined): string {
 function QuoteSlotRow({ slot }: { slot: QuoteSlotSnapshot }) {
   const unknown = slot.state === "unknown" || slot.state === "orphaned_live" || slot.state === "recovery_required"
   return (
-    <tr className="border-t border-zinc-800 font-mono">
+    <tr className="border-t border-border-default font-mono">
       <td className={cn("p-2 font-semibold", slot.side === "buy" ? "text-profit" : "text-loss")}>{slot.side.toUpperCase()} L{slot.level}</td>
       <td className={cn(unknown && "text-warning")}>{slot.state.toUpperCase()}</td>
       <td>{formatQuote(slot.desired_price, slot.desired_size)}</td>
@@ -473,11 +474,11 @@ function InventoryPanel({ snapshot, overlay }: { snapshot?: MarketMakingInventor
     <Panel id="inventory" title="Inventory & Skew" icon={<Gauge className="h-4 w-4" aria-hidden="true" />}>
       <div className="space-y-4">
         <div>
-          <div className="mb-2 flex justify-between text-xs text-zinc-500"><span>库存带使用率</span><span>{formatPct(utilization)}</span></div>
-          <div className="h-3 overflow-hidden rounded-full bg-zinc-800">
+          <div className="mb-2 flex justify-between text-xs text-text-tertiary"><span>库存带使用率</span><span>{formatPct(utilization)}</span></div>
+          <div className="h-3 overflow-hidden rounded-full bg-bg-active">
             <div className={cn("h-full", snapshot.reduction_mode === "emergency" ? "bg-loss" : snapshot.reduction_mode === "hard" ? "bg-warning" : "bg-profit")} style={{ width: `${clampedPercent(utilization)}%` }} />
           </div>
-          <div className="mt-1 flex justify-between text-xs text-zinc-600"><span>Soft {formatUsd(snapshot.soft_limit_notional)}</span><span>Hard {formatUsd(snapshot.hard_limit_notional)}</span><span>Emergency {formatUsd(snapshot.emergency_limit_notional)}</span></div>
+          <div className="mt-1 flex justify-between text-xs text-text-tertiary"><span>Soft {formatUsd(snapshot.soft_limit_notional)}</span><span>Hard {formatUsd(snapshot.hard_limit_notional)}</span><span>Emergency {formatUsd(snapshot.emergency_limit_notional)}</span></div>
         </div>
         <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
           <Metric label="Position" value={formatSize(overlay?.position_size ?? snapshot.position_size)} />
@@ -501,7 +502,7 @@ function AccountingPanel({ snapshot }: { snapshot?: MarketMakingPerformanceSnaps
     <Panel id="accounting" title="Accounting PnL" icon={<CircleDollarSign className="h-4 w-4" aria-hidden="true" />}>
       {accounting ? (
         <div className="space-y-4">
-          <p className="rounded-lg bg-zinc-950/70 p-3 text-xs text-zinc-400">
+          <p className="rounded-md bg-bg-elevated p-3 text-xs text-text-secondary">
             权威口径来自 Postgres ledger。Markout 不计入 Accounting Net PnL，避免重复计算。
           </p>
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
@@ -513,8 +514,8 @@ function AccountingPanel({ snapshot }: { snapshot?: MarketMakingPerformanceSnaps
               ["Paid actions", new Decimal(accounting.paid_action_cost).neg().toFixed() as DecimalString],
               ["Accounting net", accounting.accounting_net_pnl],
             ].map(([label, value]) => (
-              <div key={label} className="rounded-lg bg-zinc-950/70 p-3">
-                <p className="text-xs text-zinc-500">{label}</p>
+              <div key={label} className="rounded-md bg-bg-elevated p-3">
+                <p className="text-xs text-text-tertiary">{label}</p>
                 <p className={cn("mt-1 font-mono text-lg font-semibold", pnlColor(value))}>{formatUsd(value)}</p>
               </div>
             ))}
@@ -536,7 +537,7 @@ function ExecutionQualityPanel({ snapshot }: { snapshot?: MarketMakingPerformanc
     <Panel id="quality" title="Execution Quality / Markout" icon={<DatabaseZap className="h-4 w-4" aria-hidden="true" />}>
       {quality ? (
         <div className="space-y-4">
-          <p className="text-xs text-zinc-500">ClickHouse 分析口径，仅用于执行质量诊断，不是会计账本。</p>
+          <p className="text-xs text-text-tertiary">ClickHouse 分析口径，仅用于执行质量诊断，不是会计账本。</p>
           <div className="grid grid-cols-2 gap-3 lg:grid-cols-4">
             <Metric label="Quoted spread" value={`${formatPrice(quality.quoted_spread_bps, 2)} bps`} />
             <Metric label="Captured spread" value={`${formatPrice(quality.captured_spread_bps, 2)} bps`} />
@@ -692,25 +693,25 @@ function ConfigEditor({
     <div className="space-y-5">
       <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
         {decimalFields.map(([key, label]) => (
-          <label key={key} className="text-xs text-zinc-400">{label}
-            <input value={String(draft[key])} onChange={(event) => setDecimal(key, event.target.value)} inputMode="decimal" className="mt-1 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-sm text-white" />
+          <label key={key} className="text-xs text-text-secondary">{label}
+            <input value={String(draft[key])} onChange={(event) => setDecimal(key, event.target.value)} inputMode="decimal" className="mt-1 w-full rounded-md border border-border-strong bg-bg-elevated px-3 py-2 font-mono text-sm text-white" />
           </label>
         ))}
         {integerFields.map(([key, label]) => (
-          <label key={key} className="text-xs text-zinc-400">{label}
-            <input value={String(draft[key])} onChange={(event) => setInteger(key, event.target.value)} inputMode="numeric" className="mt-1 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-sm text-white" />
+          <label key={key} className="text-xs text-text-secondary">{label}
+            <input value={String(draft[key])} onChange={(event) => setInteger(key, event.target.value)} inputMode="numeric" className="mt-1 w-full rounded-md border border-border-strong bg-bg-elevated px-3 py-2 font-mono text-sm text-white" />
           </label>
         ))}
       </div>
-      <button type="button" onClick={() => void submit("create")} className="rounded-md border border-zinc-700 px-3 py-2 text-sm hover:bg-zinc-800">保存为不可变新版本</button>
+      <button type="button" onClick={() => void submit("create")} className="rounded-md border border-border-strong px-3 py-2 text-sm hover:bg-bg-hover">保存为不可变新版本</button>
 
-      <div className="grid gap-4 border-t border-zinc-800 pt-4 lg:grid-cols-2">
+      <div className="grid gap-4 border-t border-border-default pt-4 lg:grid-cols-2">
         <div>
-          <label className="text-xs text-zinc-400" htmlFor="config-version">比较 / 操作版本</label>
-          <select id="config-version" value={selectedVersion} onChange={(event) => setSelectedVersion(Number(event.target.value))} className="mt-1 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 text-sm">
+          <label className="text-xs text-text-secondary" htmlFor="config-version">比较 / 操作版本</label>
+          <select id="config-version" value={selectedVersion} onChange={(event) => setSelectedVersion(Number(event.target.value))} className="mt-1 w-full rounded-md border border-border-strong bg-bg-elevated px-3 py-2 text-sm">
             {versions.map((version) => <option key={version.id} value={version.version}>v{version.version} · {version.config_hash.slice(0, 10)} · {version.approved_by ? "已审批" : "未审批"}</option>)}
           </select>
-          <div className="mt-3 max-h-64 overflow-auto rounded-lg bg-zinc-950/70 p-3 text-xs">
+          <div className="mt-3 max-h-64 overflow-auto rounded-md bg-bg-elevated p-3 text-xs">
             {Object.keys(current.config).map((key) => {
               const typedKey = key as keyof MarketMakerConfig
               const before = String(current.config[typedKey])
@@ -730,14 +731,14 @@ function ConfigEditor({
               {selected.shadow_preview.warnings.map((warning) => <p key={warning} className="col-span-2 text-warning">⚠ {warning}</p>)}
             </div>
           ) : <p className="text-sm text-warning">尚无 shadow preview，不应激活增加风险的配置。</p>}
-          <label className="block text-xs text-zinc-400">确认文字
-            <input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} placeholder={environment === "mainnet" ? "CONFIRM MAINNET CONFIG" : "CONFIRM"} className="mt-1 w-full rounded-md border border-zinc-700 bg-zinc-950 px-3 py-2 font-mono text-sm text-white" />
+          <label className="block text-xs text-text-secondary">确认文字
+            <input value={confirmation} onChange={(event) => setConfirmation(event.target.value)} placeholder={environment === "mainnet" ? "CONFIRM MAINNET CONFIG" : "CONFIRM"} className="mt-1 w-full rounded-md border border-border-strong bg-bg-elevated px-3 py-2 font-mono text-sm text-white" />
           </label>
           <div className="flex gap-2">
             <button type="button" disabled={!selected.approved_by || !selected.shadow_preview} onClick={() => void submit("activate")} className="rounded-md bg-profit/15 px-3 py-2 text-sm text-profit disabled:opacity-40">激活</button>
             <button type="button" onClick={() => void submit("rollback")} className="rounded-md bg-warning/15 px-3 py-2 text-sm text-warning">回滚到此版本</button>
           </div>
-          {message ? <p className="text-sm text-zinc-300">{message}</p> : null}
+          {message ? <p className="text-sm text-text-secondary">{message}</p> : null}
         </div>
       </div>
     </div>
@@ -749,11 +750,11 @@ function EventsPanel({ events }: { events: MarketMakingEvent[] }) {
     <Panel id="events" title="Events" icon={<AlertTriangle className="h-4 w-4" aria-hidden="true" />}>
       <div className="max-h-[36rem] space-y-1 overflow-auto">
         {events.length === 0 ? <EmptyState label="暂无可靠事件" /> : events.map((event) => (
-          <article key={event.id} className="[contain-intrinsic-size:0_64px] [content-visibility:auto] grid gap-1 border-b border-zinc-800 px-2 py-3 text-sm md:grid-cols-[10rem_8rem_1fr_auto]">
-            <time className="font-mono text-xs text-zinc-500">{formatDateTime(event.created_at)}</time>
-            <span className={cn("text-xs uppercase", event.severity === "critical" ? "text-loss" : event.severity === "warning" ? "text-warning" : "text-zinc-400")}>{event.category}</span>
+          <article key={event.id} className="[contain-intrinsic-size:0_64px] [content-visibility:auto] grid gap-1 border-b border-border-default px-2 py-3 text-sm md:grid-cols-[10rem_8rem_1fr_auto]">
+            <time className="font-mono text-xs text-text-tertiary">{formatDateTime(event.created_at)}</time>
+            <span className={cn("text-xs uppercase", event.severity === "critical" ? "text-loss" : event.severity === "warning" ? "text-warning" : "text-text-secondary")}>{event.category}</span>
             <span>{event.message}</span>
-            <span className="text-xs text-zinc-600">{event.actor ?? "system"}</span>
+            <span className="text-xs text-text-tertiary">{event.actor ?? "system"}</span>
           </article>
         ))}
       </div>
@@ -762,7 +763,7 @@ function EventsPanel({ events }: { events: MarketMakingEvent[] }) {
 }
 
 function EmptyState({ label }: { label: string }) {
-  return <div className="grid min-h-24 place-items-center rounded-lg bg-zinc-950/50 text-sm text-zinc-500">{label}</div>
+  return <div className="grid min-h-24 place-items-center rounded-md bg-bg-elevated/50 text-sm text-text-tertiary">{label}</div>
 }
 
 function formatNullablePrice(value: DecimalString | null | undefined) {

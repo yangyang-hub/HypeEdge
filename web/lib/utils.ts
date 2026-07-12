@@ -78,7 +78,7 @@ export function pnlColor(value: DecimalValue): string {
   const decimal = new Decimal(value)
   if (decimal.isPositive()) return "text-profit"
   if (decimal.isNegative()) return "text-loss"
-  return "text-muted-foreground"
+  return "text-text-tertiary"
 }
 
 export function pnlBg(value: DecimalValue): string {

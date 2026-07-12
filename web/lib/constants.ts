@@ -20,15 +20,15 @@ export const ORDER_STATUS_LABELS: Record<string, string> = {
 }
 
 export const ORDER_STATUS_COLORS: Record<string, string> = {
-  pending: "text-muted-foreground",
-  submitted: "text-blue-400",
+  pending: "text-text-tertiary",
+  submitted: "text-info",
   submit_unknown: "text-warning",
-  acknowledged: "text-blue-400",
+  acknowledged: "text-info",
   partial_fill: "text-warning",
   cancel_pending: "text-warning",
   cancel_unknown: "text-warning",
   filled: "text-profit",
-  cancelled: "text-muted-foreground",
+  cancelled: "text-text-tertiary",
   rejected: "text-loss",
-  expired: "text-muted-foreground",
+  expired: "text-text-tertiary",
 }

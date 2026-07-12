@@ -7,8 +7,9 @@ const useRealtimeMock = vi.fn()
 
 vi.mock("next/dynamic", () => ({ default: () => () => <div data-testid="pnl-chart" /> }))
 vi.mock("next/link", () => ({ default: ({ children, href }: { children: React.ReactNode; href: string }) => <a href={href}>{children}</a> }))
-vi.mock("@/components/layout/sidebar", () => ({ Sidebar: () => <aside /> }))
-vi.mock("@/components/layout/status-bar", () => ({ StatusBar: () => <footer /> }))
+vi.mock("@/components/layout/app-shell", () => ({
+  AppShell: ({ children }: { children: React.ReactNode }) => <div data-testid="app-shell">{children}</div>,
+}))
 vi.mock("@/hooks/use-market-making", () => ({
   useMarketMaking: (...args: unknown[]) => useMarketMakingMock(...args),
   runStrategyAction: vi.fn(),

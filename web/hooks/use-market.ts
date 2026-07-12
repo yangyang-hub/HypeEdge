@@ -10,16 +10,16 @@ function isLoopbackHost(hostname: string): boolean {
   return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1"
 }
 
-/** Resolve market WS base; skip loopback WS when the page is opened via LAN IP. */
+/** Resolve market WS base; only enable direct WS on loopback pages. */
 function resolveMarketWsBase(configured: string | undefined): string | undefined {
   const trimmed = configured?.replace(/\/$/, "")
-  if (!trimmed || typeof window === "undefined") return trimmed
+  if (!trimmed || typeof window === "undefined") return undefined
   try {
     const wsHost = new URL(trimmed).hostname
     const pageHost = window.location.hostname
-    if (isLoopbackHost(wsHost) && !isLoopbackHost(pageHost)) {
-      // Backend listens on 127.0.0.1 and CORS only allows localhost origins.
-      // A page at http://192.168.x.x cannot use ws://127.0.0.1 usefully.
+    // HypeEdge API listens on 127.0.0.1. Opening the dashboard via a LAN IP
+    // (e.g. http://192.168.x.x:34001) must use the Next.js REST proxy instead.
+    if (!isLoopbackHost(pageHost) || !isLoopbackHost(wsHost)) {
       return undefined
     }
     return trimmed

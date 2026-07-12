@@ -203,8 +203,16 @@ def upgrade() -> None:
         postgresql_using="created_at AT TIME ZONE 'UTC'",
         nullable=False,
     )
+    # PostgreSQL cannot cast INTEGER→BOOLEAN while a default expression remains.
+    op.execute(sa.text("ALTER TABLE fills ALTER COLUMN is_maker DROP DEFAULT"))
     op.alter_column(
-        "fills", "is_maker", existing_type=sa.Integer(), type_=sa.Boolean(), postgresql_using="is_maker <> 0"
+        "fills",
+        "is_maker",
+        existing_type=sa.Integer(),
+        type_=sa.Boolean(),
+        postgresql_using="is_maker <> 0",
+        server_default=sa.false(),
+        existing_nullable=True,
     )
     op.alter_column("fills", "id", existing_type=sa.Integer(), type_=sa.BigInteger())
     op.create_unique_constraint("uq_fills_fill_id", "fills", ["fill_id"])

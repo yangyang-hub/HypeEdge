@@ -67,6 +67,26 @@ async def get_account(tracker: TrackerDep, app: AppDep) -> dict[str, Any]:
 
     state = tracker.get_account_state()
     if state is None:
+        # Trading disabled / not yet reconciled: keep the dashboard quiet with zeros.
+        if not app.trading_enabled:
+            return {
+                "ok": True,
+                "data": AccountData(
+                    equity=Decimal("0"),
+                    available_balance=Decimal("0"),
+                    total_margin_used=Decimal("0"),
+                    total_unrealized_pnl=Decimal("0"),
+                    peak_equity=Decimal("0"),
+                    drawdown_pct=Decimal("0"),
+                    leverage=Decimal("0"),
+                    total_fees=Decimal("0"),
+                    total_funding=Decimal("0"),
+                    fill_count=0,
+                    position_count=0,
+                    last_update=None,
+                    trading_enabled=False,
+                ).model_dump(mode="json"),
+            }
         from hypeedge.api.errors import ApiProblem
 
         raise ApiProblem(

@@ -19,11 +19,11 @@ export interface CandlestickChartProps {
   priceDecimals?: number
 }
 
-const PROFIT = "#22c55e"
-const LOSS = "#ef4444"
-const GRID = "#27272a"
-const TEXT = "#a1a1aa"
-const CROSSHAIR = "#52525b"
+const PROFIT = "#2DD4A0"
+const LOSS = "#F07178"
+const GRID = "#1A1F28"
+const TEXT = "#6B7380"
+const CROSSHAIR = "#343B49"
 
 interface ChartPoint {
   time: UTCTimestamp
@@ -105,7 +105,7 @@ export function CandlestickChart({ candles, priceDecimals = 2 }: CandlestickChar
         background: { type: ColorType.Solid, color: "transparent" },
         textColor: TEXT,
         fontSize: 11,
-        fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace",
+        fontFamily: "var(--font-ibm-plex-mono), ui-monospace, monospace",
       },
       grid: {
         vertLines: { color: GRID },
@@ -191,7 +191,7 @@ export function CandlestickChart({ candles, priceDecimals = 2 }: CandlestickChar
   return (
     <div className="relative h-80 w-full">
       {candles.length === 0 && (
-        <div className="absolute inset-0 z-10 flex items-center justify-center text-sm text-zinc-500">
+        <div className="absolute inset-0 z-10 flex items-center justify-center text-sm text-text-tertiary">
           K 线数据尚未就绪
         </div>
       )}

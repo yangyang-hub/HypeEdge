@@ -343,6 +343,18 @@ class TestAccountAPI:
         assert data["data"]["position_count"] == 0
 
     @pytest.mark.asyncio
+    async def test_get_account_without_state_while_trading_disabled(self) -> None:
+        app_mock = _make_mock_app()
+        app_mock.projection_reader = None
+        app_mock.trading_enabled = False
+        app_mock.account_tracker.get_account_state.return_value = None
+        api_app = create_api(app_mock)
+        async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+            resp = await client.get("/api/v1/account")
+        assert resp.status_code == 200
+        assert resp.json()["data"]["equity"] == "0"
+
+    @pytest.mark.asyncio
     async def test_get_equity_curve(self, api_client):
         async with api_client as client:
             resp = await client.get("/api/v1/account/equity-curve")

@@ -1,114 +1,148 @@
 "use client"
 
-import { Sidebar } from "@/components/layout/sidebar"
-import { StatusBar } from "@/components/layout/status-bar"
+import Link from "next/link"
+import { AppShell } from "@/components/layout/app-shell"
+import { PageHeader } from "@/components/layout/page-header"
+import { EmptyState, Metric, Panel, PnLText, ProgressBar, SideTag, StaleBanner } from "@/components/ui/data-display"
+import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { useAccount } from "@/hooks/use-account"
 import { usePositions } from "@/hooks/use-positions"
 import { useRiskStatus } from "@/hooks/use-risk"
 import { useInstrumentMeta } from "@/hooks/use-system-status"
 import type { Position } from "@/lib/types"
-import { decimalToNumber, formatPct, formatPrice, formatSize, formatUsd, pnlColor } from "@/lib/utils"
-
-function MetricCard({ label, value, sub }: { label: string; value: string; sub?: string }) {
-  return (
-    <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
-      <div className="text-xs text-zinc-500 mb-1">{label}</div>
-      <div className="text-xl font-bold font-mono">{value}</div>
-      {sub && <div className="text-xs text-zinc-500 mt-1">{sub}</div>}
-    </div>
-  )
-}
+import { decimalToNumber, formatPct, formatPrice, formatSize, formatUsd } from "@/lib/utils"
 
 export default function DashboardPage() {
-  const { account } = useAccount()
-  const { positions } = usePositions()
+  const { account, error: accountError } = useAccount()
+  const { positions, error: positionsError } = usePositions()
   const { risk } = useRiskStatus()
 
   return (
-    <div className="flex h-screen">
-      <Sidebar />
-      <div className="flex-1 flex flex-col overflow-hidden">
-        <main id="main-content" className="flex-1 overflow-y-auto p-3 space-y-6 md:p-6">
-          <h2 className="text-2xl font-bold">账户总览</h2>
+    <AppShell>
+      <main id="main-content" className="flex-1 space-y-5 overflow-y-auto p-3 md:p-5">
+        <PageHeader
+          title="账户总览"
+          subtitle={account?.last_update ? `最后更新 ${account.last_update}` : "等待账户数据"}
+        />
 
-          {/* Metric Cards */}
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
-            <MetricCard label="总权益" value={account ? formatUsd(account.equity) : "—"} sub={account ? `${formatPct(account.drawdown_pct)} 回撤` : undefined} />
-            <MetricCard label="未实现PnL" value={account ? formatUsd(account.total_unrealized_pnl) : "—"} />
-            <MetricCard label="杠杆" value={account ? `${formatPrice(account.leverage, 1)}x` : "—"} />
-            <MetricCard label="总费用" value={account ? formatUsd(account.total_fees) : "—"} />
-            <MetricCard label="成交笔数" value={account ? `${account.fill_count}` : "—"} />
+        {accountError || positionsError ? (
+          <StaleBanner message="部分数据刷新失败，正在显示最后一次成功结果" />
+        ) : null}
+
+        <Panel className="px-3 sm:px-0">
+          <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-5">
+            <Metric
+              label="总权益"
+              value={account ? formatUsd(account.equity) : "—"}
+              delta={account ? `${formatPct(account.drawdown_pct)} 回撤` : undefined}
+            />
+            <Metric label="可用余额" value={account ? formatUsd(account.available_balance) : "—"} />
+            <Metric label="持仓保证金" value={account ? formatUsd(account.total_margin_used) : "—"} />
+            <div className="border-b border-border-subtle py-3 sm:border-b-0 sm:border-r sm:px-4">
+              <div className="text-2xs uppercase tracking-wider text-text-tertiary">未实现 PnL</div>
+              <div className="mt-1 text-xl font-semibold">
+                {account ? <PnLText value={account.total_unrealized_pnl} /> : "—"}
+              </div>
+            </div>
+            <Metric
+              label="杠杆"
+              value={account ? `${formatPrice(account.leverage, 1)}x` : "—"}
+              delta={account ? `${account.fill_count} 笔成交` : undefined}
+            />
           </div>
+        </Panel>
 
-          {/* Positions Table */}
-          <div className="overflow-x-auto bg-zinc-900 border border-zinc-800 rounded-xl">
-            <div className="px-4 py-3 border-b border-zinc-800 font-medium">活跃持仓</div>
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="text-zinc-500 text-left border-b border-zinc-800">
-                  <th className="px-4 py-2">币种</th>
-                  <th className="px-4 py-2">方向</th>
-                  <th className="px-4 py-2 text-right">数量</th>
-                  <th className="px-4 py-2 text-right">入场价</th>
-                  <th className="px-4 py-2 text-right">现价</th>
-                  <th className="px-4 py-2 text-right">未实现PnL</th>
-                </tr>
-              </thead>
-              <tbody>
+        <div className="grid gap-4 xl:grid-cols-[minmax(0,1fr)_320px]">
+          <Panel title={`活跃持仓 (${positions.length})`}>
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead>币种</TableHead>
+                  <TableHead>方向</TableHead>
+                  <TableHead className="text-right">数量</TableHead>
+                  <TableHead className="text-right">入场价</TableHead>
+                  <TableHead className="text-right">现价</TableHead>
+                  <TableHead className="text-right">未实现 PnL</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {positions.length === 0 ? (
-                  <tr><td colSpan={6} className="px-4 py-8 text-center text-zinc-600">无持仓</td></tr>
+                  <TableRow className="hover:bg-transparent">
+                    <TableCell colSpan={6} className="p-0">
+                      <EmptyState
+                        message="暂无持仓。策略启动后将显示在这里。"
+                        action={
+                          <Link href="/strategy" className="text-xs text-accent hover:underline">
+                            去策略
+                          </Link>
+                        }
+                      />
+                    </TableCell>
+                  </TableRow>
                 ) : (
                   positions.map((position) => <DashboardPositionRow key={position.symbol} position={position} />)
                 )}
-              </tbody>
-            </table>
-          </div>
+              </TableBody>
+            </Table>
+          </Panel>
 
-          {/* Risk Summary */}
-          {risk && (
-            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-4">
-              <div className="flex items-center justify-between mb-3">
-                <span className="font-medium">风控状态</span>
-                <span className={`text-sm px-2 py-0.5 rounded ${risk.kill_switch_active ? "bg-loss/20 text-loss" : "bg-profit/20 text-profit"}`}>
-                  {risk.kill_switch_active ? "🚨 已触发" : "✅ 正常"}
-                </span>
-              </div>
-              <div className="space-y-2">
-                {risk.limits.map((l) => {
-                  const used = decimalToNumber(l.pct_used)
-                  return <div key={l.name} className="flex items-center gap-3">
-                    <span className="text-sm text-zinc-400 w-24">{l.name}</span>
-                    <div className="flex-1 h-2 bg-zinc-800 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full rounded-full ${used > 0.8 ? "bg-loss" : used > 0.6 ? "bg-warning" : "bg-profit"}`}
-                        style={{ width: `${Math.min(used * 100, 100)}%` }}
-                      />
-                    </div>
-                    <span className="text-xs text-zinc-500 w-20 text-right">
-                      {l.unit === "%" ? formatPct(l.current) : `${formatPrice(l.current, 1)} ${l.unit}`} / {l.unit === "%" ? formatPct(l.limit) : formatPrice(l.limit, 1)}
+          <div className="space-y-4">
+            {risk ? (
+              <Panel title="风控限额">
+                <div className="space-y-3 p-3">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-text-secondary">Kill Switch</span>
+                    <span className={risk.kill_switch_active ? "text-critical" : "text-profit"}>
+                      {risk.kill_switch_active ? "已触发" : "正常"}
                     </span>
                   </div>
-                })}
-              </div>
-            </div>
-          )}
-        </main>
-        <StatusBar />
-      </div>
-    </div>
+                  {risk.limits.map((limit) => {
+                    const used = decimalToNumber(limit.pct_used)
+                    return (
+                      <div key={limit.name} className="space-y-1">
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-text-secondary">{limit.name}</span>
+                          <span className="font-mono text-text-tertiary">
+                            {limit.unit === "%"
+                              ? `${formatPct(limit.current)} / ${formatPct(limit.limit)}`
+                              : `${formatPrice(limit.current, 1)} / ${formatPrice(limit.limit, 1)} ${limit.unit}`}
+                          </span>
+                        </div>
+                        <ProgressBar value={used} />
+                      </div>
+                    )
+                  })}
+                  <Link href="/risk" className="inline-block text-xs text-accent hover:underline">
+                    打开风控面板
+                  </Link>
+                </div>
+              </Panel>
+            ) : null}
+          </div>
+        </div>
+      </main>
+    </AppShell>
   )
 }
 
 function DashboardPositionRow({ position: p }: { position: Position }) {
   const { meta } = useInstrumentMeta(p.symbol)
   return (
-    <tr className="border-b border-zinc-800/50 hover:bg-zinc-800/30">
-      <td className="px-4 py-2 font-medium">{p.symbol}</td>
-      <td className="px-4 py-2"><span className={p.side === "long" ? "text-profit" : "text-loss"}>{p.side === "long" ? "🟢 多" : "🔴 空"}</span></td>
-      <td className="px-4 py-2 text-right font-mono">{formatSize(p.size, meta?.size_decimals ?? 6)}</td>
-      <td className="px-4 py-2 text-right font-mono">{p.entry_price === null ? "—" : formatPrice(p.entry_price, meta?.price_decimals ?? 6)}</td>
-      <td className="px-4 py-2 text-right font-mono">{p.mark_price === null ? "—" : formatPrice(p.mark_price, meta?.price_decimals ?? 6)}</td>
-      <td className={`px-4 py-2 text-right font-mono ${pnlColor(p.unrealized_pnl)}`}>{formatUsd(p.unrealized_pnl)}</td>
-    </tr>
+    <TableRow>
+      <TableCell className="font-medium">{p.symbol}</TableCell>
+      <TableCell>
+        <SideTag side={p.side} />
+      </TableCell>
+      <TableCell className="text-right font-mono">{formatSize(p.size, meta?.size_decimals ?? 6)}</TableCell>
+      <TableCell className="text-right font-mono">
+        {p.entry_price === null ? "—" : formatPrice(p.entry_price, meta?.price_decimals ?? 6)}
+      </TableCell>
+      <TableCell className="text-right font-mono">
+        {p.mark_price === null ? "—" : formatPrice(p.mark_price, meta?.price_decimals ?? 6)}
+      </TableCell>
+      <TableCell className="text-right">
+        <PnLText value={p.unrealized_pnl} />
+      </TableCell>
+    </TableRow>
   )
 }

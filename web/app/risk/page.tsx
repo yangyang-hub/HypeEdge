@@ -1,129 +1,162 @@
 "use client"
 
 import { useState } from "react"
-import { Sidebar } from "@/components/layout/sidebar"
-import { StatusBar } from "@/components/layout/status-bar"
+import { AppShell } from "@/components/layout/app-shell"
+import { PageHeader } from "@/components/layout/page-header"
+import { AlertConfirmDialog } from "@/components/ui/alert-confirm-dialog"
+import { Button } from "@/components/ui/button"
+import { ConfirmPhraseDialog } from "@/components/ui/confirm-phrase-dialog"
+import { EmptyState, Metric, Panel, ProgressBar } from "@/components/ui/data-display"
 import { useRiskStatus, triggerKillSwitch, resetKillSwitch } from "@/hooks/use-risk"
 import { decimalToNumber, formatPct, formatPrice } from "@/lib/utils"
 
 export default function RiskPage() {
   const { risk, refresh } = useRiskStatus()
-  const [confirmText, setConfirmText] = useState("")
+  const [killOpen, setKillOpen] = useState(false)
+  const [resetOpen, setResetOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
 
-  const handleTrigger = async () => {
-    if (confirmText !== "CONFIRM") return
+  async function handleTrigger() {
+    setLoading(true)
+    setActionError(null)
     try {
       await triggerKillSwitch("manual_trigger_ui")
-      refresh()
-      setConfirmText("")
+      await refresh()
+      setKillOpen(false)
     } catch (e) {
-      console.error("Kill switch trigger failed:", e)
+      setActionError(e instanceof Error ? e.message : "触发 Kill Switch 失败")
+    } finally {
+      setLoading(false)
     }
   }
 
-  const handleReset = async () => {
+  async function handleReset() {
+    setLoading(true)
+    setActionError(null)
     try {
       await resetKillSwitch()
-      refresh()
+      await refresh()
+      setResetOpen(false)
     } catch (e) {
-      console.error("Kill switch reset failed:", e)
+      setActionError(e instanceof Error ? e.message : "重置 Kill Switch 失败")
+    } finally {
+      setLoading(false)
     }
   }
 
   return (
-    <div className="flex h-screen">
-      <Sidebar />
-      <div className="flex-1 flex flex-col overflow-hidden">
-        <main id="main-content" className="flex-1 overflow-y-auto p-3 space-y-6 md:p-6">
-          <div className="flex items-center justify-between">
-            <h2 className="text-2xl font-bold">风控面板</h2>
-            <div className="flex gap-2">
-              <button
-                onClick={handleReset}
-                className="px-4 py-2 text-sm bg-profit/20 hover:bg-profit/30 text-profit rounded-lg"
-              >
-                重置 Kill Switch
-              </button>
-            </div>
-          </div>
+    <AppShell>
+      <main id="main-content" className="flex-1 space-y-5 overflow-y-auto p-3 md:p-5">
+        <PageHeader
+          title="风控面板"
+          subtitle="限额、动作额度与 Kill Switch"
+          actions={
+            <Button type="button" variant="danger-soft" size="sm" onClick={() => setResetOpen(true)}>
+              重置 Kill Switch
+            </Button>
+          }
+        />
 
-          {/* Kill Switch */}
-          <div className={`border rounded-xl p-5 ${risk?.kill_switch_active ? "border-loss bg-loss/5" : "border-zinc-800 bg-zinc-900"}`}>
-            <div className="flex items-center justify-between mb-3">
-              <span className="font-medium">Kill Switch</span>
-              <span className={`text-sm px-2 py-0.5 rounded ${risk?.kill_switch_active ? "bg-loss/20 text-loss" : "bg-profit/20 text-profit"}`}>
-                {risk?.kill_switch_active ? "🚨 已触发" : "✅ 正常"}
-              </span>
-            </div>
-            {risk?.kill_switch_reason && (
-              <p className="text-sm text-zinc-400 mb-3">原因: {risk.kill_switch_reason}</p>
+        {actionError ? (
+          <p role="alert" className="rounded-md border border-loss/30 bg-loss/10 px-3 py-2 text-sm text-loss">
+            {actionError}
+          </p>
+        ) : null}
+
+        <Panel
+          className={risk?.kill_switch_active ? "border-critical" : undefined}
+          title="Kill Switch"
+          action={
+            <span className={risk?.kill_switch_active ? "text-xs text-critical" : "text-xs text-profit"}>
+              {risk?.kill_switch_active ? "已触发" : "正常"}
+            </span>
+          }
+        >
+          <div className="space-y-3 p-4">
+            {risk?.kill_switch_reason ? (
+              <p className="text-sm text-text-secondary">原因：{risk.kill_switch_reason}</p>
+            ) : (
+              <p className="text-sm text-text-tertiary">系统处于可交易状态。触发后将撤销挂单并拦截新单。</p>
             )}
-            <div className="flex gap-2 items-end">
-              <input
-                type="text"
-                value={confirmText}
-                onChange={(e) => setConfirmText(e.target.value)}
-                placeholder="输入 CONFIRM 触发"
-                className="bg-zinc-800 border border-zinc-700 rounded px-3 py-2 text-sm w-48"
-              />
-              <button
-                onClick={handleTrigger}
-                disabled={confirmText !== "CONFIRM"}
-                className="px-4 py-2 text-sm bg-loss/20 hover:bg-loss/30 text-loss rounded-lg disabled:opacity-30 disabled:cursor-not-allowed"
+            <div className="flex flex-wrap items-end gap-2">
+              <Button
+                type="button"
+                variant="danger"
+                size="sm"
+                disabled={Boolean(risk?.kill_switch_active)}
+                onClick={() => setKillOpen(true)}
               >
-                🚨 触发 Kill Switch
-              </button>
+                触发 Kill Switch
+              </Button>
+              <span className="text-2xs text-text-tertiary">需输入 CONFIRM 二次确认</span>
             </div>
           </div>
+        </Panel>
 
-          {/* Limits */}
-          {risk && (
-            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5 space-y-3">
-              <h3 className="font-medium mb-3">限额使用</h3>
-              {risk.limits.map((l) => {
-                const used = decimalToNumber(l.pct_used)
-                return <div key={l.name} className="flex items-center gap-3">
-                  <span className="text-sm text-zinc-400 w-28">{l.name}</span>
-                  <div className="flex-1 h-3 bg-zinc-800 rounded-full overflow-hidden">
-                    <div
-                      className={`h-full rounded-full transition-all ${used > 0.8 ? "bg-loss" : used > 0.6 ? "bg-warning" : "bg-profit"}`}
-                      style={{ width: `${Math.min(used * 100, 100)}%` }}
-                    />
-                  </div>
-                  <span className="text-xs text-zinc-500 w-24 text-right">
-                    {l.unit === "%" ? formatPct(l.current, 1) : `${formatPrice(l.current, 1)} ${l.unit}`} / {l.unit === "%" ? formatPct(l.limit, 1) : formatPrice(l.limit, 1)}
-                  </span>
-                  <span className={`text-xs w-12 text-right ${used > 0.8 ? "text-loss" : used > 0.6 ? "text-warning" : "text-profit"}`}>
-                    {formatPct(l.pct_used, 0)}
-                  </span>
-                </div>
-              })}
+        {risk ? (
+          <Panel title="限额使用">
+            <div className="space-y-3 p-4">
+              {risk.limits.length === 0 ? (
+                <EmptyState message="暂无限额数据" />
+              ) : (
+                risk.limits.map((limit) => {
+                  const used = decimalToNumber(limit.pct_used)
+                  return (
+                    <div key={limit.name} className="flex items-center gap-3">
+                      <span className="w-28 shrink-0 text-sm text-text-secondary">{limit.name}</span>
+                      <ProgressBar value={used} className="flex-1" />
+                      <span className="w-28 shrink-0 text-right font-mono text-xs text-text-tertiary">
+                        {limit.unit === "%"
+                          ? `${formatPct(limit.current, 1)} / ${formatPct(limit.limit, 1)}`
+                          : `${formatPrice(limit.current, 1)} / ${formatPrice(limit.limit, 1)} ${limit.unit}`}
+                      </span>
+                      <span
+                        className={`w-12 shrink-0 text-right font-mono text-xs ${
+                          used > 0.8 ? "text-loss" : used > 0.6 ? "text-warning" : "text-profit"
+                        }`}
+                      >
+                        {formatPct(limit.pct_used, 0)}
+                      </span>
+                    </div>
+                  )
+                })
+              )}
             </div>
-          )}
+          </Panel>
+        ) : null}
 
-          {/* Check Stats */}
-          {risk?.check_stats && (
-            <div className="bg-zinc-900 border border-zinc-800 rounded-xl p-5">
-              <h3 className="font-medium mb-3">风控检查统计</h3>
-              <div className="grid grid-cols-1 gap-4 text-center sm:grid-cols-3">
-                <div>
-                  <div className="text-2xl font-bold font-mono">{risk.check_stats.check_count ?? 0}</div>
-                  <div className="text-xs text-zinc-500">总检查</div>
-                </div>
-                <div>
-                  <div className="text-2xl font-bold font-mono text-profit">{risk.check_stats.pass_count ?? 0}</div>
-                  <div className="text-xs text-zinc-500">通过</div>
-                </div>
-                <div>
-                  <div className="text-2xl font-bold font-mono text-loss">{risk.check_stats.reject_count ?? 0}</div>
-                  <div className="text-xs text-zinc-500">拒绝</div>
-                </div>
-              </div>
+        {risk?.check_stats ? (
+          <Panel>
+            <div className="grid grid-cols-1 sm:grid-cols-3">
+              <Metric label="总检查" value={`${risk.check_stats.check_count ?? 0}`} />
+              <Metric label="通过" value={`${risk.check_stats.pass_count ?? 0}`} />
+              <Metric label="拒绝" value={`${risk.check_stats.reject_count ?? 0}`} />
             </div>
-          )}
-        </main>
-        <StatusBar />
-      </div>
-    </div>
+          </Panel>
+        ) : null}
+      </main>
+
+      <ConfirmPhraseDialog
+        open={killOpen}
+        onOpenChange={setKillOpen}
+        title="触发 Kill Switch"
+        description="Kill Switch 已触发后，所有挂单将撤销。输入 CONFIRM 确认。"
+        phrase="CONFIRM"
+        confirmLabel="触发"
+        loading={loading}
+        onConfirm={handleTrigger}
+      />
+
+      <AlertConfirmDialog
+        open={resetOpen}
+        onOpenChange={setResetOpen}
+        title="重置 Kill Switch"
+        description="重置后策略不会自动恢复，需人工确认环境安全后再启动策略。"
+        confirmLabel="确认重置"
+        loading={loading}
+        onConfirm={handleReset}
+      />
+    </AppShell>
   )
 }

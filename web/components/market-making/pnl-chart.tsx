@@ -18,25 +18,25 @@ export function PnlChart({ points }: PnlChartProps) {
   }))
 
   if (data.length === 0) {
-    return <div className="grid h-56 place-items-center text-sm text-zinc-500">暂无库存周期数据</div>
+    return <div className="grid h-56 place-items-center text-sm text-text-tertiary">暂无库存周期数据</div>
   }
 
   return (
     <div className="h-64 w-full" aria-label="会计 PnL 与库存周期图">
       <ResponsiveContainer width="100%" height="100%">
         <LineChart data={data} margin={{ top: 12, right: 12, bottom: 8, left: 4 }}>
-          <CartesianGrid stroke="var(--color-zinc-800)" strokeDasharray="3 3" />
+          <CartesianGrid stroke="var(--color-border-subtle)" strokeDasharray="3 3" />
           <XAxis
             dataKey="timestamp"
             tickFormatter={(value: string) => formatDateTime(value).slice(11, 16)}
-            stroke="var(--color-zinc-500)"
+            stroke="var(--color-text-tertiary)"
             tick={{ fontSize: 11 }}
           />
-          <YAxis stroke="var(--color-zinc-500)" tick={{ fontSize: 11 }} width={64} />
+          <YAxis stroke="var(--color-text-tertiary)" tick={{ fontSize: 11 }} width={64} />
           <Tooltip
             labelFormatter={(value) => formatDateTime(String(value))}
             formatter={(value, name) => [formatUsd(String(value)), name === "pnl" ? "Accounting PnL" : "库存名义价值"]}
-            contentStyle={{ background: "var(--color-zinc-900)", borderColor: "var(--color-zinc-700)" }}
+            contentStyle={{ background: "var(--color-bg-panel)", borderColor: "var(--color-border-default)" }}
           />
           <Line dataKey="pnl" name="pnl" stroke="var(--color-profit)" dot={false} strokeWidth={2} />
           <Line dataKey="inventory" name="inventory" stroke="var(--color-warning)" dot={false} strokeWidth={1.5} />
