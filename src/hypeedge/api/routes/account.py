@@ -44,9 +44,26 @@ async def get_account(tracker: TrackerDep, app: AppDep) -> dict[str, Any]:
                 ).model_dump(mode="json"),
             }
     if tracker is None:
-        from hypeedge.api.errors import ApiProblem
-
-        raise ApiProblem(503, "ACCOUNT_STATE_UNAVAILABLE", "Account tracker is not available", retryable=True)
+        # Monitor-only / no trading credentials: return an empty snapshot instead of
+        # 503 so the dashboard does not retry-spam the console.
+        return {
+            "ok": True,
+            "data": AccountData(
+                equity=Decimal("0"),
+                available_balance=Decimal("0"),
+                total_margin_used=Decimal("0"),
+                total_unrealized_pnl=Decimal("0"),
+                peak_equity=Decimal("0"),
+                drawdown_pct=Decimal("0"),
+                leverage=Decimal("0"),
+                total_fees=Decimal("0"),
+                total_funding=Decimal("0"),
+                fill_count=0,
+                position_count=0,
+                last_update=None,
+                trading_enabled=False,
+            ).model_dump(mode="json"),
+        }
 
     state = tracker.get_account_state()
     if state is None:

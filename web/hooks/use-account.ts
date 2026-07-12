@@ -1,7 +1,7 @@
 "use client"
 
 import useSWR from "swr"
-import { fetcher } from "@/lib/api"
+import { ApiError, fetcher } from "@/lib/api"
 import type { AccountData, EquityPoint } from "@/lib/types"
 import { SWR_REFRESH_INTERVAL, SWR_SLOW_INTERVAL } from "@/lib/constants"
 
@@ -9,7 +9,12 @@ export function useAccount() {
   const { data, error, isLoading } = useSWR<AccountData>(
     "/api/v1/account",
     fetcher,
-    { refreshInterval: SWR_REFRESH_INTERVAL }
+    {
+      refreshInterval: SWR_REFRESH_INTERVAL,
+      // Avoid console retry storms when trading is not configured.
+      shouldRetryOnError: (err) => !(err instanceof ApiError) || err.retryable,
+      keepPreviousData: true,
+    },
   )
   return { account: data, error, isLoading }
 }

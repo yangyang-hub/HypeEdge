@@ -327,6 +327,22 @@ class TestAccountAPI:
         assert float(data["data"]["drawdown_pct"]) == pytest.approx(0.0423076923)
 
     @pytest.mark.asyncio
+    async def test_get_account_without_tracker_returns_empty_snapshot(self) -> None:
+        app_mock = _make_mock_app()
+        app_mock.account_tracker = None
+        app_mock.projection_reader = None
+        app_mock.trading_enabled = False
+        api_app = create_api(app_mock)
+        async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+            resp = await client.get("/api/v1/account")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["ok"] is True
+        assert data["data"]["equity"] == "0"
+        assert data["data"]["trading_enabled"] is False
+        assert data["data"]["position_count"] == 0
+
+    @pytest.mark.asyncio
     async def test_get_equity_curve(self, api_client):
         async with api_client as client:
             resp = await client.get("/api/v1/account/equity-curve")
