@@ -53,6 +53,7 @@ class ClickHouseSpool:
             )
 
     def _put_sync(self, batch_id: str, table: str, payload: str) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self._path) as connection:
             connection.execute(
                 "INSERT INTO clickhouse_batches (batch_id, table_name, payload) VALUES (?, ?, ?)",
@@ -60,6 +61,7 @@ class ClickHouseSpool:
             )
 
     def _pending_sync(self, limit: int) -> list[tuple[str, str, str]]:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(self._path) as connection:
             rows = connection.execute(
                 "SELECT batch_id, table_name, payload FROM clickhouse_batches ORDER BY created_at, batch_id LIMIT ?",

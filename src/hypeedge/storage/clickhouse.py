@@ -8,6 +8,8 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Sequence
+from datetime import UTC, datetime
+from decimal import Decimal
 from typing import Any
 
 import structlog
@@ -511,8 +513,22 @@ class ClickHouseWriter:
     def _rows_to_column_data(self, rows: list[dict[str, Any]]) -> tuple[list[str], Sequence[Sequence[Any]]]:
         """Convert row dictionaries to ClickHouse column names and row sequences."""
         column_names = list(rows[0].keys())
-        data = [[row[column] for column in column_names] for row in rows]
+        data = [[self._normalize_cell(column, row[column]) for column in column_names] for row in rows]
         return column_names, data
+
+    @staticmethod
+    def _normalize_cell(column: str, value: Any) -> Any:
+        """Coerce buffered values into types clickhouse-connect accepts."""
+        if column == "ts":
+            if isinstance(value, datetime):
+                return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
+            if isinstance(value, (int, float)):
+                # Buffers historically stored seconds; accept ms just in case.
+                seconds = float(value) / 1000.0 if float(value) > 1e12 else float(value)
+                return datetime.fromtimestamp(seconds, tz=UTC)
+        if isinstance(value, Decimal):
+            return float(value)
+        return value
 
     def _buffer_event(self, event: Event) -> None:
         """Buffer an event for batch writing."""

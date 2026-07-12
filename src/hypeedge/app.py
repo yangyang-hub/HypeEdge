@@ -969,13 +969,33 @@ class HypeEdgeApp:
         return tasks
 
     async def _run_quality_checker(self) -> None:
-        """Wait for ClickHouse connection before starting quality queries."""
+        """Wait for ClickHouse readiness, then run quality checks on a dedicated client.
+
+        clickhouse-connect clients are not safe for concurrent use across threads, so the
+        quality checker must not share the writer's client (which inserts in an executor).
+        """
         if self._quality_checker is None or self._ch_writer is None:
             return
         while self._ch_writer._client is None:
             await asyncio.sleep(0.1)
-        self._quality_checker._client = self._ch_writer._client
-        await self._quality_checker.run()
+
+        import clickhouse_connect
+
+        ch = self.settings.clickhouse
+        quality_client = await asyncio.to_thread(
+            clickhouse_connect.get_client,
+            host=ch.host,
+            port=ch.port,
+            username=ch.username,
+            password=ch.password,
+            database=ch.database,
+        )
+        self._quality_checker._client = quality_client
+        try:
+            await self._quality_checker.run()
+        finally:
+            await asyncio.to_thread(quality_client.close)
+            self._quality_checker._client = None
 
     async def _poll_action_credits(self) -> None:
         """Keep the shared address quota fresh for every REST/execution consumer."""

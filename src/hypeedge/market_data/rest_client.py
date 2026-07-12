@@ -144,7 +144,13 @@ class RestClient:
             consecutive_failures = 0
 
             if not data:
-                break
+                # Empty pages can occur at the start of a window (sparse history).
+                # Advance past this page instead of treating it as end-of-stream.
+                if page_end >= end_time:
+                    break
+                start_time = page_end
+                await asyncio.sleep(0.5)
+                continue
 
             for candle_data in data:
                 candle = Candle(
@@ -160,13 +166,10 @@ class RestClient:
                 all_candles.append(candle)
 
             # Move start_time forward
-            if data:
-                last_ts = int(data[-1].get("t", 0))
-                if last_ts <= start_time:
-                    break
-                start_time = last_ts + 1
-            else:
+            last_ts = int(data[-1].get("t", 0))
+            if last_ts <= start_time:
                 break
+            start_time = last_ts + 1
 
             logger.debug(
                 "backfill_candles_batch",
@@ -204,13 +207,12 @@ class RestClient:
             await self._rate_limiter.acquire("fundingHistory", item_count=estimated_items)
 
             client = await self._ensure_client()
+            # Hyperliquid fundingHistory uses a flat body (unlike candleSnapshot's nested req).
             body = {
                 "type": "fundingHistory",
-                "req": {
-                    "coin": coin,
-                    "startTime": start_time,
-                    "endTime": page_end,
-                },
+                "coin": coin,
+                "startTime": start_time,
+                "endTime": page_end,
             }
 
             try:
@@ -218,7 +220,15 @@ class RestClient:
                 response.raise_for_status()
                 data = response.json()
             except (httpx.HTTPStatusError, httpx.RequestError) as e:
-                logger.error("backfill_funding_error", error=str(e), start_time=start_time)
+                response_text = ""
+                if isinstance(e, httpx.HTTPStatusError):
+                    response_text = e.response.text[:200]
+                logger.error(
+                    "backfill_funding_error",
+                    error=str(e),
+                    start_time=start_time,
+                    response=response_text or None,
+                )
                 consecutive_failures += 1
                 if consecutive_failures >= 3:
                     raise MarketDataError(
@@ -230,7 +240,11 @@ class RestClient:
             consecutive_failures = 0
 
             if not data:
-                break
+                if page_end >= end_time:
+                    break
+                start_time = page_end
+                await asyncio.sleep(0.5)
+                continue
 
             for item in data:
                 funding = FundingRate(
