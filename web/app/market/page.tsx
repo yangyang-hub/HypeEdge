@@ -56,7 +56,7 @@ export default function MarketPage() {
               </div>
               {errors.candles && candles.length === 0 ? (
                 <Unavailable message="K 线暂不可用，后端正在重连或回填" />
-              ) : <CandlestickChart candles={candles} />}
+              ) : <CandlestickChart candles={candles} priceDecimals={priceDecimals} />}
             </section>
 
             <section className="overflow-hidden rounded-xl border border-zinc-800 bg-zinc-900" aria-labelledby="book-title">
