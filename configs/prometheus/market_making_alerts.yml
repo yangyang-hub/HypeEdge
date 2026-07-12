@@ -1,0 +1,206 @@
+groups:
+  - name: hypeedge-market-making-p0
+    interval: 5s
+    rules:
+      - alert: HypeEdgeMarketMakingFactStale
+        expr: hype_mm_freshness_healthy == 0
+        for: 15s
+        labels:
+          severity: critical
+          component: market_making
+        annotations:
+          summary: "Required market-making fact is stale or unhealthy"
+          description: "strategy={{ $labels.strategy_id }} symbol={{ $labels.symbol }} source={{ $labels.source }}"
+          runbook: "docs/deployment.md#p0-告警处置"
+
+      - alert: HypeEdgeUserStreamLost
+        expr: hype_mm_freshness_healthy{source="user_stream"} == 0
+        for: 5s
+        labels:
+          severity: critical
+          component: account
+        annotations:
+          summary: "Authenticated user stream is unavailable"
+          description: "Placement must stop and authoritative quotes must be cancelled."
+          runbook: "docs/deployment.md#p0-告警处置"
+
+      - alert: HypeEdgeExternalReferenceStaleWithWeight
+        expr: |
+          hype_mm_external_quality{quality="stale"} == 1
+          and on(strategy_id, symbol, source)
+          hype_mm_external_effective_weight{kind="effective"} > 0
+        for: 0s
+        labels:
+          severity: critical
+          component: market_data
+        annotations:
+          summary: "Stale external reference still contributes to fair value"
+          description: "External weight must decay to zero; Hyperliquid local book remains the pricing anchor."
+          runbook: "docs/deployment.md#p0-告警处置"
+
+      - alert: HypeEdgeHardInventoryBand
+        expr: max by (strategy_id, symbol) (hype_mm_inventory_band{band=~"hard|emergency"}) == 1
+        for: 0s
+        labels:
+          severity: critical
+          component: risk
+        annotations:
+          summary: "Inventory entered hard or emergency band"
+          description: "Only inventory-reducing actions and cancellation are permitted."
+          runbook: "docs/deployment.md#p0-告警处置"
+
+      - alert: HypeEdgeUnknownExceededSLA
+        expr: hype_mm_unknown_orders > 0 and hype_mm_oldest_unknown_age_seconds > hype_mm_unknown_sla_seconds
+        for: 0s
+        labels:
+          severity: critical
+          component: execution
+        annotations:
+          summary: "UNKNOWN order exceeded reconciliation SLA"
+          description: "Keep the affected quote slot blocked and enter CANCEL_ONLY."
+          runbook: "docs/deployment.md#p0-告警处置"
+
+      - alert: HypeEdgeEmergencyCancelFailed
+        expr: increase(hype_mm_emergency_cancel_failures_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+          component: execution
+        annotations:
+          summary: "Emergency cancel-all failed"
+          description: "Escalate immediately and verify exchange-authoritative open orders."
+          runbook: "docs/deployment.md#p0-告警处置"
+
+      - alert: HypeEdgePostgresUnavailable
+        expr: hype_mm_postgres_available == 0
+        for: 5s
+        labels:
+          severity: critical
+          component: storage
+        annotations:
+          summary: "Postgres authoritative fact store is unavailable"
+          description: "No placement is permitted; only WAL-backed emergency cancellation may continue."
+          runbook: "docs/deployment.md#p0-告警处置"
+
+      - alert: HypeEdgeActionReserveConsumed
+        expr: |
+          hype_mm_action_budget{kind="address_remaining"}
+          <= on(strategy_id, symbol)
+          hype_mm_action_budget{kind="emergency_reserve"}
+        for: 0s
+        labels:
+          severity: critical
+          component: action_budget
+        annotations:
+          summary: "Address actions reached emergency reserve"
+          description: "Disable placement and preserve cancellation headroom."
+          runbook: "docs/deployment.md#p0-告警处置"
+
+      - alert: HypeEdgeCancelHeadroomEmpty
+        expr: hype_mm_action_budget{kind="cancel_headroom"} <= 0
+        for: 0s
+        labels:
+          severity: critical
+          component: action_budget
+        annotations:
+          summary: "Cancel headroom is exhausted"
+          description: "Escalate immediately; do not spend paid reserve without the emergency policy."
+          runbook: "docs/deployment.md#p0-告警处置"
+
+      - alert: HypeEdgeCriticalReconciliationDiff
+        expr: hype_mm_reconciliation_diff_count{severity="critical"} > 0
+        for: 0s
+        labels:
+          severity: critical
+          component: reconciliation
+        annotations:
+          summary: "Critical reconciliation difference is unresolved"
+          description: "Postgres/exchange facts disagree; placement remains disabled."
+          runbook: "docs/deployment.md#p0-告警处置"
+
+      - alert: HypeEdgeCanaryDirectiveRestricted
+        expr: max by (strategy_id) (hype_mm_canary_directive{directive=~"paused|cancel_only|halted"}) == 1
+        for: 0s
+        labels:
+          severity: critical
+          component: canary
+        annotations:
+          summary: "Versioned canary envelope restricted runtime"
+          description: "Apply the emitted directive and preserve the active envelope/config audit facts."
+          runbook: "docs/deployment.md#canary-与逐级扩容"
+
+      - alert: HypeEdgeKillSwitchTriggered
+        expr: increase(hype_kill_switch_triggered_total[5m]) > 0
+        for: 0s
+        labels:
+          severity: critical
+          component: safety
+        annotations:
+          summary: "Kill Switch triggered"
+          description: "Verify no new placement and reconcile exchange-authoritative open orders."
+          runbook: "docs/deployment.md#p0-告警处置"
+
+  - name: hypeedge-market-making-slo
+    interval: 15s
+    rules:
+      - alert: HypeEdgeQuoteAgeHigh
+        expr: max by (strategy_id, symbol) (hype_mm_quote_age_seconds{view="live"}) > 10
+        for: 30s
+        labels:
+          severity: warning
+          component: quoting
+        annotations:
+          summary: "Live maker quote age exceeds the initial operational threshold"
+          description: "Confirm the active config limit before changing refresh cadence."
+
+      - alert: HypeEdgeRejectBurst
+        expr: sum by (strategy_id, symbol) (increase(hype_mm_execution_outcomes_total{outcome="reject"}[5m])) >= 3
+        for: 0s
+        labels:
+          severity: warning
+          component: execution
+        annotations:
+          summary: "Market-making execution reject burst"
+          description: "Inspect normalized order facts and exchange rejection reasons."
+
+      - alert: HypeEdgeDecisionLatencyP99High
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (le, strategy_id, symbol) (
+              rate(hype_mm_latency_seconds_bucket{stage="receipt_to_decision"}[5m])
+            )
+          ) > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: latency
+        annotations:
+          summary: "Receipt-to-decision p99 exceeds the initial 50ms diagnostic threshold"
+          description: "Profile the event loop before considering any Rust migration."
+
+      - alert: HypeEdgeExternalBasisUnstable
+        expr: |
+          abs(hype_mm_external_basis_bps)
+          > on(strategy_id, symbol, source)
+          hype_mm_external_basis_limit_bps
+        for: 1m
+        labels:
+          severity: warning
+          component: market_data
+        annotations:
+          summary: "External-to-Hyperliquid basis exceeded its configured bound"
+          description: "Reduce external confidence/weight; do not chase the external market as an oracle."
+
+      - alert: HypeEdgeExternalDivergenceHigh
+        expr: |
+          abs(hype_mm_external_divergence_bps)
+          > on(strategy_id, symbol, source)
+          hype_mm_external_divergence_limit_bps
+        for: 15s
+        labels:
+          severity: warning
+          component: market_data
+        annotations:
+          summary: "Adjusted external reference diverged from the Hyperliquid local anchor"
+          description: "Widen, reduce risk, or cancel according to policy; external price is reference-only."

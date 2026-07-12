@@ -1,0 +1,89 @@
+[project]
+name = "hypeedge"
+version = "0.1.0"
+description = "Hyperliquid quantitative trading system"
+requires-python = ">=3.12"
+dependencies = [
+    # Async HTTP
+    "httpx>=0.28",
+    # FastAPI (HTTP API layer)
+    "fastapi>=0.100",
+    "uvicorn>=0.20",
+    # Async WebSocket
+    "websockets>=14.0",
+    # Hyperliquid SDK (signing only)
+    "hyperliquid-python-sdk>=0.22.0",
+    # Signing dependencies
+    "eth-account>=0.13",
+    # ClickHouse
+    "clickhouse-connect>=0.8",
+    # Postgres
+    "sqlalchemy[asyncio]>=2.0",
+    "asyncpg>=0.30",
+    "alembic>=1.14",
+    # Configuration
+    "pydantic>=2.10",
+    "pydantic-settings>=2.7",
+    "pyyaml>=6.0",
+    # Logging
+    "structlog>=24.0",
+    # Monitoring
+    "prometheus-client>=0.21",
+]
+
+[project.scripts]
+hypeedge = "hypeedge.__main__:main"
+
+[project.optional-dependencies]
+duckdb = ["duckdb>=1.0"]
+
+[tool.uv]
+package = true
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
+    "pytest-mock>=3.14",
+    "pytest-cov>=6.0",
+    "ruff>=0.9",
+    "mypy>=1.14",
+]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B", "SIM"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+    "integration: requires a real database or external service",
+    "testnet: live Hyperliquid testnet mutations; skipped unless the documented safety acknowledgements are set",
+]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+
+[[tool.mypy.overrides]]
+module = ["clickhouse_connect.*", "yaml", "duckdb.*", "hyperliquid.*"]
+ignore_missing_imports = true
+
+[tool.coverage.run]
+branch = true
+source = ["hypeedge"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.ruff.lint.per-file-ignores]
+# FastAPI Depends() is the standard pattern — B008 is a false positive
+"src/hypeedge/api/routes/*.py" = ["B008"]
+"src/hypeedge/api/deps.py" = ["B008"]

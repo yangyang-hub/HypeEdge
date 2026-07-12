@@ -1,0 +1,86 @@
+schema_version: 1
+authority:
+  transactional_facts: postgres
+  analytical_projection: clickhouse
+  realtime_health_projection: prometheus
+  note: "ClickHouse and Prometheus never authorize trading or risk expansion."
+
+stages:
+  - id: historical_replay_and_fault_injection
+    minimums:
+      required_scenarios:
+        - submit_cancel_response_loss_and_delay
+        - worker_crash_mid_parent_or_child_command
+        - duplicate_out_of_order_fill_and_rest_backfill
+        - l2_stale_gap_crossed_and_event_loop_lag
+        - postgres_failure
+        - clickhouse_spool_recovery
+        - action_cancel_ip_budget_exhaustion_and_recovery
+        - kill_switch_with_live_partial_and_unknown_orders
+        - emergency_cancel_wal_crash_replay
+        - late_revision_orphan_and_unknown_sla
+    prohibits:
+      - "Treating replay profitability as proof of live profitability"
+
+  - id: mainnet_shadow
+    minimum_complete_utc_days: 14
+    mode: shadow
+    requires:
+      - versioned_statistical_plan
+      - inventory_episode_definition
+      - regime_coverage_definition
+      - versioned_canary_risk_envelope
+    prohibits:
+      - signed_order_submission
+      - writing_shadow_fills_to_authoritative_orders_fills_positions_or_ledger
+
+  - id: testnet_clean_soak
+    minimum_complete_utc_days: 14
+    requires_zero:
+      - duplicate_orders
+      - unexplained_reconciliation_diffs
+      - risk_bypasses
+    purpose: "Protocol, recovery, reconciliation, and safety validation only."
+    prohibits:
+      - "Using testnet fills as proof of mainnet microstructure profitability"
+
+  - id: mainnet_canary
+    topology:
+      symbols: 1
+      isolated_sub_accounts: 1
+      quote_levels_per_side: 1
+      quote_size: minimum_exchange_compliant
+      leverage: "1x or very low"
+    requires:
+      - active_versioned_canary_risk_envelope
+      - human_operator_online
+      - automatic_pause_cancel_only_halt_thresholds
+      - rollback_config_version
+
+  - id: expansion
+    minimum_complete_utc_days: 30
+    change_policy:
+      dimensions_per_change: 1
+      order:
+        - quote_size
+        - second_symbol
+        - second_quote_level
+      rust_hot_path_change_is_separate: true
+      independent_observation_window_required: true
+      rollback_config_version_required: true
+    requires:
+      - preregistered_inventory_episode_sample
+      - complete_regime_coverage
+      - accounting_edge_block_bootstrap_ci95_lower_gt_zero
+      - marginal_usdc_per_action_gte_1_25
+      - action_cancel_ip_reserve_sufficient
+      - zero_hard_inventory_duplicate_order_and_critical_reconciliation_events
+      - all_unknown_orphans_have_terminal_audit_facts
+      - directional_inventory_pnl_not_dominant
+
+completion_claims:
+  shadow_soak_completed: false
+  testnet_clean_soak_completed: false
+  mainnet_canary_completed: false
+  expansion_window_completed: false
+  note: "These values remain false until real dated evidence is reviewed and recorded outside this repository template."

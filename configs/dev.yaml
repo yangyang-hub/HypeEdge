@@ -1,0 +1,156 @@
+# HypeEdge Development Configuration
+environment: dev
+log_level: DEBUG
+
+exchange:
+  api_url: https://api.hyperliquid-testnet.xyz
+  ws_url: wss://api.hyperliquid-testnet.xyz/ws
+  # account_address and agent_private_key must be set via environment variables
+  sub_account: null
+
+market_data:
+  coins:
+    - BTC
+    - ETH
+    - SOL
+  ws_subscriptions:
+    - l2Book
+    - trades
+    - candle
+    - allMids
+    - activeAssetCtx
+  candle_intervals:
+    - 1m
+  l2_book_depth: 20
+  ws_reconnect_delay_min: 1.0
+  ws_reconnect_delay_max: 30.0
+  rest_poll_interval: 10.0
+  backfill_batch_size: 500
+
+external_reference:
+  external_reference_enabled: false
+  spot_ws_url: wss://stream.binance.com:9443/stream
+  perpetual_ws_url: wss://fstream.binance.com/stream
+  symbol_map:
+    BTC: BTCUSDT
+    ETH: ETHUSDT
+    SOL: SOLUSDT
+  spot_weight: "0.40"
+  perpetual_weight: "0.60"
+  max_external_weight: "0.35"
+  basis_ewma_alpha: "0.02"
+  stale_after_ms: 1500
+  max_perp_spot_divergence_bps: "25"
+  max_mark_book_divergence_bps: "25"
+  reconnect_delay_min_seconds: 1.0
+  reconnect_delay_max_seconds: 30.0
+  max_symbols: 20
+
+clickhouse:
+  host: localhost
+  port: 8123
+  database: hypeedge
+  batch_size: 10000
+  flush_interval: 5.0
+  spool_path: data/clickhouse_spool.sqlite3
+
+postgres:
+  url: postgresql+asyncpg://hypeedge:hypeedge@localhost:5432/hypeedge
+  pool_size: 5
+  command_poll_interval_ms: 100
+  command_lease_seconds: 15
+  unknown_recheck_seconds: 5
+  risk_reservation_ttl_seconds: 86400
+
+risk:
+  max_position_pct: 0.20
+  max_strategy_loss_pct: 0.05
+  max_drawdown_pct: 0.10
+  max_leverage: 5
+  risk_check_timeout_ms: 500
+  market_price_stale_seconds: 5.0
+  action_credits_low_watermark: 1000
+  reserve_weight_cost_limit: 10.0
+  kill_switch_enabled: true
+
+action_budget:
+  remote_snapshot_max_age_seconds: 60.0
+  remote_poll_interval_normal_seconds: 30.0
+  remote_poll_interval_conserve_seconds: 15.0
+  remote_poll_interval_critical_seconds: 5.0
+  address_conserve_threshold: 3000
+  address_critical_threshold: 1500
+  address_cancel_only_threshold: 500
+  cancel_retry_buffer: 10
+  close_action_reserve: 5
+  cancel_headroom_initial: 10000
+  ip_weight_limit_per_minute: 1200
+  ip_emergency_reserve: 100
+  runway_conserve_hours: 24.0
+  runway_critical_hours: 6.0
+  runway_cancel_only_hours: 1.0
+  minimum_marginal_usdc_per_action: 1.25
+  minimum_actions_for_economic_gate: 20
+  paid_reserve_enabled: false
+  paid_reserve_cost_per_request_usdc: 0.0005
+  paid_reserve_max_single_usdc: 0.0
+  paid_reserve_max_daily_usdc: 0.0
+  paid_reserve_max_monthly_usdc: 0.0
+
+market_making:
+  max_active_strategies: 1
+  max_quote_levels_per_side: 1
+  max_hard_inventory_equity_pct: 0.15
+  max_quote_notional_equity_pct: 0.05
+  account_poll_interval_seconds: 3.0
+  near_risk_account_poll_interval_seconds: 1.0
+  full_reconciliation_interval_seconds: 300.0
+  unknown_order_sla_seconds: 15.0
+  emergency_cancel_wal_path: data/emergency_cancel.jsonl
+  shadow_min_utc_days: 14
+  testnet_soak_min_days: 14
+  canary_observation_min_days: 30
+
+monitor:
+  prometheus_port: 9090
+
+backfill:
+  state_dir: data
+  backfill_window_days: 7
+  refresh_interval_hours: 6.0
+  quality_check_interval_hours: 1.0
+  dedup_max_keys: 1000000
+
+backtest:
+  initial_capital: 10000.0
+  default_maker_rebate_pct: -0.0002
+  default_taker_fee_pct: 0.0005
+  slippage_optimistic_bps: 2.0
+  slippage_pessimistic_bps: 10.0
+  walk_forward_train_days: 60
+  walk_forward_validate_days: 30
+  walk_forward_step_days: 30
+  monte_carlo_simulations: 1000
+
+api:
+  host: 127.0.0.1
+  port: 8080
+  request_rate_limit_per_minute: 600
+  mutation_rate_limit_per_minute: 60
+  auth_failure_limit_per_minute: 10
+  market_ws_max_connections: 100
+  market_ws_max_connections_per_ip: 5
+  market_ws_queue_size: 64
+  market_ws_messages_per_second: 50
+  cors_origins:
+    - http://localhost:3000
+
+features:
+  legacy_execution: false
+  durable_ledger_v2: true
+  execution_v2: true
+  user_stream_v2: true
+  reconciliation_v2: true
+  api_v1: true
+  strategy_runner_v2: true
+  market_making_enabled: false

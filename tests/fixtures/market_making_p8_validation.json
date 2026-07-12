@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "local_deterministic_suite": "tests/unit/test_market_making_failures.py",
+  "required_external_evidence": [
+    {
+      "id": "mainnet_shadow_14_complete_utc_days",
+      "status": "evidence_required",
+      "minimum_complete_utc_days": 14,
+      "prohibited_claim": "shadow profitability proof"
+    },
+    {
+      "id": "testnet_clean_14_complete_utc_days",
+      "status": "evidence_required",
+      "minimum_complete_utc_days": 14,
+      "required_zero_counts": [
+        "duplicate_orders",
+        "unexplained_position_differences",
+        "risk_bypasses"
+      ]
+    },
+    {
+      "id": "testnet_exchange_recovery_drill",
+      "status": "evidence_required",
+      "scenarios": [
+        "authenticated_user_stream_disconnect_and_rest_backfill",
+        "real_exchange_nonce_and_unknown_resolution",
+        "pause_drain_config_switch_and_full_reconciliation"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,189 @@
+{
+  "annotations": {"list": []},
+  "editable": false,
+  "graphTooltip": 1,
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 0},
+      "id": 1,
+      "targets": [
+        {"expr": "hype_mm_freshness_age_seconds{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "{{source}} age"},
+        {"expr": "hype_mm_freshness_limit_seconds{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "{{source}} limit"}
+      ],
+      "title": "Authoritative fact freshness",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 0},
+      "id": 2,
+      "targets": [
+        {"expr": "hype_mm_reference_price{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "{{kind}}"},
+        {"expr": "hype_mm_quote_price{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "{{view}} {{side}}"}
+      ],
+      "title": "Fair, reservation, desired and live quotes",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"max": 1, "min": 0, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 0},
+      "id": 3,
+      "targets": [
+        {"expr": "hype_mm_quote_uptime_ratio{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "{{window}}"}
+      ],
+      "title": "Quote uptime",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "currencyUSD"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 8},
+      "id": 4,
+      "targets": [
+        {"expr": "hype_mm_inventory_notional_usdc{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "inventory"},
+        {"expr": "hype_mm_funding_carry_usdc{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "funding carry"}
+      ],
+      "title": "Inventory and funding",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 8},
+      "id": 5,
+      "targets": [
+        {"expr": "hype_mm_inventory_hard_limit_utilization_ratio{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "inventory / hard"},
+        {"expr": "hype_mm_margin_utilization_ratio{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "margin"},
+        {"expr": "hype_mm_liquidation_distance_ratio{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "liquidation distance"}
+      ],
+      "title": "Inventory, margin and liquidation risk",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 8},
+      "id": 6,
+      "targets": [
+        {"expr": "hype_mm_action_budget{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "{{kind}}"}
+      ],
+      "title": "Action burn, earn, runway and reserves",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 0, "y": 16},
+      "id": 7,
+      "targets": [
+        {"expr": "sum by (outcome) (increase(hype_mm_execution_outcomes_total{strategy_id=\"$strategy\",symbol=\"$symbol\"}[5m]))", "legendFormat": "{{outcome}}"}
+      ],
+      "title": "Execution outcomes (5m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 8, "y": 16},
+      "id": 8,
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le, stage) (rate(hype_mm_latency_seconds_bucket{strategy_id=\"$strategy\",symbol=\"$symbol\"}[5m])))",
+          "legendFormat": "p99 {{stage}}"
+        }
+      ],
+      "title": "Critical path latency p99",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 8, "x": 16, "y": 16},
+      "id": 9,
+      "targets": [
+        {"expr": "hype_mm_unknown_orders{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "UNKNOWN"},
+        {"expr": "hype_mm_reconciliation_diff_count{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "recon {{severity}}"}
+      ],
+      "title": "UNKNOWN and reconciliation",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 24},
+      "id": 10,
+      "targets": [
+        {"expr": "hype_mm_runtime_info{strategy_id=\"$strategy\",symbol=\"$symbol\"} == 1", "legendFormat": "{{state}} config={{config_version}}"}
+      ],
+      "title": "Runtime state and config version",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 24},
+      "id": 11,
+      "targets": [
+        {"expr": "hype_mm_canary_directive{strategy_id=\"$strategy\"} == 1", "legendFormat": "{{directive}}"},
+        {"expr": "hype_mm_canary_envelope_version{strategy_id=\"$strategy\"}", "legendFormat": "envelope version"}
+      ],
+      "title": "Canary directive and envelope",
+      "type": "state-timeline"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {}, "overrides": []},
+      "gridPos": {"h": 8, "w": 24, "x": 0, "y": 30},
+      "id": 12,
+      "targets": [
+        {"expr": "hype_mm_external_freshness_age_seconds{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "{{source}} age s"},
+        {"expr": "hype_mm_external_basis_bps{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "{{source}} basis bps"},
+        {"expr": "hype_mm_external_divergence_bps{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "{{source}} divergence bps"},
+        {"expr": "hype_mm_external_effective_weight{strategy_id=\"$strategy\",symbol=\"$symbol\",kind=\"effective\"}", "legendFormat": "{{source}} effective weight"},
+        {"expr": "hype_mm_external_confidence{strategy_id=\"$strategy\",symbol=\"$symbol\"}", "legendFormat": "{{source}} confidence"}
+      ],
+      "title": "External references (reference-only; HL local anchor)",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "tags": ["hypeedge", "market-making"],
+  "templating": {
+    "list": [
+      {
+        "current": {},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(hype_mm_runtime_info, strategy_id)",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Strategy",
+        "name": "strategy",
+        "query": {"query": "label_values(hype_mm_runtime_info, strategy_id)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
+        "refresh": 1,
+        "type": "query"
+      },
+      {
+        "current": {},
+        "datasource": {"type": "prometheus", "uid": "prometheus"},
+        "definition": "label_values(hype_mm_runtime_info{strategy_id=\"$strategy\"}, symbol)",
+        "hide": 0,
+        "includeAll": false,
+        "label": "Symbol",
+        "name": "symbol",
+        "query": {"query": "label_values(hype_mm_runtime_info{strategy_id=\"$strategy\"}, symbol)", "refId": "PrometheusVariableQueryEditor-VariableQuery"},
+        "refresh": 1,
+        "type": "query"
+      }
+    ]
+  },
+  "time": {"from": "now-6h", "to": "now"},
+  "timezone": "utc",
+  "title": "HypeEdge Market Making Operations",
+  "uid": "hypeedge-mm-ops",
+  "version": 1
+}

@@ -1,0 +1,28 @@
+# Trend Following Strategy Parameters
+# Design doc §7.1, §15.2
+# Hot-reloadable: changes are picked up without process restart.
+
+symbol: BTC
+
+# EMA / MACD signal
+fast_ema_period: 12
+slow_ema_period: 26
+signal_ema_period: 9
+
+# Momentum
+momentum_period: 10
+momentum_threshold: 0.0
+
+# ATR (volatility)
+atr_period: 14
+
+# Position sizing
+atr_position_multiplier: 0.5
+max_position_pct: 0.15
+risk_per_trade_pct: 0.01
+
+# Stop-loss
+atr_stop_multiplier: 2.0
+
+# MACD cross threshold
+macd_cross_threshold: 0.0
