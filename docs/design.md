@@ -484,13 +484,14 @@ Postgres 关键表：
 
 ### 15.3 多环境隔离
 
-| 环境 | 用途 | 配置 |
+| 环境 | 用途 | Hyperliquid 网络 |
 |---|---|---|
-| `dev` | 本地开发/调试 | Mock 数据或 testnet |
-| `testnet` | 集成测试 / Paper Trading | 连接 Hyperliquid testnet，用测试币 |
-| `mainnet` | 实盘 | 连接 Hyperliquid mainnet，真实资金 |
+| `dev` | 本地开发/调试 | 自动连接 **testnet**（API + WS） |
+| `testnet` | 集成测试 / Paper Trading | 自动连接 **testnet**，用测试币 |
+| `mainnet` | 实盘 | 自动连接 **mainnet**，真实资金 |
 
 - 通过环境变量 `HYPE_ENV` 切换环境，各环境配置文件独立（`configs/dev.yaml`、`configs/testnet.yaml`、`configs/mainnet.yaml`）。
+- **`api_url` / `ws_url` 由 `HYPE_ENV` 自动决定**，忽略 YAML 与 `HYPE_EXCHANGE__API_URL` / `WS_URL` 的手动覆盖，避免连错网络。
 - **mainnet 配置默认不含任何私钥**，必须通过环境变量或交互式输入提供。
 
 ---

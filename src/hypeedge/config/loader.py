@@ -32,6 +32,20 @@ _MAINNET_API_URL = "https://api.hyperliquid.xyz"
 _MAINNET_WS_URL = "wss://api.hyperliquid.xyz/ws"
 _TESTNET_API_URL = "https://api.hyperliquid-testnet.xyz"
 _TESTNET_WS_URL = "wss://api.hyperliquid-testnet.xyz/ws"
+_SUPPORTED_ENVIRONMENTS = frozenset({"dev", "testnet", "mainnet"})
+
+
+def exchange_urls_for_environment(environment: str) -> tuple[str, str]:
+    """Return the official Hyperliquid REST/WS URLs for ``HYPE_ENV``.
+
+    ``dev`` and ``testnet`` both connect to Hyperliquid testnet.
+    ``mainnet`` connects to Hyperliquid mainnet.
+    """
+    if environment == "mainnet":
+        return _MAINNET_API_URL, _MAINNET_WS_URL
+    if environment in {"dev", "testnet"}:
+        return _TESTNET_API_URL, _TESTNET_WS_URL
+    raise RuntimeError(f"unsupported HYPE_ENV={environment!r}; expected one of {sorted(_SUPPORTED_ENVIRONMENTS)}")
 
 
 def load_yaml_config(environment: str | None = None) -> dict[str, Any]:
@@ -56,13 +70,20 @@ def load_yaml_config(environment: str | None = None) -> dict[str, Any]:
 def load_settings(environment: str | None = None) -> AppSettings:
     """Load application settings from YAML + environment variables.
 
-    Priority (highest wins):
+    Priority (highest wins), except exchange API/WS URLs:
     1. Environment variables (HYPE_* prefix)
     2. .env file
     3. YAML config file
     4. Defaults in settings classes
+
+    Exchange ``api_url`` / ``ws_url`` are always derived from ``HYPE_ENV``
+    (``dev``/``testnet`` → testnet, ``mainnet`` → mainnet) and ignore manual overrides.
     """
     selected_environment: str = environment if environment is not None else os.environ.get("HYPE_ENV", "dev")
+    if selected_environment not in _SUPPORTED_ENVIRONMENTS:
+        raise RuntimeError(
+            f"unsupported HYPE_ENV={selected_environment!r}; expected one of {sorted(_SUPPORTED_ENVIRONMENTS)}"
+        )
     yaml_config = load_yaml_config(selected_environment)
 
     # pydantic-settings handles env vars and .env automatically.
@@ -83,23 +104,37 @@ def load_settings(environment: str | None = None) -> AppSettings:
     )
     if settings.environment != selected_environment:
         raise RuntimeError("HYPE_ENV and HYPE_ENVIRONMENT must not select different environments")
+    settings = _apply_exchange_urls(settings)
     if settings.is_mainnet:
         _validate_mainnet_environment(settings)
     _validate_exchange_environment(settings)
     return settings
 
 
+def _apply_exchange_urls(settings: AppSettings) -> AppSettings:
+    """Force official Hyperliquid endpoints from ``HYPE_ENV`` (network source of truth)."""
+    api_url, ws_url = exchange_urls_for_environment(settings.environment)
+    previous_api = settings.exchange.api_url.rstrip("/")
+    previous_ws = settings.exchange.ws_url.rstrip("/")
+    if previous_api != api_url or previous_ws != ws_url:
+        logger.warning(
+            "exchange_urls_overridden_by_environment",
+            environment=settings.environment,
+            previous_api_url=settings.exchange.api_url,
+            previous_ws_url=settings.exchange.ws_url,
+            api_url=api_url,
+            ws_url=ws_url,
+        )
+    exchange = settings.exchange.model_copy(update={"api_url": api_url, "ws_url": ws_url})
+    return settings.model_copy(update={"exchange": exchange})
+
+
 def _validate_exchange_environment(settings: AppSettings) -> None:
-    """Configured trading credentials must never point at the wrong network."""
-    if not settings.exchange.is_configured:
-        return
-    if settings.is_mainnet:
-        expected_api, expected_ws = _MAINNET_API_URL, _MAINNET_WS_URL
-    else:
-        expected_api, expected_ws = _TESTNET_API_URL, _TESTNET_WS_URL
+    """Exchange URLs must match the official endpoints for the selected environment."""
+    expected_api, expected_ws = exchange_urls_for_environment(settings.environment)
     if settings.exchange.api_url.rstrip("/") != expected_api or settings.exchange.ws_url.rstrip("/") != expected_ws:
         raise RuntimeError(
-            f"{settings.environment} trading credentials require the official "
+            f"{settings.environment} requires the official "
             f"{'mainnet' if settings.is_mainnet else 'testnet'} API and WebSocket URLs"
         )
 

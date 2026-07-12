@@ -68,12 +68,35 @@ class TestSettings:
         monkeypatch.setenv("HYPE_LOG_LEVEL", "ERROR")
         monkeypatch.setenv("HYPE_MARKET_DATA__L2_BOOK_DEPTH", "50")
         monkeypatch.setenv("HYPE_EXCHANGE__API_URL", "https://override.example")
+        monkeypatch.setenv("HYPE_EXCHANGE__WS_URL", "wss://override.example/ws")
 
         settings = load_settings("dev")
 
         assert settings.log_level == "ERROR"
         assert settings.market_data.l2_book_depth == 50
-        assert settings.exchange.api_url == "https://override.example"
+        # Exchange URLs are derived from HYPE_ENV, not manual overrides.
+        assert settings.exchange.api_url == "https://api.hyperliquid-testnet.xyz"
+        assert settings.exchange.ws_url == "wss://api.hyperliquid-testnet.xyz/ws"
+
+    def test_hype_env_auto_sets_exchange_urls(self, monkeypatch):
+        monkeypatch.delenv("HYPE_EXCHANGE__API_URL", raising=False)
+        monkeypatch.delenv("HYPE_EXCHANGE__WS_URL", raising=False)
+
+        testnet = load_settings("testnet")
+        assert testnet.exchange.api_url == "https://api.hyperliquid-testnet.xyz"
+        assert testnet.exchange.ws_url == "wss://api.hyperliquid-testnet.xyz/ws"
+
+        postgres_url = (
+            "postgresql+asyncpg://hypeedge:strong-random-db-secret@db.internal:5432/hypeedge_mainnet?ssl=require"
+        )
+        monkeypatch.setenv("HYPE_EXCHANGE__ACCOUNT_ADDRESS", "0x1234")
+        monkeypatch.setenv("HYPE_EXCHANGE__AGENT_PRIVATE_KEY", "0xdeadbeef")
+        monkeypatch.setenv("HYPE_POSTGRES__URL", postgres_url)
+        monkeypatch.setenv("HYPE_API__AUTH_TOKEN", "a" * 32)
+
+        mainnet = load_settings("mainnet")
+        assert mainnet.exchange.api_url == "https://api.hyperliquid.xyz"
+        assert mainnet.exchange.ws_url == "wss://api.hyperliquid.xyz/ws"
 
     def test_all_yaml_sections_are_loaded(self):
         settings = load_settings("testnet")
@@ -185,11 +208,13 @@ class TestSettings:
         with pytest.raises(pydantic.ValidationError, match="complete V2 trading chain"):
             FeatureFlagsSettings(market_making_enabled=True)
 
-    def test_dev_credentials_can_never_target_mainnet(self, monkeypatch):
+    def test_dev_and_testnet_force_testnet_urls_even_if_mainnet_overridden(self, monkeypatch):
         monkeypatch.setenv("HYPE_EXCHANGE__ACCOUNT_ADDRESS", "0x1234")
         monkeypatch.setenv("HYPE_EXCHANGE__AGENT_PRIVATE_KEY", "0xdeadbeef")
         monkeypatch.setenv("HYPE_EXCHANGE__API_URL", "https://api.hyperliquid.xyz")
         monkeypatch.setenv("HYPE_EXCHANGE__WS_URL", "wss://api.hyperliquid.xyz/ws")
 
-        with pytest.raises(RuntimeError, match="dev trading credentials require the official testnet"):
-            load_settings("dev")
+        settings = load_settings("dev")
+
+        assert settings.exchange.api_url == "https://api.hyperliquid-testnet.xyz"
+        assert settings.exchange.ws_url == "wss://api.hyperliquid-testnet.xyz/ws"
