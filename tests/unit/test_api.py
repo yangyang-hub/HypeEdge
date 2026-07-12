@@ -355,6 +355,40 @@ class TestAccountAPI:
         assert resp.json()["data"]["equity"] == "0"
 
     @pytest.mark.asyncio
+    async def test_get_account_prefers_live_tracker_over_stale_projection(self) -> None:
+        """Clearinghouse poller updates tracker; projection only refreshes on reconcile."""
+        from datetime import UTC, datetime
+        from unittest.mock import AsyncMock, MagicMock
+
+        app_mock = _make_mock_app()
+        stale = MagicMock()
+        stale.equity = Decimal("0")
+        stale.available_balance = Decimal("0")
+        stale.total_margin_used = Decimal("0")
+        stale.total_unrealized_pnl = Decimal("0")
+        stale.peak_equity = Decimal("0")
+        stale.exchange_updated_at = datetime(2026, 7, 12, 9, 33, 39, tzinfo=UTC)
+        reader = MagicMock()
+        reader.get_account = AsyncMock(return_value=stale)
+        reader.get_account_metrics = AsyncMock(
+            return_value={
+                "leverage": 0,
+                "total_fees": Decimal("0"),
+                "fill_count": 0,
+                "position_count": 0,
+            }
+        )
+        app_mock.projection_reader = reader
+        api_app = create_api(app_mock)
+        async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+            resp = await client.get("/api/v1/account")
+        assert resp.status_code == 200
+        data = resp.json()["data"]
+        assert data["equity"] == "12450"
+        assert data["available_balance"] == "10000"
+        reader.get_account.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_get_equity_curve(self, api_client):
         async with api_client as client:
             resp = await client.get("/api/v1/account/equity-curve")

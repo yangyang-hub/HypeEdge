@@ -16,7 +16,34 @@ router = APIRouter(prefix="/account", tags=["account"], dependencies=[Depends(re
 
 @router.get("")
 async def get_account(tracker: TrackerDep, app: AppDep) -> dict[str, Any]:
-    """Account overview: equity, margin, PnL, leverage."""
+    """Account overview: equity, margin, PnL, leverage.
+
+    Prefer the live AccountTracker (updated by clearinghouse polling) over the
+    durable Postgres projection. Projection is only refreshed on reconciliation,
+    so using it first leaves the dashboard stuck on stale zeros after Spot→Perps
+    transfers and similar balance changes.
+    """
+    if tracker is not None:
+        state = tracker.get_account_state()
+        if state is not None:
+            status = tracker.get_status()
+            data = AccountData(
+                equity=Decimal(str(state.equity)),
+                available_balance=Decimal(str(state.available_balance)),
+                total_margin_used=Decimal(str(state.total_margin_used)),
+                total_unrealized_pnl=Decimal(str(state.total_unrealized_pnl)),
+                peak_equity=Decimal(str(state.peak_equity)),
+                drawdown_pct=Decimal(str(state.drawdown_pct)),
+                leverage=Decimal(str(status["leverage"])),
+                total_fees=Decimal(str(status["total_fees"])),
+                total_funding=Decimal(str(status["total_funding"])),
+                fill_count=status["fill_count"],
+                position_count=status["position_count"],
+                last_update=status["last_update"],
+                trading_enabled=app.trading_enabled,
+            )
+            return {"ok": True, "data": data.model_dump(mode="json")}
+
     projection_reader = getattr(app, "projection_reader", None)
     if projection_reader is not None:
         projection = await projection_reader.get_account()
@@ -43,6 +70,7 @@ async def get_account(tracker: TrackerDep, app: AppDep) -> dict[str, Any]:
                     trading_enabled=app.trading_enabled,
                 ).model_dump(mode="json"),
             }
+
     if tracker is None:
         # Monitor-only / no trading credentials: return an empty snapshot instead of
         # 503 so the dashboard does not retry-spam the console.
@@ -65,53 +93,34 @@ async def get_account(tracker: TrackerDep, app: AppDep) -> dict[str, Any]:
             ).model_dump(mode="json"),
         }
 
-    state = tracker.get_account_state()
-    if state is None:
-        # Trading disabled / not yet reconciled: keep the dashboard quiet with zeros.
-        if not app.trading_enabled:
-            return {
-                "ok": True,
-                "data": AccountData(
-                    equity=Decimal("0"),
-                    available_balance=Decimal("0"),
-                    total_margin_used=Decimal("0"),
-                    total_unrealized_pnl=Decimal("0"),
-                    peak_equity=Decimal("0"),
-                    drawdown_pct=Decimal("0"),
-                    leverage=Decimal("0"),
-                    total_fees=Decimal("0"),
-                    total_funding=Decimal("0"),
-                    fill_count=0,
-                    position_count=0,
-                    last_update=None,
-                    trading_enabled=False,
-                ).model_dump(mode="json"),
-            }
-        from hypeedge.api.errors import ApiProblem
+    # Trading disabled / not yet polled: keep the dashboard quiet with zeros.
+    if not app.trading_enabled:
+        return {
+            "ok": True,
+            "data": AccountData(
+                equity=Decimal("0"),
+                available_balance=Decimal("0"),
+                total_margin_used=Decimal("0"),
+                total_unrealized_pnl=Decimal("0"),
+                peak_equity=Decimal("0"),
+                drawdown_pct=Decimal("0"),
+                leverage=Decimal("0"),
+                total_fees=Decimal("0"),
+                total_funding=Decimal("0"),
+                fill_count=0,
+                position_count=0,
+                last_update=None,
+                trading_enabled=False,
+            ).model_dump(mode="json"),
+        }
+    from hypeedge.api.errors import ApiProblem
 
-        raise ApiProblem(
-            503,
-            "ACCOUNT_STATE_UNAVAILABLE",
-            "Authoritative account state is not available",
-            retryable=True,
-        )
-    status = tracker.get_status()
-    data = AccountData(
-        equity=Decimal(str(state.equity)),
-        available_balance=Decimal(str(state.available_balance)),
-        total_margin_used=Decimal(str(state.total_margin_used)),
-        total_unrealized_pnl=Decimal(str(state.total_unrealized_pnl)),
-        peak_equity=Decimal(str(state.peak_equity)),
-        drawdown_pct=Decimal(str(state.drawdown_pct)),
-        leverage=Decimal(str(status["leverage"])),
-        total_fees=Decimal(str(status["total_fees"])),
-        total_funding=Decimal(str(status["total_funding"])),
-        fill_count=status["fill_count"],
-        position_count=status["position_count"],
-        last_update=status["last_update"],
-        trading_enabled=app.trading_enabled,
+    raise ApiProblem(
+        503,
+        "ACCOUNT_STATE_UNAVAILABLE",
+        "Authoritative account state is not available",
+        retryable=True,
     )
-    return {"ok": True, "data": data.model_dump(mode="json")}
 
 
 @router.get("/equity-curve")
