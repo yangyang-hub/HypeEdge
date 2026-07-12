@@ -373,7 +373,7 @@ class HypeEdgeApp:
         )
 
         quota_owner = self.settings.exchange.account_address.lower()
-        from hypeedge.risk.action_budget import CancelHeadroomSnapshot
+        from hypeedge.risk.action_budget import ActionBudgetController, CancelHeadroomSnapshot
 
         self._action_budget_controller = ActionBudgetController(quota_owner, self.settings.action_budget)
         self._action_budget_controller.reconcile_cancel_headroom(
