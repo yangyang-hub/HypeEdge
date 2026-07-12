@@ -277,8 +277,8 @@ class APISettings(HypeSettings):
     model_config = SettingsConfigDict(env_prefix="HYPE_API__", env_file=".env", extra="ignore")
 
     host: str = "127.0.0.1"
-    port: int = Field(default=8080, ge=1024, le=65535)
-    cors_origins: list[str] = Field(default=["http://localhost:3000"])
+    port: int = Field(default=37001, ge=1024, le=65535)
+    cors_origins: list[str] = Field(default=["http://localhost:34001"])
     # ``auth_token`` is retained as a backwards-compatible admin token. New
     # deployments should use the role-specific tokens below.
     auth_token: str = ""

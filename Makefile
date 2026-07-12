@@ -40,10 +40,10 @@ run:
 
 # Emergency kill switch
 kill-switch:
-	@curl -s -X POST http://localhost:8080/api/kill-switch \
+	@curl -s -X POST http://localhost:37001/api/kill-switch \
 		-H "Content-Type: application/json" \
 		-d '{"action":"trigger","reason":"manual_makefile_trigger"}' \
-		|| echo "Error: Is the HypeEdge API server running on port 8080?"
+		|| echo "Error: Is the HypeEdge API server running on port 37001?"
 
 # Clean build artifacts
 clean:

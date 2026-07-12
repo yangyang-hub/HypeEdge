@@ -33,7 +33,7 @@ def create_api(hype_app: Any, cors_origins: list[str] | None = None) -> FastAPI:
 
     Args:
         hype_app: The HypeEdgeApp instance (provides access to all components).
-        cors_origins: Allowed CORS origins (default: localhost:3000 for Next.js dev).
+        cors_origins: Allowed CORS origins (default: localhost:34001 for Next.js dev).
 
     Returns:
         Configured FastAPI app ready to serve.
@@ -172,9 +172,9 @@ def create_api(hype_app: Any, cors_origins: list[str] | None = None) -> FastAPI:
         cors_origins
         if cors_origins is not None
         else [
-            "http://localhost:3000",  # Next.js dev server
-            "http://localhost:3001",
-            "http://127.0.0.1:3000",
+            "http://localhost:34001",  # Next.js dev server
+            "http://localhost:34002",
+            "http://127.0.0.1:34001",
         ]
     )
     if origins:

@@ -29,7 +29,7 @@ Next.js 仅在服务端读取以下变量：
 
 | 变量 | 用途 |
 |---|---|
-| `HYPEEDGE_BACKEND_URL` | 后端内网地址，默认 `http://127.0.0.1:8080` |
+| `HYPEEDGE_BACKEND_URL` | 后端内网地址，默认 `http://127.0.0.1:37001` |
 | `HYPEEDGE_{VIEWER,OPERATOR,ADMIN}_API_TOKEN` | 按登录角色转发给后端，分别匹配对应 `HYPE_API__*TOKEN` |
 | `HYPEEDGE_DASHBOARD_{VIEWER,OPERATOR,ADMIN}_USERNAME` | 对应角色的 Dashboard Basic Auth 用户名 |
 | `HYPEEDGE_DASHBOARD_{VIEWER,OPERATOR,ADMIN}_PASSWORD` | 对应角色的强随机密码 |

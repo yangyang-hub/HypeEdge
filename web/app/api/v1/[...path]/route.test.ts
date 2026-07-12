@@ -9,7 +9,7 @@ describe("HypeEdge backend proxy", () => {
   })
 
   it("injects the server-side bearer token without trusting browser authorization", async () => {
-    vi.stubEnv("HYPEEDGE_BACKEND_URL", "http://backend.internal:8080")
+    vi.stubEnv("HYPEEDGE_BACKEND_URL", "http://backend.internal:37001")
     vi.stubEnv("HYPEEDGE_API_TOKEN", "server-secret".repeat(3))
     vi.stubEnv("HYPEEDGE_DASHBOARD_USERNAME", "operator")
     vi.stubEnv("HYPEEDGE_DASHBOARD_PASSWORD", "dashboard-secret")
@@ -28,7 +28,7 @@ describe("HypeEdge backend proxy", () => {
     )
 
     const [url, init] = fetchMock.mock.calls[0] as [URL, RequestInit]
-    expect(url.toString()).toBe("http://backend.internal:8080/api/v1/system/status")
+    expect(url.toString()).toBe("http://backend.internal:37001/api/v1/system/status")
     expect(new Headers(init.headers).get("Authorization")).toBe(`Bearer ${"server-secret".repeat(3)}`)
   })
 
@@ -77,7 +77,7 @@ describe("HypeEdge backend proxy", () => {
   })
 
   it("forwards command bodies and idempotency keys", async () => {
-    vi.stubEnv("HYPEEDGE_BACKEND_URL", "http://127.0.0.1:8080")
+    vi.stubEnv("HYPEEDGE_BACKEND_URL", "http://127.0.0.1:37001")
     vi.stubEnv("HYPEEDGE_DASHBOARD_OPERATOR_USERNAME", "operator")
     vi.stubEnv("HYPEEDGE_DASHBOARD_OPERATOR_PASSWORD", "operator-password")
     vi.stubEnv("HYPEEDGE_OPERATOR_API_TOKEN", "o".repeat(32))

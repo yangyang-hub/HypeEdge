@@ -119,7 +119,7 @@ function csrfFailure(request: NextRequest): Response | null {
 }
 
 function backendBaseUrl(): URL {
-  const configured = process.env.HYPEEDGE_BACKEND_URL ?? "http://127.0.0.1:8080"
+  const configured = process.env.HYPEEDGE_BACKEND_URL ?? "http://127.0.0.1:37001"
   const url = new URL(configured)
   if (!url.protocol.startsWith("http")) throw new Error("HYPEEDGE_BACKEND_URL must use HTTP or HTTPS")
   return url

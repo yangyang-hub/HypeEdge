@@ -134,7 +134,7 @@ backtest:
 
 api:
   host: 127.0.0.1
-  port: 8080
+  port: 37001
   request_rate_limit_per_minute: 600
   mutation_rate_limit_per_minute: 60
   auth_failure_limit_per_minute: 10
@@ -143,7 +143,7 @@ api:
   market_ws_queue_size: 64
   market_ws_messages_per_second: 50
   cors_origins:
-    - http://localhost:3000
+    - http://localhost:34001
 
 features:
   legacy_execution: false

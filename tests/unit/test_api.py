@@ -146,7 +146,7 @@ def _make_mock_app():
     app_mock.settings.api = MagicMock()
     app_mock.settings.api.auth_token = ""
     app_mock.settings.api.host = "127.0.0.1"
-    app_mock.settings.api.cors_origins = ["http://localhost:3000"]
+    app_mock.settings.api.cors_origins = ["http://localhost:34001"]
     app_mock.settings.api.request_rate_limit_per_minute = 600
     app_mock.settings.api.mutation_rate_limit_per_minute = 60
     app_mock.settings.api.auth_failure_limit_per_minute = 10
