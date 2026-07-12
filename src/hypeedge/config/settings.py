@@ -278,7 +278,12 @@ class APISettings(HypeSettings):
 
     host: str = "127.0.0.1"
     port: int = Field(default=37001, ge=1024, le=65535)
-    cors_origins: list[str] = Field(default=["http://localhost:34001"])
+    cors_origins: list[str] = Field(
+        default_factory=lambda: [
+            "http://localhost:34001",
+            "http://127.0.0.1:34001",
+        ]
+    )
     # ``auth_token`` is retained as a backwards-compatible admin token. New
     # deployments should use the role-specific tokens below.
     auth_token: str = ""

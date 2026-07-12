@@ -132,6 +132,7 @@ async def test_durable_replay_reads_unpublished_committed_rows_after_restart() -
     request = SimpleNamespace(is_disconnected=AsyncMock(return_value=True))
     stream = _event_stream(request, app, after_sequence=4)
     try:
+        assert await anext(stream) == ": connected\n\n"
         frame = await anext(stream)
         assert frame.startswith("id: 7\nevent: order.filled")
         assert json.loads(frame.split("data: ", 1)[1])["sequence"] == 7
@@ -147,6 +148,7 @@ async def test_retention_gap_emits_explicit_resync_at_latest_sequence() -> None:
     request = SimpleNamespace(is_disconnected=AsyncMock(return_value=True))
     stream = _event_stream(request, app, after_sequence=2)
     try:
+        assert await anext(stream) == ": connected\n\n"
         frame = await anext(stream)
         assert frame.startswith("id: 11\nevent: StreamResyncRequired")
         data = json.loads(frame.split("data: ", 1)[1])
@@ -168,6 +170,7 @@ async def test_client_sequence_ahead_of_database_is_reset_by_resync_event() -> N
     request = SimpleNamespace(is_disconnected=AsyncMock(return_value=True))
     stream = _event_stream(request, app, after_sequence=99)
     try:
+        assert await anext(stream) == ": connected\n\n"
         frame = await anext(stream)
         assert frame.startswith("id: 5\nevent: StreamResyncRequired")
         assert json.loads(frame.split("data: ", 1)[1])["payload"]["latest_available"] == 5

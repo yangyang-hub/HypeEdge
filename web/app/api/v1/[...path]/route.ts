@@ -159,6 +159,7 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<Respo
   upstream.search = request.nextUrl.search
 
   const hasBody = request.method !== "GET" && request.method !== "HEAD"
+  const isEventStream = path.join("/") === "events"
   try {
     const response = await fetch(upstream, {
       method: request.method,
@@ -174,6 +175,12 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<Respo
       if (!HOP_BY_HOP_HEADERS.has(name.toLowerCase())) headers.set(name, value)
     }
     headers.set("Cache-Control", response.headers.get("Cache-Control") ?? "no-store")
+    if (isEventStream) {
+      // Backend yields an immediate ": connected" comment so Next does not buffer
+      // the SSE response until the first durable event / heartbeat.
+      headers.set("Cache-Control", "no-cache, no-transform")
+      headers.set("X-Accel-Buffering", "no")
+    }
     return new Response(response.body, { status: response.status, headers })
   } catch {
     return Response.json(

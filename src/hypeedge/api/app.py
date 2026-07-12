@@ -175,6 +175,7 @@ def create_api(hype_app: Any, cors_origins: list[str] | None = None) -> FastAPI:
             "http://localhost:34001",  # Next.js dev server
             "http://localhost:34002",
             "http://127.0.0.1:34001",
+            "http://192.168.31.5:34001",
         ]
     )
     if origins:

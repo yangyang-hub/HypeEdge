@@ -15,6 +15,12 @@ const websocketOrigins = [
   websocketOrigin(process.env.NEXT_PUBLIC_HYPEEDGE_MM_WS_URL),
 ].filter((value): value is string => value !== null)
 
+// Next.js dev (React Refresh / webpack) requires 'unsafe-eval'; keep production tight.
+const scriptSrc =
+  process.env.NODE_ENV === "development"
+    ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
+    : "script-src 'self' 'unsafe-inline'"
+
 const contentSecurityPolicy = [
   "default-src 'self'",
   "base-uri 'self'",
@@ -24,7 +30,7 @@ const contentSecurityPolicy = [
   "frame-ancestors 'none'",
   "img-src 'self' data:",
   "object-src 'none'",
-  "script-src 'self' 'unsafe-inline'",
+  scriptSrc,
   "style-src 'self' 'unsafe-inline'",
 ].join("; ")
 

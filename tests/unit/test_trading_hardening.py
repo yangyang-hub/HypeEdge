@@ -792,6 +792,7 @@ class TestSseIsolationAndReplay:
         request = SimpleNamespace(is_disconnected=AsyncMock(return_value=True))
         stream = _event_stream(request, app, after_sequence=0)
         try:
+            assert await anext(stream) == ": connected\n\n"
             assert await anext(stream) == BufferedEvent(1, "OrderFilled", "{}").encode()
             with pytest.raises(StopAsyncIteration):
                 await anext(stream)
@@ -825,6 +826,7 @@ class TestSseIsolationAndReplay:
         stream = _event_stream(request, app, after_sequence=None)
         broker: SseBroker | None = None
         try:
+            assert await anext(stream) == ": connected\n\n"
             assert await anext(stream) == ": heartbeat\n\n"
             with pytest.raises(StopAsyncIteration):
                 await anext(stream)

@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any
 
+import structlog
 from fastapi import APIRouter, Depends, Header, Request
 from fastapi.responses import StreamingResponse
 
@@ -19,6 +20,8 @@ from hypeedge.api.auth import require_viewer
 from hypeedge.api.deps import AppDep
 from hypeedge.api.schemas import decimal_string
 from hypeedge.storage.outbox import DurableEvent, DurableOutboxStore
+
+logger = structlog.get_logger(__name__)
 
 router = APIRouter(tags=["events"], dependencies=[Depends(require_viewer)])
 
@@ -257,11 +260,18 @@ async def _event_stream(
     queue, replay = broker.subscribe(after_sequence)
     last_sent = after_sequence or 0
     try:
+        # Flush immediately so reverse proxies (e.g. Next.js) do not buffer the
+        # response until the first durable event or 15s heartbeat arrives.
+        yield ": connected\n\n"
         if broker.store is not None:
-            async for event in _durable_replay(broker, queue, after_sequence):
-                if event.event_type == "StreamResyncRequired" or event.sequence >= last_sent:
-                    last_sent = event.sequence
-                    yield event.encode()
+            try:
+                async for event in _durable_replay(broker, queue, after_sequence):
+                    if event.event_type == "StreamResyncRequired" or event.sequence >= last_sent:
+                        last_sent = event.sequence
+                        yield event.encode()
+            except Exception:
+                logger.exception("sse_durable_replay_failed", after_sequence=after_sequence)
+                yield "event: error\ndata: {\"detail\":\"sse_replay_unavailable\"}\n\n"
         else:
             for event in replay:
                 last_sent = max(last_sent, event.sequence)
