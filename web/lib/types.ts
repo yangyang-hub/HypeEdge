@@ -152,6 +152,7 @@ export interface StrategyInstanceBase {
   archived_at: string | null
   created_at: string
   updated_at: string
+  metadata?: Record<string, string>
 }
 
 export interface TrendFollowStrategyInstance extends StrategyInstanceBase {
@@ -393,6 +394,16 @@ export interface MarketMakerConfig {
   max_quote_age_ms: number
   market_stale_after_ms: number
   account_stale_after_ms: number
+}
+
+/** Payload for POST /api/v1/strategies (market_maker only). */
+export interface StrategyCreateRequest {
+  strategy_id: string
+  strategy_type: "market_maker"
+  sub_account: string
+  symbol: string
+  initial_config: MarketMakerConfig
+  metadata?: Record<string, string>
 }
 
 export interface MarketMakerConfigVersion {

@@ -87,6 +87,7 @@ def _strategy_payload(value: Any, *, actual_state: str | None = None) -> Any:  #
             payload["actual_state"] = payload["status"]
         return payload
     desired = definition.desired_state.value
+    metadata = _safe(getattr(value, "metadata", {}))
     return {
         "strategy_id": str(definition.strategy_id),
         "strategy_type": definition.strategy_type,
@@ -98,7 +99,7 @@ def _strategy_payload(value: Any, *, actual_state: str | None = None) -> Any:  #
         "desired_config_version_id": definition.desired_config_revision,
         "effective_config_version_id": None,
         "revision": definition.revision,
-        "metadata": _safe(getattr(value, "metadata", {})),
+        "metadata": metadata if isinstance(metadata, dict) else {},
         "archived_at": _safe(getattr(value, "archived_at", None)),
         "created_at": _safe(getattr(value, "created_at", None)),
         "updated_at": _safe(getattr(value, "updated_at", None)),

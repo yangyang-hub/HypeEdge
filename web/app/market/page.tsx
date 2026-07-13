@@ -9,9 +9,9 @@ import { EmptyState, Panel, StaleBanner } from "@/components/ui/data-display"
 import { SegmentedControl } from "@/components/ui/segmented-control"
 import { useMarket } from "@/hooks/use-market"
 import type { DecimalString } from "@/lib/types"
+import { TRADE_SYMBOLS } from "@/lib/constants"
 import { cn, formatPct, formatPrice, formatSize } from "@/lib/utils"
 
-const SYMBOLS = ["BTC", "ETH", "SOL"]
 const INTERVALS = [
   { value: "1m", label: "1m" },
   { value: "5m", label: "5m" },
@@ -21,7 +21,7 @@ const INTERVALS = [
 ]
 
 export default function MarketPage() {
-  const [symbol, setSymbol] = useState("BTC")
+  const [symbol, setSymbol] = useState<string>(TRADE_SYMBOLS[0])
   const [interval, setInterval] = useState("1m")
   const [tradesOpen, setTradesOpen] = useState(false)
   const { book, funding, candles, meta, errors, isLoading, streamConnected } = useMarket(symbol, interval)
@@ -45,7 +45,7 @@ export default function MarketPage() {
             onChange={(event) => setSymbol(event.target.value)}
             className="h-7 rounded-sm border border-border-default bg-bg-elevated px-2 text-sm font-semibold text-text-primary"
           >
-            {SYMBOLS.map((item) => (
+            {TRADE_SYMBOLS.map((item) => (
               <option key={item} value={item}>
                 {item}
               </option>

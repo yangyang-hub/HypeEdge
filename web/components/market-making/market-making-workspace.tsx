@@ -26,6 +26,7 @@ import {
   useMarketMaking,
 } from "@/hooks/use-market-making"
 import { useMarketMakingRealtime, type MarketMakingDisplayOverlay } from "@/hooks/use-market-making-realtime"
+import { MarketMakerConfigFields } from "@/components/market-making/market-maker-config-fields"
 import type {
   BudgetMode,
   DecimalString,
@@ -52,9 +53,11 @@ const LIFECYCLE_ACTIONS = ["start", "pause", "resume", "drain", "stop"] as const
 
 interface MarketMakingWorkspaceProps {
   strategyId: string
+  /** Shown once after create wizard redirects here. */
+  justCreated?: boolean
 }
 
-export function MarketMakingWorkspace({ strategyId }: MarketMakingWorkspaceProps) {
+export function MarketMakingWorkspace({ strategyId, justCreated = false }: MarketMakingWorkspaceProps) {
   const snapshot = useMarketMaking(strategyId)
   const realtime = useMarketMakingRealtime(
     strategyId,
@@ -65,6 +68,7 @@ export function MarketMakingWorkspace({ strategyId }: MarketMakingWorkspaceProps
   const [pendingAction, setPendingAction] = useState<(typeof LIFECYCLE_ACTIONS)[number] | null>(null)
   const [confirmation, setConfirmation] = useState("")
   const [commandError, setCommandError] = useState<string | null>(null)
+  const [showCreatedBanner, setShowCreatedBanner] = useState(justCreated)
   const state = snapshot.state
 
   async function executeLifecycleAction(action: (typeof LIFECYCLE_ACTIONS)[number]) {
@@ -90,6 +94,23 @@ export function MarketMakingWorkspace({ strategyId }: MarketMakingWorkspaceProps
     <AppShell>
         <main id="main-content" className="flex-1 space-y-5 overflow-y-auto p-3 md:p-5">
           <header className="space-y-3">
+            {showCreatedBanner ? (
+              <div
+                role="status"
+                className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-info/30 bg-info/10 px-3 py-2 text-sm text-info"
+              >
+                <span>
+                  策略已创建，当前为 <strong>stopped</strong>。建议先 <strong>Shadow</strong> 验证，再切到 Running。
+                </span>
+                <button
+                  type="button"
+                  className="text-xs underline underline-offset-2 hover:text-text-primary"
+                  onClick={() => setShowCreatedBanner(false)}
+                >
+                  知道了
+                </button>
+              </div>
+            ) : null}
             <div className="flex flex-wrap items-start justify-between gap-3">
               <div>
                 <Link href="/strategy" className="mb-2 inline-flex items-center gap-1 text-sm text-text-secondary hover:text-text-primary">
@@ -635,14 +656,6 @@ function ConfigEditor({
   const [message, setMessage] = useState<string | null>(null)
   const selected = versions.find((version) => version.version === selectedVersion) ?? current
 
-  function setDecimal(key: keyof MarketMakerConfig, value: string) {
-    setDraft((previous) => ({ ...previous, [key]: value as DecimalString }))
-  }
-
-  function setInteger(key: keyof MarketMakerConfig, value: string) {
-    setDraft((previous) => ({ ...previous, [key]: Number.parseInt(value, 10) || 0 }))
-  }
-
   async function submit(operation: "create" | "activate" | "rollback") {
     const required = environment === "mainnet" ? "CONFIRM MAINNET CONFIG" : "CONFIRM"
     if (operation !== "create" && confirmation !== required) {
@@ -660,49 +673,9 @@ function ConfigEditor({
     }
   }
 
-  const decimalFields: Array<[keyof MarketMakerConfig, string]> = [
-    ["soft_inventory_notional", "Soft inventory (USDC)"],
-    ["hard_inventory_notional", "Hard inventory (USDC)"],
-    ["emergency_inventory_notional", "Emergency inventory (USDC)"],
-    ["quote_size", "Quote size"],
-    ["max_depth_participation", "Max depth participation"],
-    ["inventory_skew_bps", "Inventory skew (bps)"],
-    ["max_inventory_shift_bps", "Max inventory shift (bps)"],
-    ["min_half_spread_bps", "Minimum half spread (bps)"],
-    ["toxicity_spread_bps", "Toxicity spread (bps)"],
-    ["min_expected_pnl_usdc", "Min expected PnL (USDC)"],
-    ["external_reference_weight", "External reference weight"],
-    ["external_max_age_seconds", "External max age (seconds)"],
-    ["external_outlier_bps", "External outlier threshold (bps)"],
-    ["max_external_shift_ticks", "Max external shift (ticks)"],
-    ["max_total_fair_shift_ticks", "Max total fair shift (ticks)"],
-    ["latency_risk_multiplier", "Latency risk multiplier"],
-    ["conservative_latency_seconds", "Conservative latency (seconds)"],
-    ["conservative_markout_bps", "Conservative markout (bps)"],
-  ]
-  const integerFields: Array<[keyof MarketMakerConfig, string]> = [
-    ["min_quote_lifetime_ms", "Min quote lifetime (ms)"],
-    ["refresh_cooldown_ms", "Refresh cooldown (ms)"],
-    ["max_quote_age_ms", "Max quote age (ms)"],
-    ["market_stale_after_ms", "Max market age (ms)"],
-    ["account_stale_after_ms", "Max account age (ms)"],
-    ["min_markout_samples", "Minimum mature markout samples"],
-  ]
-
   return (
     <div className="space-y-5">
-      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-3">
-        {decimalFields.map(([key, label]) => (
-          <label key={key} className="text-xs text-text-secondary">{label}
-            <input value={String(draft[key])} onChange={(event) => setDecimal(key, event.target.value)} inputMode="decimal" className="mt-1 w-full rounded-md border border-border-strong bg-bg-elevated px-3 py-2 font-mono text-sm text-white" />
-          </label>
-        ))}
-        {integerFields.map(([key, label]) => (
-          <label key={key} className="text-xs text-text-secondary">{label}
-            <input value={String(draft[key])} onChange={(event) => setInteger(key, event.target.value)} inputMode="numeric" className="mt-1 w-full rounded-md border border-border-strong bg-bg-elevated px-3 py-2 font-mono text-sm text-white" />
-          </label>
-        ))}
-      </div>
+      <MarketMakerConfigFields mode="full" value={draft} onChange={setDraft} />
       <button type="button" onClick={() => void submit("create")} className="rounded-md border border-border-strong px-3 py-2 text-sm hover:bg-bg-hover">保存为不可变新版本</button>
 
       <div className="grid gap-4 border-t border-border-default pt-4 lg:grid-cols-2">

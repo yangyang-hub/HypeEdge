@@ -1,39 +1,60 @@
 "use client"
 
 import Link from "next/link"
+import { useState } from "react"
 import { AppShell } from "@/components/layout/app-shell"
 import { PageHeader } from "@/components/layout/page-header"
+import { CreateMarketMakerDialog } from "@/components/strategy/create-market-maker-dialog"
 import { Button } from "@/components/ui/button"
 import { EmptyState, Panel } from "@/components/ui/data-display"
 import { StrategyStatusChip } from "@/components/ui/strategy-status-chip"
 import { useStrategies, startStrategy, stopStrategy } from "@/hooks/use-strategies"
+import { ApiError } from "@/lib/api"
 import { formatDateTime } from "@/lib/utils"
 import type { StrategyInstance } from "@/lib/types"
 
 export default function StrategyPage() {
   const { strategies, refresh, error, isLoading } = useStrategies()
+  const [createOpen, setCreateOpen] = useState(false)
+  const [actionError, setActionError] = useState<string | null>(null)
 
-  async function handleToggle(id: string, status: string) {
+  async function handleToggle(strategy: StrategyInstance) {
+    setActionError(null)
     try {
-      if (status === "running" || status === "shadow") {
-        await stopStrategy(id)
+      if (strategy.actual_state === "running" || strategy.actual_state === "shadow") {
+        await stopStrategy(strategy)
       } else {
-        await startStrategy(id)
+        await startStrategy(strategy, strategy.strategy_type === "market_maker" ? "shadow" : "running")
       }
-      refresh()
+      await refresh()
     } catch (e) {
-      console.error("Strategy toggle failed:", e)
+      setActionError(e instanceof ApiError ? e.message : e instanceof Error ? e.message : "策略启停失败")
     }
   }
+
+  const createButton = (
+    <Button type="button" variant="primary" size="sm" onClick={() => setCreateOpen(true)}>
+      新建做市策略
+    </Button>
+  )
 
   return (
     <AppShell>
       <main id="main-content" className="flex-1 space-y-4 overflow-y-auto p-3 md:p-5">
-        <PageHeader title="策略管理" subtitle="启停策略实例并进入做市工作台" />
+        <PageHeader
+          title="策略管理"
+          subtitle="创建做市实例、启停策略并进入工作台"
+          actions={createButton}
+        />
 
         {error ? (
           <p role="status" className="rounded-md border border-warning/30 bg-warning/10 px-3 py-2 text-sm text-warning">
             策略列表刷新失败，显示缓存数据
+          </p>
+        ) : null}
+        {actionError ? (
+          <p role="alert" className="rounded-md border border-critical/30 bg-critical/10 px-3 py-2 text-sm text-critical">
+            {actionError}
           </p>
         ) : null}
 
@@ -43,7 +64,7 @@ export default function StrategyPage() {
           </Panel>
         ) : strategies.length === 0 ? (
           <Panel>
-            <EmptyState message="无策略实例" />
+            <EmptyState message="无策略实例" action={createButton} />
           </Panel>
         ) : (
           <div className="space-y-3">
@@ -53,6 +74,13 @@ export default function StrategyPage() {
           </div>
         )}
       </main>
+
+      <CreateMarketMakerDialog
+        open={createOpen}
+        onOpenChange={setCreateOpen}
+        existing={strategies}
+        onCreated={() => void refresh()}
+      />
     </AppShell>
   )
 }
@@ -62,7 +90,7 @@ function StrategyRow({
   onToggle,
 }: {
   strategy: StrategyInstance
-  onToggle: (id: string, status: string) => Promise<void>
+  onToggle: (strategy: StrategyInstance) => Promise<void>
 }) {
   const running = s.actual_state === "running" || s.actual_state === "shadow"
   const busy = s.actual_state === "draining" || s.actual_state === "warming"
@@ -83,6 +111,7 @@ function StrategyRow({
           </div>
           <div className="text-2xs text-text-tertiary">
             Desired {s.desired_state} · Runtime revision {s.revision}
+            {s.metadata?.note ? ` · ${s.metadata.note}` : ""}
           </div>
         </div>
 
@@ -97,8 +126,8 @@ function StrategyRow({
             variant={running ? "secondary" : "primary"}
             size="sm"
             disabled={busy}
-            title={busy ? "生命周期切换中" : undefined}
-            onClick={() => void onToggle(s.strategy_id, s.actual_state)}
+            title={busy ? "生命周期切换中" : s.strategy_type === "market_maker" && !running ? "启动为 Shadow" : undefined}
+            onClick={() => void onToggle(s)}
           >
             {running ? "停止" : "启动"}
           </Button>

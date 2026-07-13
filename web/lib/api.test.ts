@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { fetcher, poster } from "@/lib/api"
+import { createIdempotencyKey, fetcher, poster } from "@/lib/api"
+
+const UUID_V4 =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 
 describe("API client", () => {
   afterEach(() => vi.restoreAllMocks())
@@ -49,5 +52,20 @@ describe("API client", () => {
     const init = fetchMock.mock.calls[0][1] as RequestInit
     expect(new Headers(init.headers).get("If-Match")).toBe('"17"')
     expect(new Headers(init.headers).get("Idempotency-Key")).toBeTruthy()
+  })
+
+  it("creates a UUID even when crypto.randomUUID is unavailable", () => {
+    const original = globalThis.crypto
+    vi.stubGlobal("crypto", {
+      getRandomValues: (arr: Uint8Array) => {
+        for (let i = 0; i < arr.length; i++) arr[i] = i
+        return arr
+      },
+    })
+    try {
+      expect(createIdempotencyKey()).toMatch(UUID_V4)
+    } finally {
+      vi.stubGlobal("crypto", original)
+    }
   })
 })

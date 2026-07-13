@@ -5,6 +5,10 @@ export const SWR_REFRESH_INTERVAL = 5000
 export const SWR_SLOW_INTERVAL = 30000
 export const SWR_FAST_INTERVAL = 60000
 
+/** Tradable symbols shown in market / strategy create pickers. */
+export const TRADE_SYMBOLS = ["BTC", "ETH", "SOL"] as const
+export type TradeSymbol = (typeof TRADE_SYMBOLS)[number]
+
 export const ORDER_STATUS_LABELS: Record<string, string> = {
   pending: "待处理",
   submitted: "已提交",
