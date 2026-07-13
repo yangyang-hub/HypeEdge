@@ -110,7 +110,10 @@ P5–P7 可在 P3/P4 接口冻结后并行，但任何真实 placement 必须等
 1. 定义并实现 `TradingCommandService`：Safety -> DataHealth -> Risk -> ActionBudget -> Normalize -> durable transaction。
 2. 策略不再注入 `ExecutionEngine`，改为 `QuoteCommandClient/TradingCommandClient`。
 3. 实现 `StrategyRegistry/StrategySupervisor`，替代 `app.py` 硬编码单一 `TrendFollowStrategy`。
+   多策略类型插件、前端可创建非做市实例、以及 Trend 迁入控制面的分期（P0–P2）见
+   `docs/strategy_control_plane.md` §10 与 `docs/design.md` §19。
 4. 支持 `STOPPED/WARMING/SHADOW/RUNNING/PAUSED/DRAINING/FAULTED` 生命周期。
+   非做市类型按 capabilities 使用子集（如 trend：stopped/running/paused），不强制对外 shadow。
 5. YAML 只保留环境安全默认和上限；实例参数以 Postgres 不可变配置版本为主，避免双主。
 
 ### Postgres migration 007+

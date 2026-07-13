@@ -241,13 +241,58 @@ class MarketMakerConfigVersionCreateRequest(StrictModel):
     config: MarketMakerConfigCreateRequest
 
 
-class StrategyCreateRequest(StrictModel):
+class TrendFollowConfigCreateRequest(StrictModel):
+    fast_ema_period: int = Field(gt=0, le=10_000)
+    slow_ema_period: int = Field(gt=0, le=10_000)
+    signal_ema_period: int = Field(default=9, gt=0, le=10_000)
+    momentum_period: int = Field(default=10, gt=0, le=10_000)
+    momentum_threshold: DecimalString = Field(default=Decimal("0"))
+    atr_period: int = Field(default=14, gt=0, le=10_000)
+    atr_position_multiplier: DecimalString = Field(default=Decimal("0.5"), gt=0)
+    atr_stop_multiplier: DecimalString = Field(default=Decimal("2"), gt=0)
+    max_position_pct: DecimalString = Field(default=Decimal("0.15"), gt=0, le=1)
+    risk_per_trade_pct: DecimalString = Field(default=Decimal("0.01"), gt=0, le=1)
+    macd_cross_threshold: DecimalString = Field(default=Decimal("0"))
+
+    @model_validator(mode="after")
+    def validate_ema_order(self) -> TrendFollowConfigCreateRequest:
+        if not self.fast_ema_period < self.slow_ema_period:
+            raise ValueError("fast_ema_period must be < slow_ema_period")
+        return self
+
+
+class TrendFollowConfigVersionCreateRequest(StrictModel):
+    strategy_type: Literal["trend_follow"] = "trend_follow"
+    config: TrendFollowConfigCreateRequest
+
+
+class MarketMakerStrategyCreateRequest(StrictModel):
     strategy_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
     strategy_type: Literal["market_maker"] = "market_maker"
     sub_account: str = Field(min_length=1, max_length=128)
     symbol: str = Field(min_length=1, max_length=20, pattern=r"^[A-Z0-9][A-Z0-9_.-]*$")
     initial_config: MarketMakerConfigCreateRequest
     metadata: dict[str, str] = Field(default_factory=dict)
+
+
+class TrendFollowStrategyCreateRequest(StrictModel):
+    strategy_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
+    strategy_type: Literal["trend_follow"]
+    sub_account: str = Field(min_length=1, max_length=128)
+    symbol: str = Field(min_length=1, max_length=20, pattern=r"^[A-Z0-9][A-Z0-9_.-]*$")
+    initial_config: TrendFollowConfigCreateRequest
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
+StrategyCreateRequest = Annotated[
+    MarketMakerStrategyCreateRequest | TrendFollowStrategyCreateRequest,
+    Field(discriminator="strategy_type"),
+]
+
+StrategyConfigVersionCreateRequest = Annotated[
+    MarketMakerConfigVersionCreateRequest | TrendFollowConfigVersionCreateRequest,
+    Field(discriminator="strategy_type"),
+]
 
 
 class DangerousActionConfirmation(StrictModel):

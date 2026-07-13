@@ -10,6 +10,7 @@ from typing import Any, Protocol
 from hypeedge.core.enums import MarketMakerLifecycle
 from hypeedge.core.exceptions import StrategyRegistrationError
 from hypeedge.core.types import StrategyId, SubAccount, Symbol
+from hypeedge.strategy.plugin import StrategyTypeCapabilities, StrategyTypePlugin
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,12 +66,14 @@ StrategyFactory = Callable[[StrategyBuildContext], StrategyRuntimeHandle]
 
 
 class StrategyRegistry:
-    """Maps stable strategy type names to factories; instances remain independent."""
+    """Maps stable strategy type names to factories/plugins; instances remain independent."""
 
     def __init__(self) -> None:
         self._factories: dict[str, StrategyFactory] = {}
+        self._plugins: dict[str, StrategyTypePlugin] = {}
 
     def register(self, strategy_type: str, factory: StrategyFactory) -> None:
+        """Register a runtime factory (backward-compatible with market-maker wiring)."""
         normalized = strategy_type.strip().lower()
         if not normalized:
             raise StrategyRegistrationError("Strategy type is required")
@@ -78,11 +81,21 @@ class StrategyRegistry:
             raise StrategyRegistrationError(f"Strategy type is already registered: {normalized}")
         self._factories[normalized] = factory
 
+    def register_plugin(self, plugin: StrategyTypePlugin) -> None:
+        normalized = plugin.strategy_type.strip().lower()
+        if not normalized:
+            raise StrategyRegistrationError("Strategy type is required")
+        if normalized in self._factories or normalized in self._plugins:
+            raise StrategyRegistrationError(f"Strategy type is already registered: {normalized}")
+        self._plugins[normalized] = plugin
+        self._factories[normalized] = plugin.factory
+
     def unregister(self, strategy_type: str) -> None:
         normalized = strategy_type.strip().lower()
         if normalized not in self._factories:
             raise StrategyRegistrationError(f"Strategy type is not registered: {normalized}")
         del self._factories[normalized]
+        self._plugins.pop(normalized, None)
 
     def create(self, context: StrategyBuildContext) -> StrategyRuntimeHandle:
         normalized = context.instance.strategy_type.strip().lower()
@@ -90,6 +103,13 @@ class StrategyRegistry:
         if factory is None:
             raise StrategyRegistrationError(f"Strategy type is not registered: {normalized}")
         return factory(context)
+
+    def get_plugin(self, strategy_type: str) -> StrategyTypePlugin | None:
+        return self._plugins.get(strategy_type.strip().lower())
+
+    def capabilities(self, strategy_type: str) -> StrategyTypeCapabilities | None:
+        plugin = self.get_plugin(strategy_type)
+        return plugin.capabilities if plugin is not None else None
 
     @property
     def strategy_types(self) -> tuple[str, ...]:

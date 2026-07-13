@@ -493,6 +493,39 @@ class MarketMakerConfigVersionRecord(Base):
     account_stale_after_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
 
 
+class TrendFollowConfigVersionRecord(Base):
+    """Typed, immutable trend-follow parameters for one config version."""
+
+    __tablename__ = "trend_follow_config_versions"
+    __table_args__ = (
+        CheckConstraint("fast_ema_period > 0", name="ck_tf_config_fast_ema"),
+        CheckConstraint("slow_ema_period > 0", name="ck_tf_config_slow_ema"),
+        CheckConstraint("fast_ema_period < slow_ema_period", name="ck_tf_config_ema_order"),
+        CheckConstraint("signal_ema_period > 0", name="ck_tf_config_signal_ema"),
+        CheckConstraint("momentum_period > 0", name="ck_tf_config_momentum_period"),
+        CheckConstraint("atr_period > 0", name="ck_tf_config_atr_period"),
+        CheckConstraint("atr_position_multiplier > 0", name="ck_tf_config_atr_pos_mult"),
+        CheckConstraint("atr_stop_multiplier > 0", name="ck_tf_config_atr_stop_mult"),
+        CheckConstraint("max_position_pct > 0 AND max_position_pct <= 1", name="ck_tf_config_max_pos"),
+        CheckConstraint("risk_per_trade_pct > 0 AND risk_per_trade_pct <= 1", name="ck_tf_config_risk"),
+    )
+
+    config_version_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_config_versions.id", ondelete="RESTRICT"), primary_key=True
+    )
+    fast_ema_period: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    slow_ema_period: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    signal_ema_period: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    momentum_period: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    momentum_threshold: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    atr_period: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    atr_position_multiplier: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    atr_stop_multiplier: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    max_position_pct: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    risk_per_trade_pct: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    macd_cross_threshold: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+
+
 class StrategyRuntimeStateRecord(Base):
     """Recoverable hot state acknowledged by the active supervisor."""
 

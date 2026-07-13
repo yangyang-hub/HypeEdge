@@ -396,15 +396,38 @@ export interface MarketMakerConfig {
   account_stale_after_ms: number
 }
 
-/** Payload for POST /api/v1/strategies (market_maker only). */
-export interface StrategyCreateRequest {
-  strategy_id: string
-  strategy_type: "market_maker"
-  sub_account: string
-  symbol: string
-  initial_config: MarketMakerConfig
-  metadata?: Record<string, string>
+export interface TrendFollowConfig {
+  fast_ema_period: number
+  slow_ema_period: number
+  signal_ema_period: number
+  momentum_period: number
+  momentum_threshold: DecimalString
+  atr_period: number
+  atr_position_multiplier: DecimalString
+  atr_stop_multiplier: DecimalString
+  max_position_pct: DecimalString
+  risk_per_trade_pct: DecimalString
+  macd_cross_threshold: DecimalString
 }
+
+/** Payload for POST /api/v1/strategies (discriminated by strategy_type). */
+export type StrategyCreateRequest =
+  | {
+      strategy_id: string
+      strategy_type: "market_maker"
+      sub_account: string
+      symbol: string
+      initial_config: MarketMakerConfig
+      metadata?: Record<string, string>
+    }
+  | {
+      strategy_id: string
+      strategy_type: "trend_follow"
+      sub_account: string
+      symbol: string
+      initial_config: TrendFollowConfig
+      metadata?: Record<string, string>
+    }
 
 export interface MarketMakerConfigVersion {
   id: number

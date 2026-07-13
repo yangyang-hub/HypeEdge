@@ -267,6 +267,54 @@ class TestMarketMakingControlPlane:
         assert item["desired_state"] == "shadow"
 
     @pytest.mark.asyncio
+    async def test_creates_trend_follow_strategy_via_discriminated_union(self):
+        from hypeedge.storage.market_making import default_trend_follow_config
+
+        app_mock = _make_mock_app()
+        repository = MagicMock()
+        created = SimpleNamespace(
+            definition=SimpleNamespace(
+                strategy_id=StrategyId("trend-btc-1"),
+                strategy_type="trend_follow",
+                sub_account=SubAccount("trend_btc"),
+                symbol=Symbol("BTC"),
+                desired_state=MarketMakerLifecycle.STOPPED,
+                desired_config_revision=1,
+                revision=0,
+            ),
+            metadata={},
+            archived_at=None,
+            created_at=datetime(2026, 7, 13, tzinfo=UTC),
+            updated_at=datetime(2026, 7, 13, tzinfo=UTC),
+        )
+        repository.create_strategy_instance = AsyncMock(return_value=created)
+        app_mock.market_making_repository = repository
+        api_app = create_api(app_mock)
+        raw = default_trend_follow_config()
+        body = {
+            "strategy_id": "trend-btc-1",
+            "strategy_type": "trend_follow",
+            "sub_account": "trend_btc",
+            "symbol": "BTC",
+            "initial_config": {
+                key: (format(value, "f") if isinstance(value, Decimal) else value) for key, value in raw.items()
+            },
+        }
+        async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/strategies",
+                json=body,
+                headers={"Idempotency-Key": "create-trend-1"},
+            )
+
+        assert response.status_code == 200, response.text
+        data = response.json()["data"]
+        assert data["strategy_type"] == "trend_follow"
+        assert data["strategy_id"] == "trend-btc-1"
+        repository.create_strategy_instance.assert_awaited()
+        assert repository.create_strategy_instance.await_args.kwargs["strategy_type"] == "trend_follow"
+
+    @pytest.mark.asyncio
     async def test_lists_legacy_trend_strategy_with_actual_state(self):
         app_mock = _make_mock_app()
         app_mock.market_making_repository = None

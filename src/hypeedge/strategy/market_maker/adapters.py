@@ -7,7 +7,7 @@ only when a repository exposes one atomic durable quote-plan transaction.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal
 from typing import Any, Protocol, cast
@@ -119,11 +119,18 @@ class DurableQuotePlanCommandAdapter:
 
 
 class LiveCapabilityStrategySupervisor:
-    """Reject RUNNING transitions before lifecycle state can overstate capability."""
+    """Reject unsupported lifecycle actions and RUNNING before live capability exists."""
 
-    def __init__(self, supervisor: Any, commands: DurableQuotePlanCommandAdapter) -> None:  # noqa: ANN401
+    def __init__(
+        self,
+        supervisor: Any,  # noqa: ANN401
+        commands: DurableQuotePlanCommandAdapter,
+        *,
+        registry: Any | None = None,  # noqa: ANN401
+    ) -> None:
         self._supervisor = supervisor
         self._commands = commands
+        self._registry = registry if registry is not None else getattr(supervisor, "_registry", None)
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._supervisor, name)
@@ -135,7 +142,7 @@ class LiveCapabilityStrategySupervisor:
         target: MarketMakerLifecycle = MarketMakerLifecycle.RUNNING,
         expected_revision: int | None = None,
     ) -> Any:
-        self._require_live_capability(target)
+        await self._require_action(strategy_id, "start", target=target)
         return await self._supervisor.start(
             strategy_id,
             target=target,
@@ -148,8 +155,51 @@ class LiveCapabilityStrategySupervisor:
         *,
         target: MarketMakerLifecycle = MarketMakerLifecycle.RUNNING,
     ) -> Any:
-        self._require_live_capability(target)
+        await self._require_action(strategy_id, "resume", target=target)
         return await self._supervisor.resume(strategy_id, target=target)
+
+    async def pause(self, strategy_id: StrategyId) -> Any:
+        await self._require_action(strategy_id, "pause")
+        return await self._supervisor.pause(strategy_id)
+
+    async def drain(self, strategy_id: StrategyId) -> Any:
+        await self._require_action(strategy_id, "drain")
+        return await self._supervisor.drain(strategy_id)
+
+    async def stop(self, strategy_id: StrategyId) -> Any:
+        await self._require_action(strategy_id, "stop")
+        return await self._supervisor.stop(strategy_id)
+
+    async def _require_action(
+        self,
+        strategy_id: StrategyId,
+        action: str,
+        *,
+        target: MarketMakerLifecycle | None = None,
+    ) -> None:
+        from hypeedge.strategy.plugin import MARKET_MAKER_CAPABILITIES
+
+        instance = await self._supervisor._store.get_instance(strategy_id)
+        capabilities = None
+        if self._registry is not None:
+            capabilities = self._registry.capabilities(instance.strategy_type)
+        if capabilities is None and instance.strategy_type == "market_maker":
+            capabilities = MARKET_MAKER_CAPABILITIES
+        if capabilities is not None:
+            if action not in capabilities.actions:
+                raise StrategyLifecycleError(
+                    f"Action '{action}' is not supported for strategy_type={instance.strategy_type}"
+                )
+            if target == MarketMakerLifecycle.SHADOW and not capabilities.supports_shadow:
+                raise StrategyLifecycleError(
+                    f"Shadow mode is not supported for strategy_type={instance.strategy_type}"
+                )
+            if action == "drain" and not capabilities.supports_drain:
+                raise StrategyLifecycleError(
+                    f"Drain is not supported for strategy_type={instance.strategy_type}"
+                )
+        if instance.strategy_type == "market_maker" and target is not None:
+            self._require_live_capability(target)
 
     def _require_live_capability(self, target: MarketMakerLifecycle) -> None:
         if target == MarketMakerLifecycle.RUNNING and not self._commands.live_enabled:
@@ -195,10 +245,38 @@ class MarketMakingRepositoryFacade:
         self._kill_switch_active = kill_switch_active
 
     def __getattr__(self, name: str) -> Any:
+        # Prefer durable repository for create_* helpers that use keyword API signatures.
+        if name.startswith("create_"):
+            repo_method = getattr(self._repository, name, None)
+            if repo_method is not None:
+                return repo_method
         state_method = getattr(self._state_store, name, None)
         if state_method is not None:
             return state_method
         return getattr(self._repository, name)
+
+    async def create_strategy_instance(
+        self,
+        *,
+        strategy_id: StrategyId,
+        sub_account: Any,
+        symbol: Any,
+        initial_config: Mapping[str, Any],
+        created_by: str,
+        metadata: Mapping[str, Any] | None = None,
+        strategy_type: str = "market_maker",
+    ) -> dict[str, Any]:
+        create = self._repository.create_strategy_instance
+        view = await create(
+            strategy_id=strategy_id,
+            sub_account=sub_account,
+            symbol=symbol,
+            initial_config=initial_config,
+            created_by=created_by,
+            metadata=metadata,
+            strategy_type=strategy_type,
+        )
+        return await self._strategy_instance_payload(view)
 
     async def list_strategy_instances(self, *, include_archived: bool = False) -> list[dict[str, Any]]:
         list_views = cast(Any, self._state_store).list_strategy_instances

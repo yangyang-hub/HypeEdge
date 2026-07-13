@@ -348,6 +348,17 @@ class StrategySupervisor:
         ):
             return runtime
 
+        capabilities = self._registry.capabilities(instance.strategy_type)
+        supports_shadow = True if capabilities is None else capabilities.supports_shadow
+        if target == MarketMakerLifecycle.SHADOW and not supports_shadow:
+            raise StrategyLifecycleError(
+                f"Strategy type {instance.strategy_type} does not support shadow start"
+            )
+        if not supports_shadow and target != MarketMakerLifecycle.RUNNING:
+            raise StrategyLifecycleError(
+                f"Strategy type {instance.strategy_type} start target must be running"
+            )
+
         await self._allocations.acquire(strategy_id, instance.sub_account, instance.symbol)
         config = await self._store.get_config(strategy_id, instance.desired_config_revision)
         try:
@@ -371,10 +382,18 @@ class StrategySupervisor:
                 reason="config_applied",
                 expected_revision=runtime.revision,
             )
-            await handle.set_mode(MarketMakerLifecycle.SHADOW)
-            runtime = await self._transition(instance, runtime, MarketMakerLifecycle.SHADOW, "runtime_shadow")
-            if target == MarketMakerLifecycle.RUNNING:
-                runtime = await self._transition(instance, runtime, MarketMakerLifecycle.RUNNING, "runtime_running")
+            if supports_shadow:
+                await handle.set_mode(MarketMakerLifecycle.SHADOW)
+                runtime = await self._transition(instance, runtime, MarketMakerLifecycle.SHADOW, "runtime_shadow")
+                if target == MarketMakerLifecycle.RUNNING:
+                    runtime = await self._transition(
+                        instance, runtime, MarketMakerLifecycle.RUNNING, "runtime_running"
+                    )
+                    await handle.set_mode(MarketMakerLifecycle.RUNNING)
+            else:
+                runtime = await self._transition(
+                    instance, runtime, MarketMakerLifecycle.RUNNING, "runtime_running", recovery=True
+                )
                 await handle.set_mode(MarketMakerLifecycle.RUNNING)
             return runtime
         except Exception as exc:

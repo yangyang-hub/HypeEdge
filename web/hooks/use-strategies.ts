@@ -105,30 +105,30 @@ export async function createStrategy(
   return normalizeStrategy(data)
 }
 
-/** Start strategy. MM uses control-plane actions + If-Match; trend uses legacy start. */
+/** Start strategy via control-plane actions; legacy singleton uses /start. */
 export async function startStrategy(
   strategy: Pick<StrategyInstance, "strategy_id" | "strategy_type" | "revision">,
   target: StrategyDesiredState = "shadow",
 ) {
-  if (strategy.strategy_type === "market_maker") {
-    return poster(
-      `/api/v1/strategies/${encodeURIComponent(strategy.strategy_id)}/actions/start`,
-      { target },
-      { ifMatch: strategy.revision },
-    )
+  if (strategy.strategy_type === "legacy") {
+    return poster(`/api/v1/strategies/${encodeURIComponent(strategy.strategy_id)}/start`, {})
   }
-  return poster(`/api/v1/strategies/${encodeURIComponent(strategy.strategy_id)}/start`, {})
+  return poster(
+    `/api/v1/strategies/${encodeURIComponent(strategy.strategy_id)}/actions/start`,
+    { target },
+    { ifMatch: strategy.revision },
+  )
 }
 
 export async function stopStrategy(
   strategy: Pick<StrategyInstance, "strategy_id" | "strategy_type" | "revision">,
 ) {
-  if (strategy.strategy_type === "market_maker") {
-    return poster(
-      `/api/v1/strategies/${encodeURIComponent(strategy.strategy_id)}/actions/stop`,
-      {},
-      { ifMatch: strategy.revision },
-    )
+  if (strategy.strategy_type === "legacy") {
+    return poster(`/api/v1/strategies/${encodeURIComponent(strategy.strategy_id)}/stop`, {})
   }
-  return poster(`/api/v1/strategies/${encodeURIComponent(strategy.strategy_id)}/stop`, {})
+  return poster(
+    `/api/v1/strategies/${encodeURIComponent(strategy.strategy_id)}/actions/stop`,
+    {},
+    { ifMatch: strategy.revision },
+  )
 }

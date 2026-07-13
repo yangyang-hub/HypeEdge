@@ -240,6 +240,7 @@ Postgres 关键表：
 - 中频，吃大行情；单所即可，回测相对可靠。
 - 信号示例：多周期均线/动量/突破 + 波动率过滤（ATR 定仓位）。
 - 风控：明确止损 + 仓位级风控（见 §8）。
+- 多实例创建、配置版本与生命周期迁入统一控制面，见 §19 与 `docs/strategy_control_plane.md`。
 
 ### 7.2 动态网格 —【近期，单所，仅震荡开启】
 
@@ -257,6 +258,7 @@ Postgres 关键表：
   quote-set 风险预占和全局 kill switch，不采用逐单止损。
 - 仅小资金验证，不以 L2 回测收益作为上线依据；必须经过 mainnet shadow、testnet 执行验证和单 symbol canary。
 - `reserveRequestWeight` 默认关闭，只允许用于退出风险或处理 UNKNOWN，必须受单次、日和月成本上限约束。
+- 做市实例的多类型控制面创建与启停契约见 §19（算法仍以 §18 为准）。
 
 ### 7.4 跨交易所基差套利 —【后期项，依赖多所基建】
 
@@ -482,9 +484,12 @@ Postgres 关键表：
 
 ### 15.2 策略参数管理
 
-- 策略参数（周期、阈值、仓位比例等）使用 **YAML/TOML 配置文件**，与代码分离。
-- 配置文件支持**热更新**：monitor 文件变更 → 通知策略重新加载参数（不重启进程）。
-- 每次参数变更记录日志（旧值 → 新值、变更时间、触发者），便于事后审计。
+- **实例参数权威源**为 Postgres 不可变配置版本（`strategy_config_versions` + 按类型的 typed 子表），经 API
+  create / config-version activate 变更；每次变更产生审计事件（谁、何时、旧→新版本）。
+- **YAML / 环境 Settings** 只保留安全默认值与上限（ceiling），不得与运行中实例参数形成双主。
+- 热更新路径：operator 创建新 config version → activate（带 revision / `If-Match`）→ Supervisor 在安全点
+  `apply_config`；不以文件 watcher 作为已托管实例的权威热更新通道。
+- 细节与类型插件契约见 §19 与 `docs/strategy_control_plane.md`。
 
 ### 15.3 多环境隔离
 
@@ -729,7 +734,7 @@ Alembic 管理，应用启动禁止 `create_all`。
 - Postgres ledger/fill/funding/paid-action 是 Accounting PnL 和风控权威；markout 是执行质量诊断，不能重复计入净 PnL，
   ClickHouse PnL 仅是可重建分析投影，不能驱动 Kill Switch。
 - API 重构为多策略实例、版本化配置和 start/pause/resume/drain/stop；mutation 继续强制 RBAC、CSRF、
-  Idempotency-Key、revision 和 api_audit。
+  Idempotency-Key、revision 和 api_audit。多策略类型共用该控制面与 create 契约，泛化决策见 §19。
 - 前端新增做市工作台，展示 desired/live/UNKNOWN quotes、库存 skew、PnL 分解、动作 runway、配置 diff 和 stale 状态；
   可靠控制事件走 SSE，高频报价遥测走有界 WebSocket，精确数值使用 decimal string。
 
@@ -743,3 +748,17 @@ Alembic 管理，应用启动禁止 `create_all`。
   reserve 充足、硬库存越限/重复订单/关键对账差异为 0，且 UNKNOWN/orphan 均在 SLA 内有终态。
 - 第一版保持 Python asyncio 单进程。只有 profile 证明 event-loop/CPU/receipt-to-send 成为瓶颈时才按 WS/订单簿、
   feature/quote、diff/batch、签名热路径顺序迁移 Rust，优先 PyO3，不因“做市”名义提前拆微服务。
+
+## 19. 多策略控制面与前端创建（2026-07）
+
+详细契约、存储、API、前端插件与分期见 `docs/strategy_control_plane.md`。本节冻结跨模块决策；若详细文档与本节冲突，以本节为准。做市算法与 MM 专用表仍以 §18 与 `docs/market_making_design.md` 为准。
+
+- 控制面采用 **Strategy Type Plugin**：共享实例 / 配置版本元数据 / allocation / Supervisor；按类型提供强类型
+  校验、typed 配置子表、Runtime factory、生命周期能力与前端 ConfigFields。
+- 前端与 API 通过唯一入口 `POST /api/v1/strategies` 创建实例；请求体为 `strategy_type` 判别联合
+  （首期 `market_maker` | `trend_follow`）。禁止按类型永久平行 create API；禁止无约束 JSONB 作为交易关键配置主存。
+- 生命周期共用 Supervisor，按类型声明能力子集：`market_maker` 支持 shadow/running/paused/drain；
+  `trend_follow` 支持 stopped/running/paused（不强制对外 shadow）。不支持的 action 由 CapabilityGate 拒绝。
+- 实例参数以 Postgres 不可变配置版本为主；YAML 仅环境默认与上限。目标态删除 `app.py` 硬编码单一
+  `TrendFollowStrategy` 与实例级文件 watcher 双主（§15.2）。
+- 新增策略类型的边际成本应为一份 plugin + typed 表 + ConfigFields，而不修改 create 壳与 Supervisor 核心。

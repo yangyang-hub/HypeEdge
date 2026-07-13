@@ -26,7 +26,7 @@ describe("market-maker-config helpers", () => {
         hard_inventory_notional: asDecimalString(100),
         emergency_inventory_notional: asDecimalString(300),
       }),
-    ).toMatch(/soft < hard < emergency/)
+    ).toMatch(/软库存 < 硬库存 < 紧急库存/)
   })
 
   it("validates strategy identity", () => {

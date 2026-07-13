@@ -109,6 +109,10 @@ class TrendFollowStrategy:
     def status(self) -> StrategyStatus:
         return self._status
 
+    def set_status(self, status: StrategyStatus) -> None:
+        """Update lifecycle status without tearing down the runner (pause/resume)."""
+        self._status = status
+
     def update_params(self, new_params: TrendParams) -> None:
         """Hot-reload parameters (design doc §15.2)."""
         old = self._params
@@ -171,6 +175,9 @@ class TrendFollowStrategy:
         # Need enough data before generating signals
         min_candles = self._params.slow_ema_period * _MIN_CANDLES_FACTOR
         if self._candle_count < min_candles:
+            return
+
+        if self._status == StrategyStatus.PAUSED:
             return
 
         await self._process_candle(candle)

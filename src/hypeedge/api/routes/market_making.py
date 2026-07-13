@@ -15,7 +15,7 @@ from hypeedge.api.deps import ApiCommandDep, AppDep
 from hypeedge.api.errors import ApiProblem
 from hypeedge.api.schemas import (
     DangerousActionConfirmation,
-    MarketMakerConfigVersionCreateRequest,
+    StrategyConfigVersionCreateRequest,
     StrategyCreateRequest,
     StrategyLifecycleRequest,
     StrategyMetadataPatchRequest,
@@ -182,6 +182,10 @@ async def list_strategies(app: AppDep) -> dict[str, Any]:
     payloads: list[Any] = []
     get_runtime = getattr(repository, "get_runtime", None)
     for record in records:
+        if isinstance(record, dict):
+            # Facade already returns API payloads with actual_state filled.
+            payloads.append(record)
+            continue
         actual_state: str | None = None
         if get_runtime is not None:
             try:
@@ -217,6 +221,7 @@ async def create_strategy(
                 initial_config=body.initial_config.model_dump(),
                 created_by=str(request.state.actor_id),
                 metadata=body.metadata,
+                strategy_type=body.strategy_type,
             )
         except (StrategyLifecycleError, StrategyRegistrationError) as exc:
             raise ApiProblem(409, "STRATEGY_CREATE_CONFLICT", str(exc)) from exc
@@ -382,7 +387,7 @@ async def list_config_versions(strategy_id: str, app: AppDep) -> dict[str, Any]:
 @router.post("/strategies/{strategy_id}/config-versions")
 async def create_config_version(
     strategy_id: str,
-    body: MarketMakerConfigVersionCreateRequest,
+    body: StrategyConfigVersionCreateRequest,
     app: AppDep,
     service: ApiCommandDep,
     request: Request,
@@ -394,7 +399,10 @@ async def create_config_version(
     revision = _expected_revision(if_match)
 
     async def execute(_command_id: str) -> dict[str, Any]:
-        method = getattr(repository, "create_market_maker_config_version", None)
+        if body.strategy_type == "trend_follow":
+            method = getattr(repository, "create_trend_follow_config_version", None)
+        else:
+            method = getattr(repository, "create_market_maker_config_version", None)
         if method is None:
             raise ApiProblem(503, "MARKET_MAKING_STORE_UNAVAILABLE", "Config creation is unavailable", retryable=True)
         try:

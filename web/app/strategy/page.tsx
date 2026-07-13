@@ -4,7 +4,7 @@ import Link from "next/link"
 import { useState } from "react"
 import { AppShell } from "@/components/layout/app-shell"
 import { PageHeader } from "@/components/layout/page-header"
-import { CreateMarketMakerDialog } from "@/components/strategy/create-market-maker-dialog"
+import { CreateStrategyDialog } from "@/components/strategy/create-strategy-dialog"
 import { Button } from "@/components/ui/button"
 import { EmptyState, Panel } from "@/components/ui/data-display"
 import { StrategyStatusChip } from "@/components/ui/strategy-status-chip"
@@ -34,7 +34,7 @@ export default function StrategyPage() {
 
   const createButton = (
     <Button type="button" variant="primary" size="sm" onClick={() => setCreateOpen(true)}>
-      新建做市策略
+      新建策略
     </Button>
   )
 
@@ -43,7 +43,7 @@ export default function StrategyPage() {
       <main id="main-content" className="flex-1 space-y-4 overflow-y-auto p-3 md:p-5">
         <PageHeader
           title="策略管理"
-          subtitle="创建做市实例、启停策略并进入工作台"
+          subtitle="创建多类型实例、启停策略并进入工作台"
           actions={createButton}
         />
 
@@ -75,7 +75,7 @@ export default function StrategyPage() {
         )}
       </main>
 
-      <CreateMarketMakerDialog
+      <CreateStrategyDialog
         open={createOpen}
         onOpenChange={setCreateOpen}
         existing={strategies}
@@ -126,7 +126,13 @@ function StrategyRow({
             variant={running ? "secondary" : "primary"}
             size="sm"
             disabled={busy}
-            title={busy ? "生命周期切换中" : s.strategy_type === "market_maker" && !running ? "启动为 Shadow" : undefined}
+            title={
+              busy
+                ? "生命周期切换中"
+                : s.strategy_type === "market_maker" && !running
+                  ? "启动为 Shadow"
+                  : undefined
+            }
             onClick={() => void onToggle(s)}
           >
             {running ? "停止" : "启动"}

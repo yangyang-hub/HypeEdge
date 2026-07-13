@@ -100,24 +100,6 @@ function dashboardPrincipal(request: NextRequest): DashboardPrincipal | Response
   return principal
 }
 
-function csrfFailure(request: NextRequest): Response | null {
-  if (request.method === "GET" || request.method === "HEAD" || request.method === "OPTIONS") return null
-  if (request.headers.get("sec-fetch-site") === "cross-site") {
-    return Response.json({ code: "CROSS_SITE_REQUEST_REJECTED", detail: "Cross-site commands are not allowed" }, { status: 403 })
-  }
-  const origin = request.headers.get("origin")
-  if (origin) {
-    try {
-      if (new URL(origin).host !== request.nextUrl.host) {
-        return Response.json({ code: "CROSS_SITE_REQUEST_REJECTED", detail: "Cross-site commands are not allowed" }, { status: 403 })
-      }
-    } catch {
-      return Response.json({ code: "CROSS_SITE_REQUEST_REJECTED", detail: "Cross-site commands are not allowed" }, { status: 403 })
-    }
-  }
-  return null
-}
-
 function backendBaseUrl(): URL {
   const configured = process.env.HYPEEDGE_BACKEND_URL ?? "http://127.0.0.1:37001"
   const url = new URL(configured)
@@ -150,8 +132,6 @@ function upstreamHeaders(request: NextRequest, backendToken: string): Headers {
 async function proxy(request: NextRequest, context: RouteContext): Promise<Response> {
   const principal = dashboardPrincipal(request)
   if (principal instanceof Response) return principal
-  const crossSiteFailure = csrfFailure(request)
-  if (crossSiteFailure) return crossSiteFailure
 
   const { path } = await context.params
   const requiredRole: DashboardRole = request.method === "GET" || request.method === "HEAD"

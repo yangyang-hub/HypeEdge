@@ -17,8 +17,11 @@ __all__ = [
     "PostgresStrategyStateStore",
     "QuoteSlotView",
     "StrategyInstanceView",
+    "default_trend_follow_config",
     "market_maker_config_hash",
     "normalize_market_maker_config",
+    "normalize_trend_follow_config",
+    "trend_follow_config_hash",
 ]
 
 

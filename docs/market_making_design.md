@@ -105,7 +105,9 @@ Metrics/alerts                            -> Prometheus + alerting
   NO_ACTION 中选择增量效用最高的可行计划。
 - `ActionBudgetController`：动作 shadow debit、远端校正、预算状态和刷新许可。
 - `MarketMakerRiskGate`：按报价集合做最坏场景风控，而不是仅逐单检查。
-- `StrategySupervisor`：管理多策略实例、配置版本、生命周期和健康状态。
+- `StrategySupervisor`：管理多策略实例、配置版本、生命周期和健康状态。多策略类型共用该 Supervisor，
+  按类型声明能力子集与 typed 配置插件；通用控制面与前端创建契约见 `docs/strategy_control_plane.md`
+  与 `docs/design.md` §19。做市算法、quote plan、action budget 与 `market_maker_config_versions` 仍以本文为准。
 
 策略计算必须无网络和数据库 I/O。I/O 只存在于行情、命令、执行、事实写入和遥测写入层。
 
@@ -454,6 +456,8 @@ Prometheus 只保存实时健康和告警指标，不作为订单、PnL、额度
 重构为多实例、query/command 分离：
 
 - `GET/POST /api/v1/strategies`，已有交易历史的实例只允许 archive，不提供硬删除。
+  `POST` body 为 `strategy_type` 判别联合（不只限于 `market_maker`）；多类型 create 契约见
+  `docs/strategy_control_plane.md`。
 - `GET/PATCH /api/v1/strategies/{id}`，更新使用 `If-Match` revision。
 - `POST /api/v1/strategies/{id}/actions/{start|pause|resume|drain|stop}`。
 - `GET/POST /api/v1/strategies/{id}/config-versions`。

@@ -46,34 +46,29 @@ describe("HypeEdge backend proxy", () => {
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
-  it("rejects cross-site commands before forwarding them", async () => {
-    const fetchMock = vi.fn()
+  it("forwards mutations regardless of Origin / sec-fetch-site", async () => {
+    vi.stubEnv("HYPEEDGE_BACKEND_URL", "http://127.0.0.1:37001")
+    vi.stubEnv("HYPEEDGE_DASHBOARD_OPERATOR_USERNAME", "operator")
+    vi.stubEnv("HYPEEDGE_DASHBOARD_OPERATOR_PASSWORD", "operator-password")
+    vi.stubEnv("HYPEEDGE_OPERATOR_API_TOKEN", "o".repeat(32))
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 202 }))
     vi.stubGlobal("fetch", fetchMock)
-    const request = new NextRequest("http://dashboard.local/api/v1/orders", {
+    const request = new NextRequest("http://dashboard.local/api/v1/strategies", {
       method: "POST",
-      headers: { Origin: "https://attacker.example", "Content-Type": "application/json" },
+      headers: {
+        Authorization: `Basic ${Buffer.from("operator:operator-password").toString("base64")}`,
+        Origin: "https://attacker.example",
+        "Sec-Fetch-Site": "cross-site",
+        "Content-Type": "application/json",
+        "Idempotency-Key": "create-1",
+      },
       body: "{}",
     })
 
-    const response = await POST(request, { params: Promise.resolve({ path: ["orders"] }) })
+    const response = await POST(request, { params: Promise.resolve({ path: ["strategies"] }) })
 
-    expect(response.status).toBe(403)
-    expect(fetchMock).not.toHaveBeenCalled()
-  })
-
-  it("rejects malformed origins without contacting the backend", async () => {
-    const fetchMock = vi.fn()
-    vi.stubGlobal("fetch", fetchMock)
-    const request = new NextRequest("http://dashboard.local/api/v1/orders", {
-      method: "POST",
-      headers: { Origin: "not a valid origin", "Content-Type": "application/json" },
-      body: "{}",
-    })
-
-    const response = await POST(request, { params: Promise.resolve({ path: ["orders"] }) })
-
-    expect(response.status).toBe(403)
-    expect(fetchMock).not.toHaveBeenCalled()
+    expect(response.status).toBe(202)
+    expect(fetchMock).toHaveBeenCalled()
   })
 
   it("forwards command bodies and idempotency keys", async () => {

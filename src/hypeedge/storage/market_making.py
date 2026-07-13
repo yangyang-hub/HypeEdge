@@ -45,6 +45,7 @@ from hypeedge.storage.postgres import (
     StrategyInstanceRecord,
     StrategyRuntimeStateRecord,
     StrategyStateEventRecord,
+    TrendFollowConfigVersionRecord,
 )
 from hypeedge.strategy.registry import StrategyConfigSnapshot, StrategyInstanceDefinition
 from hypeedge.strategy.supervisor import StrategyAllocation, StrategyRuntimeState
@@ -176,6 +177,87 @@ def market_maker_config_hash(values: Mapping[str, Any]) -> str:
     }
     payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
     return hashlib.sha256(payload.encode()).hexdigest()
+
+
+_TF_INTEGER_FIELDS = (
+    "fast_ema_period",
+    "slow_ema_period",
+    "signal_ema_period",
+    "momentum_period",
+    "atr_period",
+)
+_TF_DECIMAL_FIELDS = (
+    "momentum_threshold",
+    "atr_position_multiplier",
+    "atr_stop_multiplier",
+    "max_position_pct",
+    "risk_per_trade_pct",
+    "macd_cross_threshold",
+)
+_TF_CONFIG_FIELDS = frozenset((*_TF_INTEGER_FIELDS, *_TF_DECIMAL_FIELDS))
+
+
+def normalize_trend_follow_config(values: Mapping[str, Any]) -> dict[str, Decimal | int]:
+    """Validate and normalize typed trend-follow Postgres config."""
+
+    supplied = dict(values)
+    # Drop symbol if callers embed it; instance.symbol is authoritative.
+    supplied.pop("symbol", None)
+    keys = frozenset(supplied)
+    if keys != _TF_CONFIG_FIELDS:
+        missing = sorted(_TF_CONFIG_FIELDS - keys)
+        extra = sorted(keys - _TF_CONFIG_FIELDS)
+        raise StrategyRegistrationError(f"Invalid trend-follow config fields: missing={missing} extra={extra}")
+    normalized: dict[str, Decimal | int] = {}
+    for name in _TF_INTEGER_FIELDS:
+        value = supplied[name]
+        if isinstance(value, bool) or int(value) != value:
+            raise StrategyRegistrationError(f"Trend-follow config field must be an integer: {name}")
+        normalized[name] = int(value)
+    for name in _TF_DECIMAL_FIELDS:
+        normalized[name] = Decimal(_decimal_text(supplied[name]))
+    if not normalized["fast_ema_period"] < normalized["slow_ema_period"]:  # type: ignore[operator]
+        raise StrategyRegistrationError("fast_ema_period must be < slow_ema_period")
+    for name in ("max_position_pct", "risk_per_trade_pct"):
+        value = normalized[name]
+        assert isinstance(value, Decimal)
+        if not (Decimal("0") < value <= Decimal("1")):
+            raise StrategyRegistrationError(f"{name} must be in (0, 1]")
+    for name in ("atr_position_multiplier", "atr_stop_multiplier"):
+        value = normalized[name]
+        assert isinstance(value, Decimal)
+        if value <= 0:
+            raise StrategyRegistrationError(f"{name} must be > 0")
+    return normalized
+
+
+def trend_follow_config_hash(values: Mapping[str, Any]) -> str:
+    """Return a stable semantic hash for trend-follow config."""
+
+    normalized = normalize_trend_follow_config(values)
+    canonical = {
+        key: _decimal_text(value) if key in _TF_DECIMAL_FIELDS else value for key, value in sorted(normalized.items())
+    }
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def default_trend_follow_config() -> dict[str, Decimal | int]:
+    """Safe create defaults aligned with ``TrendParams``."""
+
+    return {
+        "fast_ema_period": 12,
+        "slow_ema_period": 26,
+        "signal_ema_period": 9,
+        "momentum_period": 10,
+        "momentum_threshold": Decimal("0"),
+        "atr_period": 14,
+        "atr_position_multiplier": Decimal("0.5"),
+        "atr_stop_multiplier": Decimal("2"),
+        "max_position_pct": Decimal("0.15"),
+        "risk_per_trade_pct": Decimal("0.01"),
+        "macd_cross_threshold": Decimal("0"),
+    }
 
 
 @dataclass(frozen=True, slots=True)
@@ -334,16 +416,21 @@ class PostgresStrategyStateStore:
         created_by: str,
         metadata: Mapping[str, Any] | None = None,
     ) -> StrategyInstanceView:
-        if instance.strategy_type != "market_maker":
-            raise StrategyRegistrationError("Postgres typed creation currently requires strategy_type=market_maker")
+        strategy_type = instance.strategy_type.strip().lower()
+        if strategy_type not in {"market_maker", "trend_follow"}:
+            raise StrategyRegistrationError(f"Unsupported strategy_type for typed creation: {strategy_type}")
         if instance.desired_config_revision != 1:
             raise StrategyRegistrationError("Initial config revision must be 1")
-        normalized = normalize_market_maker_config(initial_config)
-        config_hash = market_maker_config_hash(normalized)
+        if strategy_type == "market_maker":
+            normalized: dict[str, Decimal | int] = normalize_market_maker_config(initial_config)
+            config_hash = market_maker_config_hash(normalized)
+        else:
+            normalized = normalize_trend_follow_config(initial_config)
+            config_hash = trend_follow_config_hash(normalized)
         async with self._session_factory() as session, session.begin():
             record = StrategyInstanceRecord(
                 strategy_id=str(instance.strategy_id),
-                strategy_type=instance.strategy_type,
+                strategy_type=strategy_type,
                 sub_account=str(instance.sub_account),
                 symbol=str(instance.symbol),
                 desired_state=instance.desired_state.value,
@@ -357,7 +444,10 @@ class PostgresStrategyStateStore:
             )
             session.add(config_record)
             await session.flush()
-            session.add(MarketMakerConfigVersionRecord(config_version_id=config_record.id, **normalized))
+            if strategy_type == "market_maker":
+                session.add(MarketMakerConfigVersionRecord(config_version_id=config_record.id, **normalized))
+            else:
+                session.add(TrendFollowConfigVersionRecord(config_version_id=config_record.id, **normalized))
             record.desired_config_version_id = config_record.id
             session.add(StrategyRuntimeStateRecord(strategy_id=str(instance.strategy_id)))
             await session.flush()
@@ -426,18 +516,31 @@ class PostgresStrategyStateStore:
             return _instance_view(record, desired_version)
 
     async def list_config_versions(self, strategy_id: StrategyId) -> list[StrategyConfigSnapshot]:
-        statement = (
-            select(StrategyConfigVersionRecord, MarketMakerConfigVersionRecord)
-            .join(
-                MarketMakerConfigVersionRecord,
-                MarketMakerConfigVersionRecord.config_version_id == StrategyConfigVersionRecord.id,
-            )
-            .where(StrategyConfigVersionRecord.strategy_id == str(strategy_id))
-            .order_by(StrategyConfigVersionRecord.version)
-        )
+        strategy_type = await self._strategy_type(strategy_id)
         async with self._session_factory() as session:
+            if strategy_type == "market_maker":
+                statement = (
+                    select(StrategyConfigVersionRecord, MarketMakerConfigVersionRecord)
+                    .join(
+                        MarketMakerConfigVersionRecord,
+                        MarketMakerConfigVersionRecord.config_version_id == StrategyConfigVersionRecord.id,
+                    )
+                    .where(StrategyConfigVersionRecord.strategy_id == str(strategy_id))
+                    .order_by(StrategyConfigVersionRecord.version)
+                )
+                rows = (await session.execute(statement)).all()
+                return [self._mm_config_snapshot(meta, typed) for meta, typed in rows]
+            statement = (
+                select(StrategyConfigVersionRecord, TrendFollowConfigVersionRecord)
+                .join(
+                    TrendFollowConfigVersionRecord,
+                    TrendFollowConfigVersionRecord.config_version_id == StrategyConfigVersionRecord.id,
+                )
+                .where(StrategyConfigVersionRecord.strategy_id == str(strategy_id))
+                .order_by(StrategyConfigVersionRecord.version)
+            )
             rows = (await session.execute(statement)).all()
-        return [self._config_snapshot(meta, typed) for meta, typed in rows]
+            return [self._tf_config_snapshot(meta, typed) for meta, typed in rows]
 
     async def create_market_maker_config_version(
         self,
@@ -459,6 +562,10 @@ class PostgresStrategyStateStore:
             ).scalar_one_or_none()
             if instance is None or instance.archived_at is not None:
                 raise StrategyRegistrationError(f"Unknown active strategy instance: {strategy_id}")
+            if instance.strategy_type != "market_maker":
+                raise StrategyRegistrationError(
+                    "create_market_maker_config_version requires strategy_type=market_maker"
+                )
             if expected_revision is not None and instance.revision != expected_revision:
                 raise StrategyLifecycleError(
                     f"Strategy revision conflict: expected={expected_revision} actual={instance.revision}"
@@ -477,7 +584,7 @@ class PostgresStrategyStateStore:
                 )
             ).one_or_none()
             if existing is not None:
-                return self._config_snapshot(existing[0], existing[1])
+                return self._mm_config_snapshot(existing[0], existing[1])
             latest = await session.scalar(
                 select(func.max(StrategyConfigVersionRecord.version)).where(
                     StrategyConfigVersionRecord.strategy_id == str(strategy_id)
@@ -496,25 +603,107 @@ class PostgresStrategyStateStore:
             instance.revision += 1
             instance.updated_at = _utcnow()
             await session.flush()
-            return self._config_snapshot(meta, typed)
+            return self._mm_config_snapshot(meta, typed)
+
+    async def create_trend_follow_config_version(
+        self,
+        strategy_id: StrategyId,
+        values: Mapping[str, Any],
+        *,
+        created_by: str,
+        expected_revision: int | None = None,
+    ) -> StrategyConfigSnapshot:
+        normalized = normalize_trend_follow_config(values)
+        config_hash = trend_follow_config_hash(normalized)
+        async with self._session_factory() as session, session.begin():
+            instance = (
+                await session.execute(
+                    select(StrategyInstanceRecord)
+                    .where(StrategyInstanceRecord.strategy_id == str(strategy_id))
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if instance is None or instance.archived_at is not None:
+                raise StrategyRegistrationError(f"Unknown active strategy instance: {strategy_id}")
+            if instance.strategy_type != "trend_follow":
+                raise StrategyRegistrationError(
+                    "create_trend_follow_config_version requires strategy_type=trend_follow"
+                )
+            if expected_revision is not None and instance.revision != expected_revision:
+                raise StrategyLifecycleError(
+                    f"Strategy revision conflict: expected={expected_revision} actual={instance.revision}"
+                )
+            existing = (
+                await session.execute(
+                    select(StrategyConfigVersionRecord, TrendFollowConfigVersionRecord)
+                    .join(
+                        TrendFollowConfigVersionRecord,
+                        TrendFollowConfigVersionRecord.config_version_id == StrategyConfigVersionRecord.id,
+                    )
+                    .where(
+                        StrategyConfigVersionRecord.strategy_id == str(strategy_id),
+                        StrategyConfigVersionRecord.config_hash == config_hash,
+                    )
+                )
+            ).one_or_none()
+            if existing is not None:
+                return self._tf_config_snapshot(existing[0], existing[1])
+            latest = await session.scalar(
+                select(func.max(StrategyConfigVersionRecord.version)).where(
+                    StrategyConfigVersionRecord.strategy_id == str(strategy_id)
+                )
+            )
+            meta = StrategyConfigVersionRecord(
+                strategy_id=str(strategy_id),
+                version=int(latest or 0) + 1,
+                config_hash=config_hash,
+                created_by=created_by,
+            )
+            session.add(meta)
+            await session.flush()
+            typed = TrendFollowConfigVersionRecord(config_version_id=meta.id, **normalized)
+            session.add(typed)
+            instance.revision += 1
+            instance.updated_at = _utcnow()
+            await session.flush()
+            return self._tf_config_snapshot(meta, typed)
 
     async def get_config(self, strategy_id: StrategyId, revision: int) -> StrategyConfigSnapshot:
-        statement = (
-            select(StrategyConfigVersionRecord, MarketMakerConfigVersionRecord)
-            .join(
-                MarketMakerConfigVersionRecord,
-                MarketMakerConfigVersionRecord.config_version_id == StrategyConfigVersionRecord.id,
-            )
-            .where(
-                StrategyConfigVersionRecord.strategy_id == str(strategy_id),
-                StrategyConfigVersionRecord.version == revision,
-            )
-        )
+        strategy_type = await self._strategy_type(strategy_id)
         async with self._session_factory() as session:
+            if strategy_type == "market_maker":
+                statement = (
+                    select(StrategyConfigVersionRecord, MarketMakerConfigVersionRecord)
+                    .join(
+                        MarketMakerConfigVersionRecord,
+                        MarketMakerConfigVersionRecord.config_version_id == StrategyConfigVersionRecord.id,
+                    )
+                    .where(
+                        StrategyConfigVersionRecord.strategy_id == str(strategy_id),
+                        StrategyConfigVersionRecord.version == revision,
+                    )
+                )
+                row = (await session.execute(statement)).one_or_none()
+                if row is None:
+                    raise StrategyRegistrationError(
+                        f"Unknown config revision: strategy_id={strategy_id} revision={revision}"
+                    )
+                return self._mm_config_snapshot(row[0], row[1])
+            statement = (
+                select(StrategyConfigVersionRecord, TrendFollowConfigVersionRecord)
+                .join(
+                    TrendFollowConfigVersionRecord,
+                    TrendFollowConfigVersionRecord.config_version_id == StrategyConfigVersionRecord.id,
+                )
+                .where(
+                    StrategyConfigVersionRecord.strategy_id == str(strategy_id),
+                    StrategyConfigVersionRecord.version == revision,
+                )
+            )
             row = (await session.execute(statement)).one_or_none()
         if row is None:
             raise StrategyRegistrationError(f"Unknown config revision: strategy_id={strategy_id} revision={revision}")
-        return self._config_snapshot(row[0], row[1])
+        return self._tf_config_snapshot(row[0], row[1])
 
     async def get_runtime(self, strategy_id: StrategyId) -> StrategyRuntimeState:
         statement = (
@@ -662,6 +851,17 @@ class PostgresStrategyStateStore:
             raise StrategyRegistrationError(f"Unknown strategy instance: {strategy_id}")
         raise StrategyLifecycleError(f"Strategy revision conflict: expected={expected_revision} actual={actual}")
 
+    async def _strategy_type(self, strategy_id: StrategyId) -> str:
+        async with self._session_factory() as session:
+            strategy_type = await session.scalar(
+                select(StrategyInstanceRecord.strategy_type).where(
+                    StrategyInstanceRecord.strategy_id == str(strategy_id)
+                )
+            )
+        if strategy_type is None:
+            raise StrategyRegistrationError(f"Unknown strategy instance: {strategy_id}")
+        return str(strategy_type).strip().lower()
+
     @staticmethod
     async def _config_version_for_id(session: AsyncSession, config_id: int | None) -> int | None:
         if config_id is None:
@@ -686,11 +886,25 @@ class PostgresStrategyStateStore:
         return int(config_id)
 
     @staticmethod
-    def _config_snapshot(
+    def _mm_config_snapshot(
         meta: StrategyConfigVersionRecord, typed: MarketMakerConfigVersionRecord
     ) -> StrategyConfigSnapshot:
         values = {name: getattr(typed, name) for name in _MM_CONFIG_FIELDS}
         return StrategyConfigSnapshot(StrategyId(meta.strategy_id), int(meta.version), values)
+
+    @staticmethod
+    def _tf_config_snapshot(
+        meta: StrategyConfigVersionRecord, typed: TrendFollowConfigVersionRecord
+    ) -> StrategyConfigSnapshot:
+        values = {name: getattr(typed, name) for name in _TF_CONFIG_FIELDS}
+        return StrategyConfigSnapshot(StrategyId(meta.strategy_id), int(meta.version), values)
+
+    @staticmethod
+    def _config_snapshot(
+        meta: StrategyConfigVersionRecord, typed: MarketMakerConfigVersionRecord
+    ) -> StrategyConfigSnapshot:
+        """Backward-compatible alias for market-maker snapshots."""
+        return PostgresStrategyStateStore._mm_config_snapshot(meta, typed)
 
 
 class PostgresStrategyAllocationManager:
@@ -1375,11 +1589,12 @@ class PostgresMarketMakingRepository:
         initial_config: Mapping[str, Any],
         created_by: str,
         metadata: Mapping[str, Any] | None = None,
+        strategy_type: str = "market_maker",
         desired_state: MarketMakerLifecycle = MarketMakerLifecycle.STOPPED,
     ) -> StrategyInstanceView:
         definition = StrategyInstanceDefinition(
             strategy_id,
-            "market_maker",
+            strategy_type.strip().lower(),
             sub_account,
             symbol,
             desired_state,
@@ -1430,6 +1645,21 @@ class PostgresMarketMakingRepository:
         expected_revision: int | None = None,
     ) -> StrategyConfigSnapshot:
         return await self.state_store.create_market_maker_config_version(
+            strategy_id,
+            values,
+            created_by=created_by,
+            expected_revision=expected_revision,
+        )
+
+    async def create_trend_follow_config_version(
+        self,
+        strategy_id: StrategyId,
+        values: Mapping[str, Any],
+        *,
+        created_by: str,
+        expected_revision: int | None = None,
+    ) -> StrategyConfigSnapshot:
+        return await self.state_store.create_trend_follow_config_version(
             strategy_id,
             values,
             created_by=created_by,

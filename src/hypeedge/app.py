@@ -507,13 +507,39 @@ class HypeEdgeApp:
             external_reference=self._external_reference_provider,
             funding=self._market_data_provider,
         )
-        registry.register("market_maker", dependencies.factory)
+        from hypeedge.storage.market_making import normalize_market_maker_config
+        from hypeedge.strategy.plugin import (
+            MARKET_MAKER_CAPABILITIES,
+            StaticStrategyTypePlugin,
+        )
+        from hypeedge.strategy.trend_follow_runtime import build_trend_follow_plugin
+
+        def _mm_validate(values: Any) -> Any:
+            payload = values.model_dump() if hasattr(values, "model_dump") else dict(values)
+            return normalize_market_maker_config(payload)
+
+        registry.register_plugin(
+            StaticStrategyTypePlugin(
+                strategy_type="market_maker",
+                capabilities=MARKET_MAKER_CAPABILITIES,
+                factory=dependencies.factory,
+                _default_config={},
+                _validate=_mm_validate,
+                _decode=lambda snapshot: snapshot.values,
+            )
+        )
+        registry.register_plugin(
+            build_trend_follow_plugin(
+                event_bus=self.event_bus,
+                strategy_factory=self._build_trend_follow_strategy,
+            )
+        )
         concrete_supervisor = StrategySupervisor(
             registry,
             state_store,
             PostgresStrategyAllocationManager(self._pg_session_factory),
         )
-        supervisor = LiveCapabilityStrategySupervisor(concrete_supervisor, commands)
+        supervisor = LiveCapabilityStrategySupervisor(concrete_supervisor, commands, registry=registry)
         if self._execution_engine is not None and self._market_data_provider is not None:
             from hypeedge.execution.quote_plan_worker import AppQuoteDispatchGuardProvider, QuotePlanWorker
 
@@ -588,14 +614,32 @@ class HypeEdgeApp:
             max_quote_lifetime_seconds=Decimal(values["max_quote_age_ms"]) / Decimal(1000),
         )
 
-    def _init_strategy(self) -> None:
-        """Initialize the trading strategy and parameter watcher.
+    def _build_trend_follow_strategy(self, context: Any, params: Any) -> Any:
+        """Construct a managed trend-follow strategy for the control-plane registry."""
+        from hypeedge.strategy.trend_follow import TrendFollowStrategy
 
-        Design doc §7.1 + §15.2: Trend following strategy with hot-reloadable
-        parameters from YAML config file.
+        if self._execution_engine is None:
+            raise RuntimeError("execution engine is required for trend_follow strategies")
+        return TrendFollowStrategy(
+            strategy_id=context.instance.strategy_id,
+            event_bus=self.event_bus,
+            execution_client=self._execution_engine,
+            params=params,
+            account_tracker=self._tracker,
+        )
+
+    def _init_strategy(self) -> None:
+        """Initialize the legacy single-instance trend strategy (control plane off only).
+
+        When the multi-strategy control plane is enabled, trend instances are created via
+        Postgres + StrategyRegistry instead (``docs/design.md`` §19).
         """
         from hypeedge.strategy.params import load_params
         from hypeedge.strategy.trend_follow import TrendFollowStrategy
+
+        if self._strategy_supervisor is not None:
+            logger.info("legacy_trend_init_skipped_control_plane_active")
+            return
 
         if self._execution_engine is None:
             logger.warning("strategy_init_skipped_no_engine")
@@ -621,7 +665,7 @@ class HypeEdgeApp:
 
         self._strategy_runner = StrategyRunner(self._strategy, self.event_bus)
 
-        # Set up parameter hot-reload watcher (§15.2)
+        # Set up parameter hot-reload watcher (§15.2 legacy path)
         from hypeedge.strategy.params import ParamWatcher
 
         self._param_watcher = ParamWatcher(
@@ -922,13 +966,16 @@ class HypeEdgeApp:
                     if self._quote_plan_worker is not None:
                         tasks.append(asyncio.create_task(self._quote_plan_worker.run(), name="quote_plan_worker"))
 
-                    # Initialize and start strategy (only after reconciliation)
-                    self._init_strategy()
-                    if self._strategy_runner:
-                        self._strategy_task = asyncio.create_task(self._strategy_runner.run(), name="strategy_runner")
-                        tasks.append(self._strategy_task)
-                    if self._param_watcher:
-                        tasks.append(asyncio.create_task(self._param_watcher.run(), name="param_watcher"))
+                    # Legacy single-instance trend only when multi-strategy control plane is off.
+                    if self._strategy_supervisor is None:
+                        self._init_strategy()
+                        if self._strategy_runner:
+                            self._strategy_task = asyncio.create_task(
+                                self._strategy_runner.run(), name="strategy_runner"
+                            )
+                            tasks.append(self._strategy_task)
+                        if self._param_watcher:
+                            tasks.append(asyncio.create_task(self._param_watcher.run(), name="param_watcher"))
                     if self._rest_client is not None:
                         tasks.append(asyncio.create_task(self._poll_action_credits(), name="action_credits_poll"))
                     if self._strategy_supervisor is not None:
@@ -1052,7 +1099,11 @@ class HypeEdgeApp:
         await self._restore_market_making_in_shadow()
 
     async def _restore_market_making_in_shadow(self) -> None:
-        """Restart active instances through WARMING into SHADOW, never straight to live."""
+        """Restore durable strategy instances after placement prerequisites are fresh.
+
+        Market makers restart through SHADOW and keep RUNNING as desired intent only.
+        Trend-follow instances start directly into RUNNING when that was desired.
+        """
         if self._strategy_supervisor is None or self._market_making_state_store is None:
             return
         from hypeedge.core.enums import MarketMakerLifecycle
@@ -1062,6 +1113,17 @@ class HypeEdgeApp:
             if desired in {MarketMakerLifecycle.STOPPED, MarketMakerLifecycle.FAULTED}:
                 continue
             try:
+                if instance.strategy_type == "trend_follow":
+                    start_target = (
+                        MarketMakerLifecycle.RUNNING
+                        if desired in {MarketMakerLifecycle.RUNNING, MarketMakerLifecycle.PAUSED}
+                        else MarketMakerLifecycle.RUNNING
+                    )
+                    await self._strategy_supervisor.start(instance.strategy_id, target=start_target)
+                    if desired == MarketMakerLifecycle.PAUSED:
+                        await self._strategy_supervisor.pause(instance.strategy_id)
+                    continue
+
                 await self._strategy_supervisor.start(instance.strategy_id, target=MarketMakerLifecycle.SHADOW)
                 if desired == MarketMakerLifecycle.RUNNING:
                     # Preserve operator intent but require an explicit resume

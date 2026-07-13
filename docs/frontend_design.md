@@ -209,43 +209,38 @@
 
 ### 2.5 策略页 `/strategy`
 
-**用途**：监控策略运行状态，启停策略，查看参数。
+**用途**：创建多类型策略实例、监控运行状态、启停策略，并进入类型专用工作台。
 
 ```
 ┌──────────────────────────────────────────────────────────┐
-│  策略管理                                                 │
+│  策略管理                              [新建策略]         │
 ├──────────────────────────────────────────────────────────┤
 │  ┌──────────────────────────────────────────────────────┐│
-│  │  trend_v1 — 趋势跟随                                  ││
-│  │  状态: 🟢 运行中                                      ││
-│  │                                                      ││
-│  │  ┌─────────────┬─────────────┬──────────────────┐    ││
-│  │  │ 今日信号: 3  │ 今日成交: 2  │ 策略PnL: +$180   │    ││
-│  │  └─────────────┴─────────────┴──────────────────┘    ││
-│  │                                                      ││
-│  │  当前参数:                                             ││
-│  │  fast_ema: 12  slow_ema: 26  signal: 9               ││
-│  │  atr_period: 14  stop_mult: 2.0  max_pos: 15%        ││
-│  │                                                      ││
-│  │  最近信号:                                             ││
-│  │  05:30 BUY BTC @ $69,200 (MACD cross ↑, mom 0.03)    ││
-│  │  04:15 SELL ETH @ $3,750 (MACD cross ↓, mom -0.02)   ││
-│  │                                                      ││
-│  │  [▶ 启动]  [⏹ 停止]  [📋 参数详情]                     ││
+│  │  mm-btc-1 — market_maker                             ││
+│  │  状态: 🟡 shadow · BTC · sub mm_btc                  ││
+│  │  [工作台]  [▶/⏹]                                      ││
 │  └──────────────────────────────────────────────────────┘│
-│                                                          │
 │  ┌──────────────────────────────────────────────────────┐│
-│  │  grid_v1 — 动态网格                                    ││
-│  │  状态: ⚪ 未启用                                       ││
-│  │  [▶ 启动]                                              ││
+│  │  trend_btc_1 — trend_follow                          ││
+│  │  状态: 🟢 running · BTC · sub trend_btc              ││
+│  │  [详情]  [▶/⏹]                                        ││
 │  └──────────────────────────────────────────────────────┘│
 └──────────────────────────────────────────────────────────┘
 ```
 
+**创建交互：**
+
+- 「新建策略」打开通用创建壳：先选 `strategy_type`，再填公共字段（`strategy_id` / `symbol` / `sub_account`）
+  与类型强类型 ConfigFields（做市复用 `MarketMakerConfigFields`，趋势使用 `TrendFollowConfigFields`）。
+- 请求体为 `strategy_type` 判别联合；禁止无约束 `Record` 表示交易关键配置。
+- 权威细节见 `docs/strategy_control_plane.md` 与 `docs/design.md` §19。
+
 **数据源：**
-- 策略列表：`GET /api/strategies` (SWR 5s)
-- 启动：`POST /api/strategies/:id/start`
-- 停止：`POST /api/strategies/:id/stop`
+
+- 策略列表：`GET /api/v1/strategies` (SWR 5s)
+- 创建：`POST /api/v1/strategies`（`Idempotency-Key`；判别联合 body）
+- 启停（目标态）：`POST /api/v1/strategies/:id/actions/{start|pause|resume|drain|stop}`（`If-Match` revision）
+- 过渡期 trend legacy：`POST /api/v1/strategies/:id/start|stop`（deprecated，P2 删除）
 - 策略信号：通过 SSE 推送 `EVENT_SIGNAL_GENERATED`
 
 #### 2.5.1 做市策略工作台 `/strategy/[id]/market-making`
