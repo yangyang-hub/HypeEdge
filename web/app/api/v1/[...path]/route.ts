@@ -41,14 +41,21 @@ function constantTimeEqual(left: string, right: string): boolean {
   return leftBuffer.length === rightBuffer.length && timingSafeEqual(leftBuffer, rightBuffer)
 }
 
+/** Intranet lab default: open (admin). Auth only when HYPEEDGE_DASHBOARD_AUTH=on|true|1. */
+function dashboardAuthEnabled(): boolean {
+  const flag = (process.env.HYPEEDGE_DASHBOARD_AUTH ?? "").trim().toLowerCase()
+  return flag === "1" || flag === "true" || flag === "on"
+}
+
 function configuredCredentials(): DashboardCredential[] | Response {
+  if (!dashboardAuthEnabled()) return []
+
   const credentials: DashboardCredential[] = []
   const definitions: Array<[DashboardRole, string | undefined, string | undefined, string | undefined]> = [
     ["viewer", process.env.HYPEEDGE_DASHBOARD_VIEWER_USERNAME, process.env.HYPEEDGE_DASHBOARD_VIEWER_PASSWORD, process.env.HYPEEDGE_VIEWER_API_TOKEN],
     ["operator", process.env.HYPEEDGE_DASHBOARD_OPERATOR_USERNAME, process.env.HYPEEDGE_DASHBOARD_OPERATOR_PASSWORD, process.env.HYPEEDGE_OPERATOR_API_TOKEN],
     ["admin", process.env.HYPEEDGE_DASHBOARD_ADMIN_USERNAME, process.env.HYPEEDGE_DASHBOARD_ADMIN_PASSWORD, process.env.HYPEEDGE_ADMIN_API_TOKEN],
-    // Backwards compatibility is intentionally read-only: legacy credentials
-    // can never silently inherit an admin backend token.
+    // Legacy Basic Auth maps to viewer only — never silently becomes admin.
     ["viewer", process.env.HYPEEDGE_DASHBOARD_USERNAME, process.env.HYPEEDGE_DASHBOARD_PASSWORD, process.env.HYPEEDGE_API_TOKEN],
   ]
   for (const [role, username, password, backendToken] of definitions) {
@@ -74,7 +81,9 @@ function dashboardPrincipal(request: NextRequest): DashboardPrincipal | Response
   const configured = configuredCredentials()
   if (configured instanceof Response) return configured
   if (configured.length === 0) {
-    return { role: "viewer", backendToken: "" }
+    // No dashboard auth configured: local open mode. Match backend unauthenticated
+    // local-admin so create/start/stop are not blocked as viewer-only.
+    return { role: "admin", backendToken: "" }
   }
   const authorization = request.headers.get("authorization") ?? ""
   const [scheme, encoded = ""] = authorization.split(" ", 2)
@@ -138,8 +147,15 @@ async function proxy(request: NextRequest, context: RouteContext): Promise<Respo
     ? "viewer"
     : path.join("/") === "kill-switch" ? "admin" : "operator"
   if (ROLE_RANK[principal.role] < ROLE_RANK[requiredRole]) {
+    const roleHint =
+      requiredRole === "admin"
+        ? "需要管理员账号（HYPEEDGE_DASHBOARD_ADMIN_*）"
+        : "需要操作员或管理员账号（HYPEEDGE_DASHBOARD_OPERATOR_* / ADMIN_*）"
     return Response.json(
-      { code: "INSUFFICIENT_ROLE", detail: `The ${requiredRole} dashboard role is required` },
+      {
+        code: "INSUFFICIENT_ROLE",
+        detail: `当前 Dashboard 角色为 ${principal.role}，${roleHint}。内网单人部署可去掉 HYPEEDGE_DASHBOARD_AUTH=on 以关闭鉴权。`,
+      },
       { status: 403 },
     )
   }

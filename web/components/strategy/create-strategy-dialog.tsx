@@ -190,8 +190,10 @@ export function CreateStrategyDialog({
       const message =
         err instanceof ApiError
           ? err.code === "STRATEGY_CREATE_CONFLICT"
-            ? "创建冲突：strategy_id 或 sub_account+symbol 已占用"
-            : err.message
+            ? "创建冲突：策略 ID 或子账户+品种已占用"
+            : err.code === "INSUFFICIENT_ROLE"
+              ? "当前开启了 Dashboard 鉴权且账号权限不足。内网单人请去掉 HYPEEDGE_DASHBOARD_AUTH=on，并清空 API token 后重启前后端。"
+              : err.message
           : err instanceof Error
             ? err.message
             : "创建失败"

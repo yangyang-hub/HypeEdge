@@ -9,6 +9,7 @@ describe("HypeEdge backend proxy", () => {
   })
 
   it("injects the server-side bearer token without trusting browser authorization", async () => {
+    vi.stubEnv("HYPEEDGE_DASHBOARD_AUTH", "on")
     vi.stubEnv("HYPEEDGE_BACKEND_URL", "http://backend.internal:37001")
     vi.stubEnv("HYPEEDGE_API_TOKEN", "server-secret".repeat(3))
     vi.stubEnv("HYPEEDGE_DASHBOARD_USERNAME", "operator")
@@ -33,6 +34,7 @@ describe("HypeEdge backend proxy", () => {
   })
 
   it("does not expose a configured backend token through an unauthenticated proxy", async () => {
+    vi.stubEnv("HYPEEDGE_DASHBOARD_AUTH", "on")
     vi.stubEnv("HYPEEDGE_API_TOKEN", "server-secret".repeat(3))
     const fetchMock = vi.fn()
     vi.stubGlobal("fetch", fetchMock)
@@ -47,6 +49,7 @@ describe("HypeEdge backend proxy", () => {
   })
 
   it("forwards mutations regardless of Origin / sec-fetch-site", async () => {
+    vi.stubEnv("HYPEEDGE_DASHBOARD_AUTH", "on")
     vi.stubEnv("HYPEEDGE_BACKEND_URL", "http://127.0.0.1:37001")
     vi.stubEnv("HYPEEDGE_DASHBOARD_OPERATOR_USERNAME", "operator")
     vi.stubEnv("HYPEEDGE_DASHBOARD_OPERATOR_PASSWORD", "operator-password")
@@ -72,6 +75,7 @@ describe("HypeEdge backend proxy", () => {
   })
 
   it("forwards command bodies and idempotency keys", async () => {
+    vi.stubEnv("HYPEEDGE_DASHBOARD_AUTH", "on")
     vi.stubEnv("HYPEEDGE_BACKEND_URL", "http://127.0.0.1:37001")
     vi.stubEnv("HYPEEDGE_DASHBOARD_OPERATOR_USERNAME", "operator")
     vi.stubEnv("HYPEEDGE_DASHBOARD_OPERATOR_PASSWORD", "operator-password")
@@ -95,7 +99,78 @@ describe("HypeEdge backend proxy", () => {
     expect(init.body).toBeTruthy()
   })
 
-  it("keeps legacy dashboard credentials read-only even when a backend token exists", async () => {
+  it("forwards mutations in local open mode without dashboard credentials", async () => {
+    vi.stubEnv("HYPEEDGE_BACKEND_URL", "http://127.0.0.1:37001")
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 202 }))
+    vi.stubGlobal("fetch", fetchMock)
+    const request = new NextRequest("http://192.168.31.5:34001/api/v1/strategies", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "Idempotency-Key": "open-mode-create",
+      },
+      body: "{}",
+    })
+
+    const response = await POST(request, { params: Promise.resolve({ path: ["strategies"] }) })
+
+    expect(response.status).toBe(202)
+    expect(fetchMock).toHaveBeenCalled()
+  })
+
+  it("ignores credential env vars unless HYPEEDGE_DASHBOARD_AUTH=on", async () => {
+    vi.stubEnv("HYPEEDGE_BACKEND_URL", "http://127.0.0.1:37001")
+    vi.stubEnv("HYPEEDGE_DASHBOARD_VIEWER_USERNAME", "viewer")
+    vi.stubEnv("HYPEEDGE_DASHBOARD_VIEWER_PASSWORD", "viewer-password")
+    vi.stubEnv("HYPEEDGE_VIEWER_API_TOKEN", "v".repeat(32))
+    const fetchMock = vi.fn().mockResolvedValue(new Response(null, { status: 202 }))
+    vi.stubGlobal("fetch", fetchMock)
+
+    const response = await POST(
+      new NextRequest("http://dashboard.local/api/v1/strategies", {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${Buffer.from("viewer:viewer-password").toString("base64")}`,
+          "Content-Type": "application/json",
+          "Idempotency-Key": "default-open",
+        },
+        body: "{}",
+      }),
+      { params: Promise.resolve({ path: ["strategies"] }) },
+    )
+
+    expect(response.status).toBe(202)
+    expect(fetchMock).toHaveBeenCalled()
+  })
+
+  it("rejects viewer credentials for operator mutations when auth is enabled", async () => {
+    vi.stubEnv("HYPEEDGE_DASHBOARD_AUTH", "on")
+    vi.stubEnv("HYPEEDGE_DASHBOARD_VIEWER_USERNAME", "viewer")
+    vi.stubEnv("HYPEEDGE_DASHBOARD_VIEWER_PASSWORD", "viewer-password")
+    vi.stubEnv("HYPEEDGE_VIEWER_API_TOKEN", "v".repeat(32))
+    const fetchMock = vi.fn()
+    vi.stubGlobal("fetch", fetchMock)
+
+    const response = await POST(
+      new NextRequest("http://dashboard.local/api/v1/strategies", {
+        method: "POST",
+        headers: {
+          Authorization: `Basic ${Buffer.from("viewer:viewer-password").toString("base64")}`,
+          "Content-Type": "application/json",
+          "Idempotency-Key": "viewer-create",
+        },
+        body: "{}",
+      }),
+      { params: Promise.resolve({ path: ["strategies"] }) },
+    )
+
+    expect(response.status).toBe(403)
+    expect(await response.json()).toMatchObject({ code: "INSUFFICIENT_ROLE" })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it("keeps legacy dashboard credentials from kill-switch when auth is enabled", async () => {
+    vi.stubEnv("HYPEEDGE_DASHBOARD_AUTH", "on")
     vi.stubEnv("HYPEEDGE_DASHBOARD_USERNAME", "legacy")
     vi.stubEnv("HYPEEDGE_DASHBOARD_PASSWORD", "legacy-password")
     vi.stubEnv("HYPEEDGE_API_TOKEN", "a".repeat(32))

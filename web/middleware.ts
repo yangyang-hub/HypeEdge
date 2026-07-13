@@ -35,6 +35,12 @@ function equalCredential(left: string, right: string): boolean {
 }
 
 export function middleware(request: NextRequest) {
+  // Default open for intranet personal use. Opt in with HYPEEDGE_DASHBOARD_AUTH=on.
+  const authFlag = (process.env.HYPEEDGE_DASHBOARD_AUTH ?? "").trim().toLowerCase()
+  if (authFlag !== "1" && authFlag !== "true" && authFlag !== "on") {
+    return NextResponse.next()
+  }
+
   const definitions = [
     [process.env.HYPEEDGE_DASHBOARD_VIEWER_USERNAME, process.env.HYPEEDGE_DASHBOARD_VIEWER_PASSWORD, process.env.HYPEEDGE_VIEWER_API_TOKEN],
     [process.env.HYPEEDGE_DASHBOARD_OPERATOR_USERNAME, process.env.HYPEEDGE_DASHBOARD_OPERATOR_PASSWORD, process.env.HYPEEDGE_OPERATOR_API_TOKEN],

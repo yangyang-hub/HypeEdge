@@ -13,16 +13,17 @@
 | `HYPE_ENV` | `dev` 或 `testnet` |
 | API 监听 | `configs/{dev,testnet}.yaml` 中 `api.host: 0.0.0.0`（可用 `HYPE_API__HOST` 覆盖） |
 | API token | **全部留空**：未配置 token 时 `/api` 以本机信任的 `local-admin` 身份运行，不校验 Bearer |
-| Dashboard | `web/.env.local` 中 Basic Auth 与 `HYPEEDGE_*_API_TOKEN` **全部留空**，页面不弹登录 |
+| Dashboard | 默认无鉴权（不要设 `HYPEEDGE_DASHBOARD_AUTH=on`）；页面不弹登录，创建/启停策略直接可用 |
 | 行情 WS | `NEXT_PUBLIC_HYPEEDGE_MARKET_WS_URL=ws://<主机局域网IP>:37001`；Origin 须在 `api.cors_origins` |
 | Next 代理 | `HYPEEDGE_BACKEND_URL=http://127.0.0.1:37001`（同机 loopback，不要写成局域网 IP） |
 
 约束：
 
-- **一旦配置任一 `HYPE_API__*TOKEN`，所有 `/api` 请求都必须带合法 Bearer**；此时 Dashboard 也必须配置完整的 Basic Auth 三元组，否则代理无法转发。
-- 若 `.env` 已清空 token 但后端未重启，进程仍会按旧配置要求 Bearer；Dashboard 无凭证时会先 401，随后在鉴权失败限流下变成 **429**。修改鉴权相关配置后必须重启 `hypeedge`。
+- **一旦配置任一 `HYPE_API__*TOKEN`，所有 `/api` 请求都必须带合法 Bearer**；此时须在 `web/.env.local` 设 `HYPEEDGE_DASHBOARD_AUTH=on` 并配置完整 Basic Auth 三元组，否则代理无法转发。
+- 若 `.env` 已清空 token 但后端未重启，进程仍会按旧配置要求 Bearer；修改鉴权相关配置后必须重启 `hypeedge` 与 `pnpm dev`。
 - **mainnet 不适用无鉴权模式**：必须配置 admin API token；非回环监听时同样强制 token。
 - 行情 WebSocket（`/ws/v1/market`）本身是只读公开通道，靠 `cors_origins` 与连接限速约束，与 HTTP `/api` 鉴权开关独立。
+- **内网单人**：请将根目录 `.env` 中所有 `HYPE_API__*TOKEN` / `HYPEEDGE_DASHBOARD_*` / `HYPEEDGE_*_API_TOKEN` 留空，且不要设置 `HYPEEDGE_DASHBOARD_AUTH=on`。
 
 最小内网启动：
 
@@ -70,8 +71,11 @@ Next.js 仅在服务端读取以下变量：
 
 每个角色的用户名、密码、后端 token 必须三者同时设置；部分配置返回 `503`，未认证请求返回 `401`。
 
-仪表盘使用三组 `HYPEEDGE_DASHBOARD_{VIEWER,OPERATOR,ADMIN}_{USERNAME,PASSWORD}`，不得用一个 Basic 用户
-共享 admin token。旧 `HYPEEDGE_DASHBOARD_USERNAME/PASSWORD` 仅映射为只读 viewer。
+**内网单人默认**：不设置 `HYPEEDGE_DASHBOARD_AUTH`，Dashboard 无 Basic Auth，BFF 以 admin 放行。
+
+仅在需要鉴权时设 `HYPEEDGE_DASHBOARD_AUTH=on`，并配置三组
+`HYPEEDGE_DASHBOARD_{VIEWER,OPERATOR,ADMIN}_{USERNAME,PASSWORD}`（不得用一个 Basic 用户共享 admin token）。
+旧 `HYPEEDGE_DASHBOARD_USERNAME/PASSWORD` 仅映射为只读 viewer。启用鉴权后，创建策略需要 operator。
 
 所有 `HYPEEDGE_*` 凭证都不能添加 `NEXT_PUBLIC_` 前缀，否则会进入浏览器 bundle。
 

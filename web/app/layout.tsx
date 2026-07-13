@@ -25,8 +25,10 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="zh-CN" className={`${ibmPlexSans.variable} ${ibmPlexMono.variable}`}>
-      <body className="min-h-screen bg-bg-base font-sans text-text-primary antialiased">
+    // Browser extensions (e.g. Immersive Translate) may mutate <html>/<body> attributes
+    // before hydration; suppress the resulting mismatch noise on these root tags only.
+    <html lang="zh-CN" className={`${ibmPlexSans.variable} ${ibmPlexMono.variable}`} suppressHydrationWarning>
+      <body className="min-h-screen bg-bg-base font-sans text-text-primary antialiased" suppressHydrationWarning>
         <a href="#main-content" className="skip-link">
           跳到主要内容
         </a>
