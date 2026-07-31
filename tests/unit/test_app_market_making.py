@@ -75,7 +75,10 @@ async def test_supervisor_rejects_running_before_atomic_plan_boundary() -> None:
         return 0
 
     commands = DurableQuotePlanCommandAdapter(repository=object(), cancel_all=cancel_all)
-    concrete = SimpleNamespace(start=None)
+    instance = StrategyInstanceDefinition(
+        StrategyId("mm-btc"), "market_maker", SubAccount("mm_btc"), Symbol("BTC")
+    )
+    concrete = SimpleNamespace(start=None, _store=_StateStore(instance))
     supervisor = LiveCapabilityStrategySupervisor(concrete, commands)
 
     with pytest.raises(StrategyLifecycleError, match="atomic durable quote-plan"):
@@ -89,6 +92,10 @@ class _StateStore:
 
     async def list_instances(self) -> list[StrategyInstanceDefinition]:
         return [self.instance]
+
+    async def get_instance(self, strategy_id: StrategyId) -> StrategyInstanceDefinition:
+        del strategy_id
+        return self.instance
 
     async def set_desired(
         self,
