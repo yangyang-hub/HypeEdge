@@ -93,7 +93,7 @@ RESERVATION_STATUSES = ("active", "consumed", "released", "expired")
 RECONCILIATION_STATUSES = ("running", "succeeded", "failed")
 STRATEGY_DESIRED_STATES = ("stopped", "warming", "shadow", "running", "paused", "draining", "faulted")
 STRATEGY_RUNTIME_STATES = ("stopped", "warming", "shadow", "running", "paused", "draining", "faulted")
-STRATEGY_TYPES = ("trend_follow", "market_maker", "legacy")
+STRATEGY_TYPES = ("funding_arb", "trend_follow", "market_maker", "legacy")
 SESSION_MODES = ("shadow", "testnet", "mainnet")
 QUOTE_PLAN_STATUSES = ("planned", "dispatching", "succeeded", "partial", "unknown", "cancelled", "superseded")
 QUOTE_DECISIONS = ("place", "cancel", "modify", "blocked_unknown")
@@ -524,6 +524,37 @@ class TrendFollowConfigVersionRecord(Base):
     max_position_pct: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     risk_per_trade_pct: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     macd_cross_threshold: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+
+
+class FundingArbConfigVersionRecord(Base):
+    """Typed, immutable funding-rate-arbitrage parameters for one config version.
+
+    Captures the single-venue delta-neutral shape (HL perpetual short + HL spot long).
+    The spot leg coin name is versioned as ``spot_coin``; the perpetual leg uses
+    ``strategy_instances.symbol``. See ``docs/funding_arb_design.md``.
+    """
+
+    __tablename__ = "funding_arb_config_versions"
+    __table_args__ = (
+        CheckConstraint("length(spot_coin) > 0", name="ck_fa_config_spot_coin"),
+        CheckConstraint("entry_funding_rate >= 0", name="ck_fa_config_entry_funding"),
+        CheckConstraint("exit_funding_rate >= 0", name="ck_fa_config_exit_funding"),
+        CheckConstraint("max_notional_usd > 0", name="ck_fa_config_max_notional"),
+        CheckConstraint("hedge_ratio > 0 AND hedge_ratio <= 1", name="ck_fa_config_hedge_ratio"),
+        CheckConstraint("rebalance_threshold_bps > 0", name="ck_fa_config_rebalance_bps"),
+        CheckConstraint("leverage > 0", name="ck_fa_config_leverage"),
+    )
+
+    config_version_id: Mapped[int] = mapped_column(
+        ForeignKey("strategy_config_versions.id", ondelete="RESTRICT"), primary_key=True
+    )
+    spot_coin: Mapped[str] = mapped_column(String(64), nullable=False)
+    entry_funding_rate: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    exit_funding_rate: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    max_notional_usd: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    hedge_ratio: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    rebalance_threshold_bps: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    leverage: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
 
 
 class StrategyRuntimeStateRecord(Base):

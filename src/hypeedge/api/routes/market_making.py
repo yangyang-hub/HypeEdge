@@ -401,6 +401,8 @@ async def create_config_version(
     async def execute(_command_id: str) -> dict[str, Any]:
         if body.strategy_type == "trend_follow":
             method = getattr(repository, "create_trend_follow_config_version", None)
+        elif body.strategy_type == "funding_arb":
+            method = getattr(repository, "create_funding_arb_config_version", None)
         else:
             method = getattr(repository, "create_market_maker_config_version", None)
         if method is None:

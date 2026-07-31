@@ -508,6 +508,7 @@ class HypeEdgeApp:
             funding=self._market_data_provider,
         )
         from hypeedge.storage.market_making import normalize_market_maker_config
+        from hypeedge.strategy.funding_arb import build_funding_arb_plugin
         from hypeedge.strategy.plugin import (
             MARKET_MAKER_CAPABILITIES,
             StaticStrategyTypePlugin,
@@ -532,6 +533,13 @@ class HypeEdgeApp:
             build_trend_follow_plugin(
                 event_bus=self.event_bus,
                 strategy_factory=self._build_trend_follow_strategy,
+            )
+        )
+        registry.register_plugin(
+            build_funding_arb_plugin(
+                execution=self._execution_engine,
+                provider=self._market_data_provider,
+                tracker=self._tracker,
             )
         )
         concrete_supervisor = StrategySupervisor(

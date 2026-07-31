@@ -120,6 +120,10 @@ function StrategyRow({
             <Button asChild variant="ghost" size="sm">
               <Link href={`/strategy/${encodeURIComponent(s.strategy_id)}/market-making`}>工作台</Link>
             </Button>
+          ) : s.strategy_type === "funding_arb" ? (
+            <Button asChild variant="ghost" size="sm">
+              <Link href={`/strategy/${encodeURIComponent(s.strategy_id)}/funding-arb`}>工作台</Link>
+            </Button>
           ) : null}
           <Button
             type="button"

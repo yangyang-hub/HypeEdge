@@ -266,6 +266,21 @@ class TrendFollowConfigVersionCreateRequest(StrictModel):
     config: TrendFollowConfigCreateRequest
 
 
+class FundingArbConfigCreateRequest(StrictModel):
+    spot_coin: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9@_.:-]+$")
+    entry_funding_rate: DecimalString = Field(default=Decimal("0.0001"), ge=0)
+    exit_funding_rate: DecimalString = Field(default=Decimal("0"), ge=0)
+    max_notional_usd: DecimalString = Field(default=Decimal("1000"), gt=0)
+    hedge_ratio: DecimalString = Field(default=Decimal("1"), gt=0, le=1)
+    rebalance_threshold_bps: int = Field(default=50, gt=0, le=1_000_000)
+    leverage: DecimalString = Field(default=Decimal("1"), gt=0)
+
+
+class FundingArbConfigVersionCreateRequest(StrictModel):
+    strategy_type: Literal["funding_arb"] = "funding_arb"
+    config: FundingArbConfigCreateRequest
+
+
 class MarketMakerStrategyCreateRequest(StrictModel):
     strategy_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
     strategy_type: Literal["market_maker"] = "market_maker"
@@ -284,13 +299,24 @@ class TrendFollowStrategyCreateRequest(StrictModel):
     metadata: dict[str, str] = Field(default_factory=dict)
 
 
+class FundingArbStrategyCreateRequest(StrictModel):
+    strategy_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_.:-]+$")
+    strategy_type: Literal["funding_arb"]
+    sub_account: str = Field(min_length=1, max_length=128)
+    symbol: str = Field(min_length=1, max_length=20, pattern=r"^[A-Z0-9][A-Z0-9_.-]*$")
+    initial_config: FundingArbConfigCreateRequest
+    metadata: dict[str, str] = Field(default_factory=dict)
+
+
 StrategyCreateRequest = Annotated[
-    MarketMakerStrategyCreateRequest | TrendFollowStrategyCreateRequest,
+    MarketMakerStrategyCreateRequest | TrendFollowStrategyCreateRequest | FundingArbStrategyCreateRequest,
     Field(discriminator="strategy_type"),
 ]
 
 StrategyConfigVersionCreateRequest = Annotated[
-    MarketMakerConfigVersionCreateRequest | TrendFollowConfigVersionCreateRequest,
+    MarketMakerConfigVersionCreateRequest
+    | TrendFollowConfigVersionCreateRequest
+    | FundingArbConfigVersionCreateRequest,
     Field(discriminator="strategy_type"),
 ]
 

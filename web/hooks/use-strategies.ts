@@ -76,6 +76,12 @@ export function normalizeStrategy(raw: StrategyListItem): StrategyInstance {
       parameters: raw.parameters ?? DEFAULT_TREND_PARAMETERS,
     }
   }
+  if (raw.strategy_type === "funding_arb") {
+    return {
+      ...base,
+      strategy_type: "funding_arb",
+    }
+  }
   return {
     ...base,
     strategy_type: "legacy",

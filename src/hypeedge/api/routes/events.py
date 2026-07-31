@@ -271,7 +271,7 @@ async def _event_stream(
                         yield event.encode()
             except Exception:
                 logger.exception("sse_durable_replay_failed", after_sequence=after_sequence)
-                yield "event: error\ndata: {\"detail\":\"sse_replay_unavailable\"}\n\n"
+                yield 'event: error\ndata: {"detail":"sse_replay_unavailable"}\n\n'
         else:
             for event in replay:
                 last_sent = max(last_sent, event.sequence)

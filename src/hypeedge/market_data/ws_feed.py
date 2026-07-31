@@ -47,6 +47,7 @@ class WebSocketFeed:
         self._event_bus = event_bus
         self._ws_url = settings.exchange.ws_url
         self._coins = [Symbol(c) for c in settings.market_data.coins]
+        self._spot_coins = [Symbol(c) for c in settings.market_data.spot_coins]
         self._channels = settings.market_data.ws_subscriptions
         self._candle_intervals = settings.market_data.candle_intervals
         self._book_manager = BookManager(depth=settings.market_data.l2_book_depth)
@@ -155,6 +156,12 @@ class WebSocketFeed:
             elif channel in {"l2Book", "trades", "activeAssetCtx"}:
                 for coin in self._coins:
                     subscriptions.append({"type": channel, "coin": str(coin)})
+                # Spot markets share the l2Book schema; subscribe spot coins so their
+                # books land in the same BookManager (keyed by spot coin name, which is
+                # distinct from perp coins).
+                if channel == "l2Book":
+                    for coin in self._spot_coins:
+                        subscriptions.append({"type": "l2Book", "coin": str(coin)})
             else:
                 logger.warning("ws_subscription_unsupported", channel=channel)
 

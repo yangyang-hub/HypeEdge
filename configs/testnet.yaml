@@ -13,6 +13,9 @@ market_data:
     - BTC
     - ETH
     - SOL
+  # Hyperliquid spot (HIP-1/HIP-2) coins to subscribe l2Book for; empty by default.
+  # Add spot tokens that have a perpetual counterpart for funding-rate arbitrage.
+  spot_coins: []
   ws_subscriptions:
     - l2Book
     - trades

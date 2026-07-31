@@ -32,6 +32,10 @@ class MarketDataProvider(Protocol):
         """Get the latest L2 order book snapshot for a symbol."""
         ...
 
+    def get_spot_book(self, symbol: Symbol) -> L2BookSnapshot | None:
+        """Get the latest L2 order book snapshot for a spot (HIP-1/HIP-2) symbol."""
+        ...
+
     def get_mid_price(self, symbol: Symbol) -> float | None:
         """Get the latest mid price for a symbol."""
         ...

@@ -13,6 +13,7 @@ import {
 } from "@/components/ui/dialog"
 import { Input } from "@/components/ui/input"
 import { MarketMakerConfigFields } from "@/components/market-making/market-maker-config-fields"
+import { FundingArbConfigFields } from "@/components/strategy/funding-arb-config-fields"
 import { TrendFollowConfigFields } from "@/components/strategy/trend-follow-config-fields"
 import { useAccount } from "@/hooks/use-account"
 import { createStrategy } from "@/hooks/use-strategies"
@@ -26,15 +27,17 @@ import {
   validateMmConfig,
   validateStrategyIdentity,
 } from "@/lib/market-maker-config"
+import { cloneDefaultFaConfig, validateFaConfig } from "@/lib/funding-arb-config"
 import { cloneDefaultTfConfig, validateTfConfig } from "@/lib/trend-follow-config"
 import type {
+  FundingArbConfig,
   MarketMakerConfig,
   StrategyCreateRequest,
   StrategyInstance,
   TrendFollowConfig,
 } from "@/lib/types"
 
-export type CreatableStrategyType = "market_maker" | "trend_follow"
+export type CreatableStrategyType = "market_maker" | "trend_follow" | "funding_arb"
 
 export interface CreateStrategyDialogProps {
   open: boolean
@@ -48,6 +51,7 @@ type Step = 1 | 2
 const TYPE_LABELS: Record<CreatableStrategyType, string> = {
   market_maker: "做市策略",
   trend_follow: "趋势跟随",
+  funding_arb: "资金费套利",
 }
 
 export function CreateStrategyDialog({
@@ -66,6 +70,7 @@ export function CreateStrategyDialog({
   const [metadataNote, setMetadataNote] = useState("")
   const [mmConfig, setMmConfig] = useState<MarketMakerConfig>(() => cloneDefaultMmConfig())
   const [tfConfig, setTfConfig] = useState<TrendFollowConfig>(() => cloneDefaultTfConfig())
+  const [faConfig, setFaConfig] = useState<FundingArbConfig>(() => cloneDefaultFaConfig())
   const [showAdvanced, setShowAdvanced] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
@@ -91,6 +96,7 @@ export function CreateStrategyDialog({
     }
     setMmConfig(next)
     setTfConfig(cloneDefaultTfConfig())
+    setFaConfig(cloneDefaultFaConfig())
   }, [open, account?.equity])
 
   useEffect(() => {
@@ -110,7 +116,7 @@ export function CreateStrategyDialog({
       sym &&
       existing.some(
         (item) =>
-          (item.strategy_type === "market_maker" || item.strategy_type === "trend_follow") &&
+          (item.strategy_type === "market_maker" || item.strategy_type === "trend_follow" || item.strategy_type === "funding_arb") &&
           item.sub_account?.toLowerCase() === sub.toLowerCase() &&
           item.symbol.toUpperCase() === sym,
       )
@@ -143,18 +149,15 @@ export function CreateStrategyDialog({
   }
 
   async function handleSubmit() {
-    if (strategyType === "market_maker") {
-      const configError = validateMmConfig(mmConfig)
-      if (configError) {
-        setError(configError)
-        return
-      }
-    } else {
-      const configError = validateTfConfig(tfConfig)
-      if (configError) {
-        setError(configError)
-        return
-      }
+    const configError =
+      strategyType === "market_maker"
+        ? validateMmConfig(mmConfig)
+        : strategyType === "funding_arb"
+          ? validateFaConfig(faConfig)
+          : validateTfConfig(tfConfig)
+    if (configError) {
+      setError(configError)
+      return
     }
 
     setSubmitting(true)
@@ -162,29 +165,42 @@ export function CreateStrategyDialog({
     try {
       const metadata: Record<string, string> = {}
       if (metadataNote.trim()) metadata.note = metadataNote.trim()
-      const body: StrategyCreateRequest =
-        strategyType === "market_maker"
-          ? {
-              strategy_id: strategyId.trim(),
-              strategy_type: "market_maker",
-              sub_account: subAccount.trim(),
-              symbol: symbol.trim().toUpperCase(),
-              initial_config: mmConfig,
-              metadata,
-            }
-          : {
-              strategy_id: strategyId.trim(),
-              strategy_type: "trend_follow",
-              sub_account: subAccount.trim(),
-              symbol: symbol.trim().toUpperCase(),
-              initial_config: tfConfig,
-              metadata,
-            }
+      let body: StrategyCreateRequest
+      if (strategyType === "market_maker") {
+        body = {
+          strategy_id: strategyId.trim(),
+          strategy_type: "market_maker",
+          sub_account: subAccount.trim(),
+          symbol: symbol.trim().toUpperCase(),
+          initial_config: mmConfig,
+          metadata,
+        }
+      } else if (strategyType === "funding_arb") {
+        body = {
+          strategy_id: strategyId.trim(),
+          strategy_type: "funding_arb",
+          sub_account: subAccount.trim(),
+          symbol: symbol.trim().toUpperCase(),
+          initial_config: faConfig,
+          metadata,
+        }
+      } else {
+        body = {
+          strategy_id: strategyId.trim(),
+          strategy_type: "trend_follow",
+          sub_account: subAccount.trim(),
+          symbol: symbol.trim().toUpperCase(),
+          initial_config: tfConfig,
+          metadata,
+        }
+      }
       const created = await createStrategy(body, { idempotencyKey: idempotencyKeyRef.current })
       onCreated?.(created)
       onOpenChange(false)
       if (created.strategy_type === "market_maker") {
         router.push(`/strategy/${encodeURIComponent(created.strategy_id)}/market-making?created=1`)
+      } else if (created.strategy_type === "funding_arb") {
+        router.push(`/strategy/${encodeURIComponent(created.strategy_id)}/funding-arb?created=1`)
       }
     } catch (err) {
       const message =
@@ -213,7 +229,9 @@ export function CreateStrategyDialog({
               ? "第一步：选择类型并定义实例身份。创建后为 stopped。"
               : strategyType === "market_maker"
                 ? "第二步：设置做市初始配置。高级参数可折叠。"
-                : "第二步：设置趋势跟随参数（EMA / ATR / 仓位）。"}
+                : strategyType === "funding_arb"
+                  ? "第二步：设置资金费套利参数（funding 阈值 / 对冲比例 / 敞口）。"
+                  : "第二步：设置趋势跟随参数（EMA / ATR / 仓位）。"}
           </DialogDescription>
           <p className="text-2xs text-text-tertiary">步骤 {step} / 2</p>
         </DialogHeader>
@@ -229,7 +247,7 @@ export function CreateStrategyDialog({
             <label className="text-xs text-text-secondary sm:col-span-2" htmlFor="create-strategy-type">
               <span className="font-medium text-text-primary">策略类型</span>
               <p className="mt-0.5 text-2xs leading-snug text-text-tertiary">
-                做市适合库存型双边报价；趋势跟随适合中频方向信号。
+                做市适合库存型双边报价；趋势跟随适合中频方向信号；资金费套利靠永续+现货对冲收取 funding（当前为骨架占位，运行时尚未实盘下单）。
               </p>
               <select
                 id="create-strategy-type"
@@ -254,7 +272,9 @@ export function CreateStrategyDialog({
                 className="mt-1.5 font-mono"
                 value={strategyId}
                 onChange={(event) => setStrategyId(event.target.value)}
-                placeholder={strategyType === "market_maker" ? "mm-btc-1" : "trend-btc-1"}
+                placeholder={
+                  strategyType === "market_maker" ? "mm-btc-1" : strategyType === "funding_arb" ? "fa-btc-1" : "trend-btc-1"
+                }
               />
             </label>
             <label className="text-xs text-text-secondary" htmlFor="create-sub-account">
@@ -267,7 +287,9 @@ export function CreateStrategyDialog({
                 className="mt-1.5 font-mono"
                 value={subAccount}
                 onChange={(event) => setSubAccount(event.target.value)}
-                placeholder={strategyType === "market_maker" ? "mm_btc" : "trend_btc"}
+                placeholder={
+                  strategyType === "market_maker" ? "mm_btc" : strategyType === "funding_arb" ? "fa_btc" : "trend_btc"
+                }
               />
             </label>
             <label className="text-xs text-text-secondary" htmlFor="create-symbol">
@@ -310,6 +332,8 @@ export function CreateStrategyDialog({
               {showAdvanced ? "隐藏高级参数" : "显示高级参数"}
             </Button>
           </div>
+        ) : strategyType === "funding_arb" ? (
+          <FundingArbConfigFields value={faConfig} onChange={setFaConfig} />
         ) : (
           <TrendFollowConfigFields value={tfConfig} onChange={setTfConfig} />
         )}

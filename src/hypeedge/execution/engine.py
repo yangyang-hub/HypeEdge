@@ -140,7 +140,7 @@ class ExecutionEngine:
         7. Publish lifecycle events
         """
         deferred_execution = self._deferred_execution if deferred is None else deferred
-        if self._order_normalizer is not None:
+        if self._order_normalizer is not None and not intent.is_spot:
             best_bid: Price | None = None
             best_ask: Price | None = None
             if self._market_data_provider is not None:
@@ -165,6 +165,7 @@ class ExecutionEngine:
             reduce_only=intent.reduce_only,
             cloid=cloid,
             client_id=intent.client_id,
+            is_spot=intent.is_spot,
         )
 
         # Idempotency precedes every new-placement gate: replaying an already
@@ -676,13 +677,42 @@ class ExecutionEngine:
         is_buy = intent.side == Side.BUY
         name = str(intent.symbol)
         sz = float(intent.size)
+        sdk_cloid = self._to_sdk_cloid(intent.cloid or Cloid(""))
+        cloid_hint = str(intent.cloid or "")
+
+        def preflight() -> None:
+            self._placement_preflight(intent)
+
+        # Spot orders route exclusively through exchange.order: market_open /
+        # market_close infer direction from the perp user_state and do not apply
+        # to the spot book, and spot has no reduce-only concept (positions are
+        # token balances). A spot "market" is an IoC limit at a caller-provided
+        # aggressive price (the SDK has no perp-free spot market helper).
+        if intent.is_spot:
+            if intent.price is None:
+                raise OrderRejectedError(
+                    "Spot orders require an explicit price",
+                    cloid=cloid_hint,
+                    reason="spot_order_requires_price",
+                )
+            tif = "Ioc" if intent.order_type == OrderType.MARKET else _TIF_MAP.get(str(intent.time_in_force), "Gtc")
+            return await self._nonce.submit(
+                exchange.order,
+                name,
+                is_buy,
+                sz,
+                float(intent.price),
+                {"limit": {"tif": tif}},
+                False,  # reduce_only is invalid for spot
+                sdk_cloid,
+                cloid_hint=cloid_hint,
+                preflight_check=preflight,
+            )
 
         # Price: for market orders use a very aggressive price
         if intent.order_type == OrderType.MARKET:
             # Market order: use IoC with a very aggressive limit price
-            limit_px = 0.0  # SDK market_open/market_close handle price calc
-            order_type: dict[str, Any] = {"limit": {"tif": "Ioc"}}
-            sdk_cloid = self._to_sdk_cloid(intent.cloid or Cloid(""))
+            order_type: dict[str, Any] = {"limit": {"tif": "Ioc"}}  # SDK market_open/market_close handle price calc
             if intent.reduce_only:
                 # market_close derives the safe side from the exchange position and
                 # always sends reduce-only semantics in the SDK.
@@ -693,8 +723,8 @@ class ExecutionEngine:
                     px=None,
                     slippage=0.05,
                     cloid=sdk_cloid,
-                    cloid_hint=str(intent.cloid or ""),
-                    preflight_check=lambda: self._placement_preflight(intent),
+                    cloid_hint=cloid_hint,
+                    preflight_check=preflight,
                 )
             return await self._nonce.submit(
                 exchange.market_open,
@@ -704,27 +734,26 @@ class ExecutionEngine:
                 px=None,
                 slippage=0.05,
                 cloid=sdk_cloid,
-                cloid_hint=str(intent.cloid or ""),
-                preflight_check=lambda: self._placement_preflight(intent),
+                cloid_hint=cloid_hint,
+                preflight_check=preflight,
             )
 
-        else:
-            limit_px = float(intent.price) if intent.price else 0.0
-            tif = _TIF_MAP.get(str(intent.time_in_force), "Gtc")
-            order_type = {"limit": {"tif": tif}}
+        limit_px = float(intent.price) if intent.price else 0.0
+        tif = _TIF_MAP.get(str(intent.time_in_force), "Gtc")
+        order_type = {"limit": {"tif": tif}}
 
-            return await self._nonce.submit(
-                exchange.order,
-                name,
-                is_buy,
-                sz,
-                limit_px,
-                order_type,
-                intent.reduce_only,
-                self._to_sdk_cloid(intent.cloid or Cloid("")),
-                cloid_hint=str(intent.cloid or ""),
-                preflight_check=lambda: self._placement_preflight(intent),
-            )
+        return await self._nonce.submit(
+            exchange.order,
+            name,
+            is_buy,
+            sz,
+            limit_px,
+            order_type,
+            intent.reduce_only,
+            sdk_cloid,
+            cloid_hint=cloid_hint,
+            preflight_check=preflight,
+        )
 
     def _placement_preflight(self, intent: OrderIntent) -> None:
         self._kill_switch.check()

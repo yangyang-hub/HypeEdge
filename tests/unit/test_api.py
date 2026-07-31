@@ -252,9 +252,7 @@ class TestMarketMakingControlPlane:
                 )
             ]
         )
-        repository.get_runtime = AsyncMock(
-            return_value=SimpleNamespace(actual_state=MarketMakerLifecycle.SHADOW)
-        )
+        repository.get_runtime = AsyncMock(return_value=SimpleNamespace(actual_state=MarketMakerLifecycle.SHADOW))
         app_mock.market_making_repository = repository
         api_app = create_api(app_mock)
         async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:

@@ -141,7 +141,7 @@ export type StrategyDesiredState = "stopped" | "shadow" | "running" | "paused"
 
 export interface StrategyInstanceBase {
   strategy_id: string
-  strategy_type: "trend_follow" | "market_maker" | "legacy"
+  strategy_type: "funding_arb" | "trend_follow" | "market_maker" | "legacy"
   symbol: string
   sub_account: string | null
   desired_state: StrategyDesiredState
@@ -166,6 +166,10 @@ export interface TrendFollowStrategyInstance extends StrategyInstanceBase {
   }
 }
 
+export interface FundingArbStrategyInstance extends StrategyInstanceBase {
+  strategy_type: "funding_arb"
+}
+
 export interface MarketMakerStrategyInstance extends StrategyInstanceBase {
   strategy_type: "market_maker"
   session_mode: "shadow" | "testnet" | "mainnet" | null
@@ -178,6 +182,7 @@ export interface LegacyStrategyInstance extends StrategyInstanceBase {
 
 export type StrategyInstance =
   | TrendFollowStrategyInstance
+  | FundingArbStrategyInstance
   | MarketMakerStrategyInstance
   | LegacyStrategyInstance
 
@@ -410,6 +415,16 @@ export interface TrendFollowConfig {
   macd_cross_threshold: DecimalString
 }
 
+export interface FundingArbConfig {
+  spot_coin: string
+  entry_funding_rate: DecimalString
+  exit_funding_rate: DecimalString
+  max_notional_usd: DecimalString
+  hedge_ratio: DecimalString
+  rebalance_threshold_bps: number
+  leverage: DecimalString
+}
+
 /** Payload for POST /api/v1/strategies (discriminated by strategy_type). */
 export type StrategyCreateRequest =
   | {
@@ -426,6 +441,14 @@ export type StrategyCreateRequest =
       sub_account: string
       symbol: string
       initial_config: TrendFollowConfig
+      metadata?: Record<string, string>
+    }
+  | {
+      strategy_id: string
+      strategy_type: "funding_arb"
+      sub_account: string
+      symbol: string
+      initial_config: FundingArbConfig
       metadata?: Record<string, string>
     }
 

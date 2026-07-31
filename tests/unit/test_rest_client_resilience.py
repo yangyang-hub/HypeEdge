@@ -96,4 +96,3 @@ async def test_candle_backfill_skips_empty_pages() -> None:
     assert http_client.post.await_count >= 2
     assert http_client.post.await_args_list[0].kwargs["json"]["req"]["endTime"] == 120_000
     assert http_client.post.await_args_list[1].kwargs["json"]["req"]["startTime"] == 120_000
-

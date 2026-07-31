@@ -179,5 +179,6 @@ class WsChannel(StrEnum):
     CANDLE = "candle"
     ALL_MIDS = "allMids"
     ACTIVE_ASSET_CTX = "activeAssetCtx"
+    ACTIVE_SPOT_ASSET_CTX = "activeSpotAssetCtx"
     USER_FILLS = "userFills"
     ORDER_UPDATES = "orderUpdates"

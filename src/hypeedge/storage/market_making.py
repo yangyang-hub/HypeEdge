@@ -32,6 +32,7 @@ from hypeedge.storage.postgres import (
     ExecutionActionRecord,
     ExecutionCommandItemRecord,
     ExecutionCommandRecord,
+    FundingArbConfigVersionRecord,
     MarketMakerConfigVersionRecord,
     MarketMakingSessionRecord,
     OrderRecord,
@@ -216,7 +217,7 @@ def normalize_trend_follow_config(values: Mapping[str, Any]) -> dict[str, Decima
         normalized[name] = int(value)
     for name in _TF_DECIMAL_FIELDS:
         normalized[name] = Decimal(_decimal_text(supplied[name]))
-    if not normalized["fast_ema_period"] < normalized["slow_ema_period"]:  # type: ignore[operator]
+    if not normalized["fast_ema_period"] < normalized["slow_ema_period"]:
         raise StrategyRegistrationError("fast_ema_period must be < slow_ema_period")
     for name in ("max_position_pct", "risk_per_trade_pct"):
         value = normalized[name]
@@ -257,6 +258,90 @@ def default_trend_follow_config() -> dict[str, Decimal | int]:
         "max_position_pct": Decimal("0.15"),
         "risk_per_trade_pct": Decimal("0.01"),
         "macd_cross_threshold": Decimal("0"),
+    }
+
+
+_FA_INTEGER_FIELDS = ("rebalance_threshold_bps",)
+_FA_DECIMAL_FIELDS = (
+    "entry_funding_rate",
+    "exit_funding_rate",
+    "max_notional_usd",
+    "hedge_ratio",
+    "leverage",
+)
+_FA_STRING_FIELDS = ("spot_coin",)
+_FA_CONFIG_FIELDS = frozenset((*_FA_INTEGER_FIELDS, *_FA_DECIMAL_FIELDS, *_FA_STRING_FIELDS))
+
+
+def normalize_funding_arb_config(values: Mapping[str, Any]) -> dict[str, Decimal | int | str]:
+    """Validate and normalize typed funding-rate-arbitrage Postgres config.
+
+    Single-venue delta-neutral shape: HL perpetual short funded by funding income,
+    delta-hedged long spot on the same venue. ``spot_coin`` names the spot leg
+    (HIP-1/HIP-2); the perpetual leg uses ``strategy_instances.symbol``.
+    """
+
+    supplied = dict(values)
+    supplied.pop("symbol", None)
+    keys = frozenset(supplied)
+    if keys != _FA_CONFIG_FIELDS:
+        missing = sorted(_FA_CONFIG_FIELDS - keys)
+        extra = sorted(keys - _FA_CONFIG_FIELDS)
+        raise StrategyRegistrationError(f"Invalid funding-arb config fields: missing={missing} extra={extra}")
+    normalized: dict[str, Decimal | int | str] = {}
+    for name in _FA_INTEGER_FIELDS:
+        value = supplied[name]
+        if isinstance(value, bool) or int(value) != value:
+            raise StrategyRegistrationError(f"Funding-arb config field must be an integer: {name}")
+        normalized[name] = int(value)
+    for name in _FA_DECIMAL_FIELDS:
+        normalized[name] = Decimal(_decimal_text(supplied[name]))
+    for name in _FA_STRING_FIELDS:
+        value = supplied[name]
+        if not isinstance(value, str) or not value.strip():
+            raise StrategyRegistrationError(f"Funding-arb config field must be a non-empty string: {name}")
+        normalized[name] = value.strip()
+    for name in ("entry_funding_rate", "exit_funding_rate"):
+        value = normalized[name]
+        assert isinstance(value, Decimal)
+        if value < 0:
+            raise StrategyRegistrationError(f"{name} must be >= 0")
+    for name in ("max_notional_usd", "leverage"):
+        value = normalized[name]
+        assert isinstance(value, Decimal)
+        if value <= 0:
+            raise StrategyRegistrationError(f"{name} must be > 0")
+    hedge = normalized["hedge_ratio"]
+    assert isinstance(hedge, Decimal)
+    if not (Decimal("0") < hedge <= Decimal("1")):
+        raise StrategyRegistrationError("hedge_ratio must be in (0, 1]")
+    if int(normalized["rebalance_threshold_bps"]) <= 0:
+        raise StrategyRegistrationError("rebalance_threshold_bps must be > 0")
+    return normalized
+
+
+def funding_arb_config_hash(values: Mapping[str, Any]) -> str:
+    """Return a stable semantic hash for funding-arb config."""
+
+    normalized = normalize_funding_arb_config(values)
+    canonical = {
+        key: _decimal_text(value) if key in _FA_DECIMAL_FIELDS else value for key, value in sorted(normalized.items())
+    }
+    payload = json.dumps(canonical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode()).hexdigest()
+
+
+def default_funding_arb_config() -> dict[str, Decimal | int | str]:
+    """Safe create defaults aligned with ``FundingArbParams``."""
+
+    return {
+        "spot_coin": "PURR",
+        "entry_funding_rate": Decimal("0.0001"),
+        "exit_funding_rate": Decimal("0"),
+        "max_notional_usd": Decimal("1000"),
+        "hedge_ratio": Decimal("1"),
+        "rebalance_threshold_bps": 50,
+        "leverage": Decimal("1"),
     }
 
 
@@ -417,13 +502,16 @@ class PostgresStrategyStateStore:
         metadata: Mapping[str, Any] | None = None,
     ) -> StrategyInstanceView:
         strategy_type = instance.strategy_type.strip().lower()
-        if strategy_type not in {"market_maker", "trend_follow"}:
+        if strategy_type not in {"market_maker", "trend_follow", "funding_arb"}:
             raise StrategyRegistrationError(f"Unsupported strategy_type for typed creation: {strategy_type}")
         if instance.desired_config_revision != 1:
             raise StrategyRegistrationError("Initial config revision must be 1")
         if strategy_type == "market_maker":
-            normalized: dict[str, Decimal | int] = normalize_market_maker_config(initial_config)
+            normalized: Mapping[str, Decimal | int | str] = normalize_market_maker_config(initial_config)
             config_hash = market_maker_config_hash(normalized)
+        elif strategy_type == "funding_arb":
+            normalized = normalize_funding_arb_config(initial_config)
+            config_hash = funding_arb_config_hash(normalized)
         else:
             normalized = normalize_trend_follow_config(initial_config)
             config_hash = trend_follow_config_hash(normalized)
@@ -446,6 +534,8 @@ class PostgresStrategyStateStore:
             await session.flush()
             if strategy_type == "market_maker":
                 session.add(MarketMakerConfigVersionRecord(config_version_id=config_record.id, **normalized))
+            elif strategy_type == "funding_arb":
+                session.add(FundingArbConfigVersionRecord(config_version_id=config_record.id, **normalized))
             else:
                 session.add(TrendFollowConfigVersionRecord(config_version_id=config_record.id, **normalized))
             record.desired_config_version_id = config_record.id
@@ -518,6 +608,7 @@ class PostgresStrategyStateStore:
     async def list_config_versions(self, strategy_id: StrategyId) -> list[StrategyConfigSnapshot]:
         strategy_type = await self._strategy_type(strategy_id)
         async with self._session_factory() as session:
+            statement: Any
             if strategy_type == "market_maker":
                 statement = (
                     select(StrategyConfigVersionRecord, MarketMakerConfigVersionRecord)
@@ -530,6 +621,18 @@ class PostgresStrategyStateStore:
                 )
                 rows = (await session.execute(statement)).all()
                 return [self._mm_config_snapshot(meta, typed) for meta, typed in rows]
+            if strategy_type == "funding_arb":
+                statement = (
+                    select(StrategyConfigVersionRecord, FundingArbConfigVersionRecord)
+                    .join(
+                        FundingArbConfigVersionRecord,
+                        FundingArbConfigVersionRecord.config_version_id == StrategyConfigVersionRecord.id,
+                    )
+                    .where(StrategyConfigVersionRecord.strategy_id == str(strategy_id))
+                    .order_by(StrategyConfigVersionRecord.version)
+                )
+                rows = (await session.execute(statement)).all()
+                return [self._fa_config_snapshot(meta, typed) for meta, typed in rows]
             statement = (
                 select(StrategyConfigVersionRecord, TrendFollowConfigVersionRecord)
                 .join(
@@ -668,9 +771,71 @@ class PostgresStrategyStateStore:
             await session.flush()
             return self._tf_config_snapshot(meta, typed)
 
+    async def create_funding_arb_config_version(
+        self,
+        strategy_id: StrategyId,
+        values: Mapping[str, Any],
+        *,
+        created_by: str,
+        expected_revision: int | None = None,
+    ) -> StrategyConfigSnapshot:
+        normalized = normalize_funding_arb_config(values)
+        config_hash = funding_arb_config_hash(normalized)
+        async with self._session_factory() as session, session.begin():
+            instance = (
+                await session.execute(
+                    select(StrategyInstanceRecord)
+                    .where(StrategyInstanceRecord.strategy_id == str(strategy_id))
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if instance is None or instance.archived_at is not None:
+                raise StrategyRegistrationError(f"Unknown active strategy instance: {strategy_id}")
+            if instance.strategy_type != "funding_arb":
+                raise StrategyRegistrationError("create_funding_arb_config_version requires strategy_type=funding_arb")
+            if expected_revision is not None and instance.revision != expected_revision:
+                raise StrategyLifecycleError(
+                    f"Strategy revision conflict: expected={expected_revision} actual={instance.revision}"
+                )
+            existing = (
+                await session.execute(
+                    select(StrategyConfigVersionRecord, FundingArbConfigVersionRecord)
+                    .join(
+                        FundingArbConfigVersionRecord,
+                        FundingArbConfigVersionRecord.config_version_id == StrategyConfigVersionRecord.id,
+                    )
+                    .where(
+                        StrategyConfigVersionRecord.strategy_id == str(strategy_id),
+                        StrategyConfigVersionRecord.config_hash == config_hash,
+                    )
+                )
+            ).one_or_none()
+            if existing is not None:
+                return self._fa_config_snapshot(existing[0], existing[1])
+            latest = await session.scalar(
+                select(func.max(StrategyConfigVersionRecord.version)).where(
+                    StrategyConfigVersionRecord.strategy_id == str(strategy_id)
+                )
+            )
+            meta = StrategyConfigVersionRecord(
+                strategy_id=str(strategy_id),
+                version=int(latest or 0) + 1,
+                config_hash=config_hash,
+                created_by=created_by,
+            )
+            session.add(meta)
+            await session.flush()
+            typed = FundingArbConfigVersionRecord(config_version_id=meta.id, **normalized)
+            session.add(typed)
+            instance.revision += 1
+            instance.updated_at = _utcnow()
+            await session.flush()
+            return self._fa_config_snapshot(meta, typed)
+
     async def get_config(self, strategy_id: StrategyId, revision: int) -> StrategyConfigSnapshot:
         strategy_type = await self._strategy_type(strategy_id)
         async with self._session_factory() as session:
+            statement: Any
             if strategy_type == "market_maker":
                 statement = (
                     select(StrategyConfigVersionRecord, MarketMakerConfigVersionRecord)
@@ -689,6 +854,24 @@ class PostgresStrategyStateStore:
                         f"Unknown config revision: strategy_id={strategy_id} revision={revision}"
                     )
                 return self._mm_config_snapshot(row[0], row[1])
+            if strategy_type == "funding_arb":
+                statement = (
+                    select(StrategyConfigVersionRecord, FundingArbConfigVersionRecord)
+                    .join(
+                        FundingArbConfigVersionRecord,
+                        FundingArbConfigVersionRecord.config_version_id == StrategyConfigVersionRecord.id,
+                    )
+                    .where(
+                        StrategyConfigVersionRecord.strategy_id == str(strategy_id),
+                        StrategyConfigVersionRecord.version == revision,
+                    )
+                )
+                row = (await session.execute(statement)).one_or_none()
+                if row is None:
+                    raise StrategyRegistrationError(
+                        f"Unknown config revision: strategy_id={strategy_id} revision={revision}"
+                    )
+                return self._fa_config_snapshot(row[0], row[1])
             statement = (
                 select(StrategyConfigVersionRecord, TrendFollowConfigVersionRecord)
                 .join(
@@ -897,6 +1080,13 @@ class PostgresStrategyStateStore:
         meta: StrategyConfigVersionRecord, typed: TrendFollowConfigVersionRecord
     ) -> StrategyConfigSnapshot:
         values = {name: getattr(typed, name) for name in _TF_CONFIG_FIELDS}
+        return StrategyConfigSnapshot(StrategyId(meta.strategy_id), int(meta.version), values)
+
+    @staticmethod
+    def _fa_config_snapshot(
+        meta: StrategyConfigVersionRecord, typed: FundingArbConfigVersionRecord
+    ) -> StrategyConfigSnapshot:
+        values = {name: getattr(typed, name) for name in _FA_CONFIG_FIELDS}
         return StrategyConfigSnapshot(StrategyId(meta.strategy_id), int(meta.version), values)
 
     @staticmethod

@@ -105,6 +105,7 @@ class OrderIntent:
     reduce_only: bool = False
     cloid: Cloid | None = None  # Pre-assigned, or auto-generated
     client_id: str | None = None  # Additional client tracking ID
+    is_spot: bool = False  # True routes to the Hyperliquid spot (HIP-1/HIP-2) order book
 
 
 @dataclass

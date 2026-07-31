@@ -103,6 +103,10 @@ class LiveMarketDataProvider:
         """Get the latest L2 order book snapshot."""
         return self._book_manager.get_snapshot(symbol)
 
+    def get_spot_book(self, symbol: Symbol) -> L2BookSnapshot | None:
+        """Get the latest spot L2 order book snapshot (shares the BookManager)."""
+        return self._book_manager.get_snapshot(symbol)
+
     def get_mid_price(self, symbol: Symbol) -> float | None:
         """Get the latest mid price for a symbol.
 

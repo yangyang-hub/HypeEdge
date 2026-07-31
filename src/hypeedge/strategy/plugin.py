@@ -73,6 +73,21 @@ TREND_FOLLOW_CAPABILITIES = StrategyTypeCapabilities(
     workspace=None,
 )
 
+FUNDING_ARB_CAPABILITIES = StrategyTypeCapabilities(
+    creatable=True,
+    desired_states=frozenset(
+        {
+            MarketMakerLifecycle.STOPPED,
+            MarketMakerLifecycle.RUNNING,
+            MarketMakerLifecycle.PAUSED,
+        }
+    ),
+    actions=frozenset({"start", "stop", "pause", "resume"}),
+    supports_shadow=False,
+    supports_drain=False,
+    workspace="funding-arb",
+)
+
 
 class StrategyTypePlugin(Protocol):
     """Registered strategy type: config persistence + runtime factory + capabilities."""

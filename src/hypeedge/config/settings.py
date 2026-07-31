@@ -53,6 +53,7 @@ class MarketDataSettings(HypeSettings):
     model_config = SettingsConfigDict(env_prefix="HYPE_MARKET_DATA__", env_file=".env", extra="ignore")
 
     coins: list[str] = Field(default=["BTC", "ETH", "SOL"])
+    spot_coins: list[str] = Field(default_factory=list)
     ws_subscriptions: list[str] = Field(default=["l2Book", "trades", "candle", "allMids", "activeAssetCtx"])
     candle_intervals: list[str] = Field(default=["1m"])
     l2_book_depth: int = Field(default=20, ge=1, le=100)

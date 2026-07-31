@@ -71,7 +71,7 @@ flowchart TB
 
 ## 4. StrategyTypePlugin 契约
 
-每种策略类型注册一份插件。第一批类型：`market_maker`、`trend_follow`。`legacy` 仅兼容展示，**不可 create**。
+每种策略类型注册一份插件。第一批类型：`market_maker`、`trend_follow`、`funding_arb`。`legacy` 仅兼容展示，**不可 create**。
 
 | 能力 | 说明 |
 |------|------|
@@ -93,6 +93,7 @@ flowchart TB
 |------|----------------|------|
 | `market_maker` | `stopped` / `shadow` / `running` / `paused`，并支持 `drain` | 完整做市语义；shadow 为决策/执行影子模式 |
 | `trend_follow` | `stopped` / `running` / `paused` | 不要求对外 shadow；启动时可短暂内部 `warming`（数据就绪），不作为独立产品态强加给 UI |
+| `funding_arb` | `stopped` / `running` / `paused` | 单所内对冲资金费套利；运行时为 stub，不支持 shadow/drain；执行能力后续补全（见 `docs/funding_arb_design.md`） |
 
 CapabilityGate 规则：
 
@@ -247,6 +248,7 @@ P1/P2 完成后：
 - 配置变更只追加 version，可 activate / rollback；精确数值为 decimal string / `NUMERIC(38,18)`。
 - 对 `trend_follow` 调用 `drain` 或 `start` 目标为 `shadow` 时被 CapabilityGate 拒绝。
 - 新增第三种策略时，不必再改通用 create Dialog 壳与 Supervisor 核心状态机。
+- `funding_arb` 实例可经 `POST /api/v1/strategies` 创建，配置落 `funding_arb_config_versions`；对它调用 `drain` 或目标为 `shadow` 时被 CapabilityGate 拒绝；运行时为 stub（启停仅记录状态，不下单）。
 
 ## 12. 刻意不做
 

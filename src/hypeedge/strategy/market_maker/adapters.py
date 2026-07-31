@@ -191,13 +191,9 @@ class LiveCapabilityStrategySupervisor:
                     f"Action '{action}' is not supported for strategy_type={instance.strategy_type}"
                 )
             if target == MarketMakerLifecycle.SHADOW and not capabilities.supports_shadow:
-                raise StrategyLifecycleError(
-                    f"Shadow mode is not supported for strategy_type={instance.strategy_type}"
-                )
+                raise StrategyLifecycleError(f"Shadow mode is not supported for strategy_type={instance.strategy_type}")
             if action == "drain" and not capabilities.supports_drain:
-                raise StrategyLifecycleError(
-                    f"Drain is not supported for strategy_type={instance.strategy_type}"
-                )
+                raise StrategyLifecycleError(f"Drain is not supported for strategy_type={instance.strategy_type}")
         if instance.strategy_type == "market_maker" and target is not None:
             self._require_live_capability(target)
 
