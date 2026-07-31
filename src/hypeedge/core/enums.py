@@ -121,6 +121,20 @@ class MarketMakerLifecycle(StrEnum):
     FAULTED = "faulted"
 
 
+class FundingArbCycleState(StrEnum):
+    """Durable two-leg funding-arbitrage execution states."""
+
+    ENTERING_SPOT = "entering_spot"
+    ENTERING_PERP = "entering_perp"
+    COMPENSATING_ENTRY = "compensating_entry"
+    OPEN = "open"
+    REBALANCING = "rebalancing"
+    EXITING_PERP = "exiting_perp"
+    EXITING_SPOT = "exiting_spot"
+    CLOSED = "closed"
+    FAULTED = "faulted"
+
+
 class QuoteDecision(StrEnum):
     """Desired decision for a logical quote slot."""
 

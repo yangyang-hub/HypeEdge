@@ -10,7 +10,7 @@ from hypeedge.account.reconciler import Reconciler
 from hypeedge.account.tracker import AccountTracker
 from hypeedge.core.enums import Side
 from hypeedge.core.events import EventBus
-from hypeedge.core.models import AccountState, Fill, OrderIntent
+from hypeedge.core.models import AccountState, Fill, OrderIntent, Position
 from hypeedge.core.types import Cloid, OrderId, Price, Size, Symbol, Timestamp, Usd
 from hypeedge.risk.checker import RiskChecker, RiskLimits
 
@@ -149,6 +149,20 @@ class TestAccountTracker:
         assert "positions" in status
         assert "leverage" in status
 
+    def test_spot_fill_never_mutates_perpetual_positions(self):
+        tracker = AccountTracker()
+        tracker.update_fill(
+            Fill(
+                **{
+                    **_make_fill(symbol="@1035").__dict__,
+                    "is_spot": True,
+                }
+            )
+        )
+
+        assert tracker.get_position(Symbol("@1035")) is None
+        assert tracker.fill_count == 1
+
 
 # --- Test RiskChecker ---
 
@@ -192,6 +206,50 @@ class TestRiskChecker:
         result = await checker.check(intent)
         assert result.passed is False
         assert "drawdown_exceeded" in result.reason
+
+    @pytest.mark.asyncio
+    async def test_drawdown_does_not_block_valid_perp_reduce_only_exit(self):
+        tracker = AccountTracker()
+        tracker.update_account_state(_make_account_state(equity=8_500, peak=10_000))
+        tracker.update_position_from_exchange(
+            Symbol("BTC"),
+            Position(Symbol("BTC"), Size("-1"), Price("100"), Price("100")),
+        )
+        checker = RiskChecker(tracker, RiskLimits(max_drawdown_pct=0.10))
+
+        result = await checker.check(
+            OrderIntent(
+                symbol=Symbol("BTC"),
+                side=Side.BUY,
+                size=Size("0.5"),
+                price=Price("100"),
+                reduce_only=True,
+                risk_reducing=True,
+            )
+        )
+
+        assert result.passed is True
+        assert "risk_reducing_exit" in result.checked_limits
+
+    @pytest.mark.asyncio
+    async def test_drawdown_does_not_block_explicit_spot_risk_reduction(self):
+        tracker = AccountTracker()
+        tracker.update_account_state(_make_account_state(equity=8_500, peak=10_000))
+        checker = RiskChecker(tracker, RiskLimits(max_drawdown_pct=0.10))
+
+        result = await checker.check(
+            OrderIntent(
+                symbol=Symbol("@1035"),
+                side=Side.SELL,
+                size=Size("0.5"),
+                price=Price("100"),
+                is_spot=True,
+                risk_reducing=True,
+            )
+        )
+
+        assert result.passed is True
+        assert "risk_reducing_exit" in result.checked_limits
 
     @pytest.mark.asyncio
     async def test_check_rejects_position_too_large(self):
@@ -273,6 +331,7 @@ class TestReconciler:
         mock_engine.get_open_orders = AsyncMock(return_value=[])
         mock_engine.import_exchange_order_authoritative = AsyncMock()
         mock_info = MagicMock()
+        mock_info.spot_user_state.return_value = {"balances": []}
         mock_info.open_orders.side_effect = OSError("network down")
         mock_info.user_state.return_value = {"assetPositions": [], "marginSummary": {}}
         reconciler = Reconciler(bus, tracker, mock_engine, info_client=mock_info, account_address="0xabc")
@@ -289,6 +348,7 @@ class TestReconciler:
         mock_engine.get_open_orders = AsyncMock(return_value=[])
         mock_engine.import_exchange_order_authoritative = AsyncMock()
         mock_info = MagicMock()
+        mock_info.spot_user_state.return_value = {"balances": []}
         mock_info.open_orders.return_value = [
             {"cloid": "0x" + "1" * 32, "coin": "BTC", "side": "B", "sz": "0.1", "limitPx": "50000", "oid": 7}
         ]
@@ -307,6 +367,7 @@ class TestReconciler:
         mock_engine.get_open_orders = AsyncMock(return_value=[])
 
         mock_info = MagicMock()
+        mock_info.spot_user_state.return_value = {"balances": []}
         mock_info.open_orders.return_value = []
         mock_info.user_state.return_value = {
             "assetPositions": [
@@ -332,6 +393,7 @@ class TestReconciler:
         result = await reconciler.reconcile()
         assert result.success is True
         assert result.positions_corrected >= 1
+        assert mock_info.user_state.call_count == 1
 
         pos = tracker.get_position(Symbol("BTC"))
         assert pos is not None
@@ -349,6 +411,7 @@ class TestReconciler:
         mock_engine.get_open_orders = AsyncMock(return_value=[])
 
         mock_info = MagicMock()
+        mock_info.spot_user_state.return_value = {"balances": []}
         mock_info.open_orders.return_value = []
         mock_info.user_state.return_value = {
             "assetPositions": [],

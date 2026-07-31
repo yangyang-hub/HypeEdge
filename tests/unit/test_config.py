@@ -111,6 +111,9 @@ class TestSettings:
         assert settings.action_budget.paid_reserve_enabled is False
         assert settings.market_making.max_quote_levels_per_side == 1
         assert settings.features.market_making_enabled is False
+        assert settings.features.funding_arb_execution_enabled is True
+        assert settings.funding_arb.max_notional_usd == 25
+        assert "HYPE/USDC" in settings.market_data.spot_coins
 
     def test_v2_execution_requires_durable_ledger(self):
         with pytest.raises(pydantic.ValidationError, match="durable_ledger_v2"):
@@ -207,6 +210,21 @@ class TestSettings:
     def test_market_making_feature_requires_full_v2_chain(self):
         with pytest.raises(pydantic.ValidationError, match="complete V2 trading chain"):
             FeatureFlagsSettings(market_making_enabled=True)
+
+    def test_funding_arb_execution_requires_full_v2_and_testnet(self):
+        with pytest.raises(pydantic.ValidationError, match="complete V2 trading chain"):
+            FeatureFlagsSettings(funding_arb_execution_enabled=True)
+
+        full_v2 = FeatureFlagsSettings(
+            durable_ledger_v2=True,
+            execution_v2=True,
+            user_stream_v2=True,
+            reconciliation_v2=True,
+            strategy_runner_v2=True,
+            funding_arb_execution_enabled=True,
+        )
+        with pytest.raises(pydantic.ValidationError, match="restricted to HYPE_ENV=testnet"):
+            AppSettings(environment="mainnet", features=full_v2)
 
     def test_dev_and_testnet_force_testnet_urls_even_if_mainnet_overridden(self, monkeypatch):
         monkeypatch.setenv("HYPE_EXCHANGE__ACCOUNT_ADDRESS", "0x1234")

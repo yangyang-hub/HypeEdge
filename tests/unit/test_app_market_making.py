@@ -6,6 +6,7 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -33,13 +34,29 @@ def _v2_features(*, market_making: bool) -> FeatureFlagsSettings:
     )
 
 
-def test_market_making_feature_off_does_not_construct_control_plane() -> None:
+def test_control_plane_requires_v2_dependencies() -> None:
     app = HypeEdgeApp(AppSettings(features=FeatureFlagsSettings()))
 
     app._init_market_making_components()
 
     assert app.strategy_supervisor is None
     assert app.market_making_repository is None
+
+
+def test_market_making_feature_off_still_constructs_multi_strategy_control_plane() -> None:
+    app = HypeEdgeApp(AppSettings(features=_v2_features(market_making=False)))
+    app._pg_session_factory = MagicMock()
+    app._tracker = MagicMock()
+    app._account_health = MagicMock()
+    app._action_budget_controller = MagicMock()
+    app._market_data_provider = MagicMock()
+    app._execution_engine = MagicMock()
+
+    app._init_market_making_components()
+
+    assert app.strategy_supervisor is not None
+    assert app.market_making_repository is not None
+    assert app._quote_plan_worker is None
 
 
 @pytest.mark.asyncio
@@ -75,9 +92,7 @@ async def test_supervisor_rejects_running_before_atomic_plan_boundary() -> None:
         return 0
 
     commands = DurableQuotePlanCommandAdapter(repository=object(), cancel_all=cancel_all)
-    instance = StrategyInstanceDefinition(
-        StrategyId("mm-btc"), "market_maker", SubAccount("mm_btc"), Symbol("BTC")
-    )
+    instance = StrategyInstanceDefinition(StrategyId("mm-btc"), "market_maker", SubAccount("mm_btc"), Symbol("BTC"))
     concrete = SimpleNamespace(start=None, _store=_StateStore(instance))
     supervisor = LiveCapabilityStrategySupervisor(concrete, commands)
 
@@ -115,6 +130,7 @@ class _Supervisor:
     def __init__(self, store: _StateStore) -> None:
         self.store = store
         self.starts: list[MarketMakerLifecycle] = []
+        self.pauses: list[StrategyId] = []
 
     async def start(
         self,
@@ -125,6 +141,11 @@ class _Supervisor:
         self.starts.append(target)
         await self.store.set_desired(strategy_id, state=target)
         return SimpleNamespace(actual_state=target)
+
+    async def pause(self, strategy_id: StrategyId) -> SimpleNamespace:
+        self.pauses.append(strategy_id)
+        await self.store.set_desired(strategy_id, state=MarketMakerLifecycle.PAUSED)
+        return SimpleNamespace(actual_state=MarketMakerLifecycle.PAUSED)
 
 
 @pytest.mark.asyncio
@@ -147,6 +168,27 @@ async def test_restart_preserves_running_intent_but_restores_runtime_to_shadow()
     assert supervisor.starts == [MarketMakerLifecycle.SHADOW]
     assert store.desired_updates == [MarketMakerLifecycle.SHADOW, MarketMakerLifecycle.RUNNING]
     assert store.instance.desired_state == MarketMakerLifecycle.RUNNING
+
+
+@pytest.mark.asyncio
+async def test_funding_arb_restore_starts_running_without_shadow() -> None:
+    app = HypeEdgeApp(AppSettings(features=_v2_features(market_making=False)))
+    instance = StrategyInstanceDefinition(
+        strategy_id=StrategyId("fa-btc"),
+        strategy_type="funding_arb",
+        sub_account=SubAccount("0x1111111111111111111111111111111111111111"),
+        symbol=Symbol("BTC"),
+        desired_state=MarketMakerLifecycle.RUNNING,
+    )
+    store = _StateStore(instance)
+    supervisor = _Supervisor(store)
+    app._market_making_state_store = store
+    app._strategy_supervisor = supervisor
+
+    await app._restore_market_making_in_shadow()
+
+    assert supervisor.starts == [MarketMakerLifecycle.RUNNING]
+    assert MarketMakerLifecycle.SHADOW not in store.desired_updates
 
 
 def test_mainnet_keeps_market_making_disabled_by_default() -> None:

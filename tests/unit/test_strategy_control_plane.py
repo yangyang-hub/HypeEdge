@@ -23,7 +23,7 @@ from hypeedge.strategy.plugin import (
     TREND_FOLLOW_CAPABILITIES,
     StaticStrategyTypePlugin,
 )
-from hypeedge.strategy.registry import StrategyBuildContext, StrategyRegistry
+from hypeedge.strategy.registry import StrategyBuildContext, StrategyConfigSnapshot, StrategyRegistry
 
 
 def test_trend_follow_config_normalize_and_hash_are_stable() -> None:
@@ -135,6 +135,35 @@ def test_funding_arb_config_rejects_negative_entry_funding() -> None:
     config["entry_funding_rate"] = Decimal("-0.001")
     with pytest.raises(StrategyRegistrationError, match="entry_funding_rate"):
         normalize_funding_arb_config(config)
+
+
+def test_funding_arb_config_requires_rate_hysteresis() -> None:
+    config = default_funding_arb_config()
+    config["exit_funding_rate"] = config["entry_funding_rate"]
+    with pytest.raises(StrategyRegistrationError, match="exit_funding_rate"):
+        normalize_funding_arb_config(config)
+
+
+def test_funding_arb_config_accepts_full_spot_market_identifier() -> None:
+    config = default_funding_arb_config()
+    config["spot_coin"] = "PURR/USDC"
+    assert normalize_funding_arb_config(config)["spot_coin"] == "PURR/USDC"
+
+
+def test_funding_arb_config_rejects_ambiguous_bare_token() -> None:
+    config = default_funding_arb_config()
+    config["spot_coin"] = "PURR"
+    with pytest.raises(StrategyRegistrationError, match="spot_coin"):
+        normalize_funding_arb_config(config)
+
+
+def test_funding_arb_config_payload_uses_type_specific_hash() -> None:
+    from hypeedge.api.routes.market_making import _config_payload
+
+    config = default_funding_arb_config()
+    snapshot = StrategyConfigSnapshot(StrategyId("fa-1"), 1, config)
+    payload = _config_payload(snapshot)
+    assert payload["config_hash"] == funding_arb_config_hash(config)
 
 
 def test_funding_arb_capabilities_exclude_shadow_and_drain() -> None:

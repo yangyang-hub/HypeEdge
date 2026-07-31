@@ -57,16 +57,27 @@ class RestClient:
             request_type: Info request type (e.g. "l2Book", "clearinghouseState")
             payload: Additional payload parameters
         """
-        await self._rate_limiter.acquire(request_type)
-
         client = await self._ensure_client()
         body = {"type": request_type}
         if payload:
             body.update(payload)
-
-        response = await client.post("/info", json=body)
-        response.raise_for_status()
-        return response.json()
+        last_error: Exception | None = None
+        for attempt in range(3):
+            await self._rate_limiter.acquire(request_type)
+            try:
+                response = await client.post("/info", json=body)
+                response.raise_for_status()
+                return response.json()
+            except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+                last_error = exc
+                retryable = not isinstance(exc, httpx.HTTPStatusError) or (
+                    exc.response.status_code == 429 or exc.response.status_code >= 500
+                )
+                if not retryable or attempt >= 2:
+                    raise
+                await asyncio.sleep(0.25 * (2**attempt))
+        assert last_error is not None
+        raise last_error
 
     async def get_l2_book(self, coin: str) -> dict[str, Any]:
         """Get current L2 order book snapshot."""

@@ -1,9 +1,11 @@
 """Tests for Hyperliquid WebSocket subscription construction."""
 
 from datetime import UTC, datetime
+from types import SimpleNamespace
 
 from hypeedge.config.settings import AppSettings
 from hypeedge.core.events import EVENT_L2_BOOK_UPDATE, EventBus
+from hypeedge.core.types import Symbol
 from hypeedge.market_data.ws_feed import WebSocketFeed
 
 
@@ -26,6 +28,16 @@ def test_build_subscriptions_uses_channel_specific_payloads():
     assert {"type": "activeAssetCtx", "coin": "BTC"} in subscriptions
     assert {"type": "candle", "coin": "BTC", "interval": "1m"} in subscriptions
     assert {"type": "candle", "coin": "ETH", "interval": "5m"} in subscriptions
+
+
+def test_spot_display_subscription_uses_exchange_coin_alias():
+    settings = AppSettings(market_data={"coins": ["HYPE"], "spot_coins": ["HYPE/USDC"], "ws_subscriptions": ["l2Book"]})
+    resolver = SimpleNamespace(resolve_spot=lambda market: SimpleNamespace(symbol=Symbol("@1035")))
+
+    subscriptions = WebSocketFeed(settings, EventBus(), spot_resolver=resolver)._build_subscriptions()  # type: ignore[arg-type]
+
+    assert {"type": "l2Book", "coin": "@1035"} in subscriptions
+    assert {"type": "l2Book", "coin": "HYPE/USDC"} not in subscriptions
 
 
 async def test_l2_book_parses_hyperliquid_object_levels():

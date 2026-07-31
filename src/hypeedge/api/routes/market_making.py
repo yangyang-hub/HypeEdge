@@ -131,13 +131,24 @@ def _config_payload(value: Any) -> Any:  # noqa: ANN401
     strategy_id = getattr(value, "strategy_id", None)
     if values is None or revision is None or strategy_id is None:
         return _safe(value)
-    from hypeedge.storage.market_making import market_maker_config_hash
+    from hypeedge.storage.market_making import (
+        funding_arb_config_hash,
+        market_maker_config_hash,
+        trend_follow_config_hash,
+    )
+
+    if "spot_coin" in values:
+        config_hash = funding_arb_config_hash(values)
+    elif "fast_ema_period" in values:
+        config_hash = trend_follow_config_hash(values)
+    else:
+        config_hash = market_maker_config_hash(values)
 
     return {
         "id": revision,
         "strategy_id": str(strategy_id),
         "version": revision,
-        "config_hash": market_maker_config_hash(values),
+        "config_hash": config_hash,
         "config": _safe(values),
         "created_by": None,
         "created_at": None,

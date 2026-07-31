@@ -249,6 +249,12 @@ class StrategySupervisor:
         """Set desired revision first; effective advances only after runtime acknowledgement."""
         async with self._locks[strategy_id]:
             config = await self._store.get_config(strategy_id, config_revision)
+            current = await self._store.get_instance(strategy_id)
+            plugin = self._registry.get_plugin(current.strategy_type)
+            if plugin is not None:
+                # Revalidate persisted snapshots before changing desired state. This
+                # keeps legacy rows that predate stricter DB constraints fail-closed.
+                plugin.validate_create_config(config.values)
             instance = await self._store.set_desired(
                 strategy_id,
                 config_revision=config_revision,

@@ -236,6 +236,22 @@ class MarketMakingSettings(HypeSettings):
         return self
 
 
+class FundingArbSettings(HypeSettings):
+    """Deployment-wide funding-arbitrage execution ceilings.
+
+    Strategy-specific thresholds remain immutable Postgres config versions. These
+    values only bound the live testnet implementation and recovery cadence.
+    """
+
+    model_config = SettingsConfigDict(env_prefix="HYPE_FUNDING_ARB__", env_file=".env", extra="ignore")
+
+    max_notional_usd: Decimal = Field(default=Decimal("25"), gt=Decimal("0"), le=Decimal("25"))
+    poll_interval_seconds: float = Field(default=5.0, ge=0.5, le=60.0)
+    order_status_poll_interval_seconds: float = Field(default=0.25, ge=0.05, le=5.0)
+    max_leg_attempts: int = Field(default=3, ge=1, le=5)
+    market_stale_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
+
+
 class MonitorSettings(HypeSettings):
     """Monitoring settings."""
 
@@ -324,6 +340,7 @@ class FeatureFlagsSettings(HypeSettings):
     api_v1: bool = False
     strategy_runner_v2: bool = False
     market_making_enabled: bool = False
+    funding_arb_execution_enabled: bool = False
 
     @model_validator(mode="after")
     def validate_cutover(self) -> FeatureFlagsSettings:
@@ -339,6 +356,8 @@ class FeatureFlagsSettings(HypeSettings):
             raise ValueError("strategy_runner_v2 requires execution_v2")
         if self.market_making_enabled and not self.v2_trading_enabled:
             raise ValueError("market_making_enabled requires the complete V2 trading chain")
+        if self.funding_arb_execution_enabled and not self.v2_trading_enabled:
+            raise ValueError("funding_arb_execution_enabled requires the complete V2 trading chain")
         return self
 
     @property
@@ -371,11 +390,18 @@ class AppSettings(HypeSettings):
     risk: RiskSettings = Field(default_factory=RiskSettings)
     action_budget: ActionBudgetSettings = Field(default_factory=ActionBudgetSettings)
     market_making: MarketMakingSettings = Field(default_factory=MarketMakingSettings)
+    funding_arb: FundingArbSettings = Field(default_factory=FundingArbSettings)
     monitor: MonitorSettings = Field(default_factory=MonitorSettings)
     backfill: BackfillSettings = Field(default_factory=BackfillSettings)
     backtest: BacktestSettings = Field(default_factory=BacktestSettings)
     api: APISettings = Field(default_factory=APISettings)
     features: FeatureFlagsSettings = Field(default_factory=FeatureFlagsSettings)
+
+    @model_validator(mode="after")
+    def validate_live_strategy_environments(self) -> AppSettings:
+        if self.features.funding_arb_execution_enabled and self.environment != "testnet":
+            raise ValueError("funding-arbitrage live execution is restricted to HYPE_ENV=testnet")
+        return self
 
     @property
     def is_dev(self) -> bool:

@@ -101,6 +101,11 @@ class _Session:
         self.executed.append(statement)
         return self.results.pop(0) if self.results else _Result()
 
+    async def scalar(self, statement: object) -> object:
+        self.executed.append(statement)
+        result = self.results.pop(0) if self.results else _Result()
+        return result.scalar_one_or_none()
+
     async def get(self, model: object, key: object) -> object:
         del model, key
         return self.get_result
@@ -358,7 +363,38 @@ async def test_order_update_terminal_releases_reservation_and_adopts_real_cloid(
 def test_exchange_status_normalization_is_fail_safe_for_unknown_values() -> None:
     assert _status("filled") == "filled"
     assert _status("canceled") == "cancelled"
+    assert _status("iocCancel") == "cancelled"
+    assert _status("insufficientSpotBalanceRejected") == "rejected"
     assert _status("unexpected-new-status") == "acknowledged"
+
+
+async def test_funding_attribution_is_scoped_to_the_ingested_subaccount() -> None:
+    cycle_id = uuid.uuid4()
+    inbox = SimpleNamespace(processed_at=None)
+    session = _Session([_Result(scalar=cycle_id)], get_result=inbox)
+    projector = ExchangeFactProjector(_Factory(session), "0xAccount")  # type: ignore[arg-type]
+    projector._claim_inbox = AsyncMock(return_value=3)  # type: ignore[method-assign]
+    projector._advance_cursor = AsyncMock()  # type: ignore[method-assign]
+
+    result = await projector.ingest_funding(
+        {
+            "time": 1_700_000_000_000,
+            "hash": "0xfunding",
+            "delta": {
+                "type": "funding",
+                "coin": "HYPE",
+                "usdc": "0.01",
+                "fundingRate": "0.0001",
+                "szi": "-0.2",
+            },
+        }
+    )
+
+    sql = str(session.executed[0])
+    assert "funding_arb_cycles.sub_account" in sql
+    payment = next(record for record in session.added if record.__class__.__name__ == "FundingPaymentRecord")
+    assert payment.sub_account == "0xaccount" and payment.cycle_id == cycle_id
+    assert result.funding_amount == Decimal("0.01")
 
 
 async def test_projector_find_create_and_projection_helpers_cover_partial_close_and_cursor() -> None:
@@ -373,6 +409,15 @@ async def test_projector_find_create_and_projection_helpers_cover_partial_close_
         create_session, "43", {"coin": "ETH", "side": "S", "origSz": "0", "limitPx": "200"}
     )
     assert created.exchange_oid == "43" and created.side == "sell" and created.size > 0
+
+    pending = SimpleNamespace(exchange_oid=None, is_spot=False)
+    bind_session = _Session([_Result(scalar=None), _Result(scalar=pending)])
+    bound = await projector._find_or_create_order(
+        bind_session,
+        "44",
+        {"coin": "@1035", "cloid": "0x" + "a" * 32, "origSz": "1"},
+    )
+    assert bound is pending and pending.exchange_oid == "44" and pending.is_spot is True
 
     order = SimpleNamespace(
         order_id=uuid.uuid4(),
@@ -395,6 +440,12 @@ async def test_projector_find_create_and_projection_helpers_cover_partial_close_
     )
     assert order.filled_size == Decimal("1.0") and order.avg_fill_price == Decimal("100")
     assert order.status == "partial_fill"
+
+    order.status = "cancelled"
+    await projector._apply_fill_to_order(
+        projection_session, order, Decimal("0.25"), Decimal("100"), datetime.now(UTC), {"tid": 2}
+    )
+    assert order.status == "cancelled"
 
     position_session = _Session([_Result(scalar=None)])
     position_session.in_transaction = True
@@ -475,7 +526,7 @@ async def test_history_orders_are_sorted_and_cursor_filters_older_updates() -> N
     info = MagicMock(user_fills_by_time=MagicMock(return_value=[]), historical_orders=MagicMock(return_value=orders))
     ingestor = ExchangeEventIngestor(info, "0xAccount", MagicMock())
     projector = SimpleNamespace(
-        cursor=AsyncMock(side_effect=[0, 2000]), ingest_fill=AsyncMock(), ingest_order_update=AsyncMock()
+        cursor=AsyncMock(side_effect=[2000, 0]), ingest_fill=AsyncMock(), ingest_order_update=AsyncMock()
     )
     ingestor._projector = projector
     await ingestor.recover_history()

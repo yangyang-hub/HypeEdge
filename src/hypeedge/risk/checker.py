@@ -147,6 +147,35 @@ class RiskChecker:
         existing_size = float(existing_pos.size) if existing_pos else 0.0
         signed_delta = float(intent.size) if intent.side.value == "buy" else -float(intent.size)
         resulting_size = existing_size + signed_delta
+        if intent.is_spot:
+            if intent.reduce_only:
+                return RiskCheckResult(False, "spot_reduce_only_invalid", checked)
+            checked.append("spot_balance_validated_upstream")
+            if intent.risk_reducing:
+                if intent.side.value != "sell":
+                    return RiskCheckResult(False, "invalid_risk_reducing_order", checked)
+                checked.append("risk_reducing_exit")
+                return RiskCheckResult(passed=True, checked_limits=checked)
+            checked.append("max_drawdown")
+            if account.drawdown_pct >= self._limits.max_drawdown_pct:
+                return RiskCheckResult(
+                    passed=False,
+                    reason=f"drawdown_exceeded: {account.drawdown_pct:.4f} >= {self._limits.max_drawdown_pct}",
+                    checked_limits=checked,
+                )
+            # Spot sells consume an existing token balance rather than creating a
+            # short position. Spot buys are cash purchases and are bounded by the
+            # same per-strategy notional fraction used for directional entries.
+            if intent.side.value == "buy" and account.equity > 0:
+                checked.append("max_position_pct")
+                position_pct = float(intent.size) * effective_reference_price / float(account.equity)
+                if position_pct > self._limits.max_position_pct:
+                    return RiskCheckResult(
+                        passed=False,
+                        reason=f"position_pct_exceeded: {position_pct:.4f} > {self._limits.max_position_pct}",
+                        checked_limits=checked,
+                    )
+            return self._check_strategy_loss(intent, float(account.equity), checked)
         if intent.reduce_only:
             reduces_position = existing_size != 0 and abs(resulting_size) < abs(existing_size)
             does_not_flip = resulting_size == 0 or (resulting_size > 0) == (existing_size > 0)
@@ -156,6 +185,8 @@ class RiskChecker:
                     reason="invalid_reduce_only_order",
                     checked_limits=checked,
                 )
+            checked.append("risk_reducing_exit")
+            return RiskCheckResult(passed=True, checked_limits=checked)
 
         # Check 1: Max drawdown from peak
         checked.append("max_drawdown")
@@ -186,22 +217,24 @@ class RiskChecker:
         checked.append("max_position_pct")
         if equity > 0:
             total_position_value = abs(resulting_size) * effective_reference_price
-            position_pct = total_position_value / equity
+            perp_position_pct = float(total_position_value / equity)
 
-            if position_pct > self._limits.max_position_pct:
+            if perp_position_pct > self._limits.max_position_pct:
                 return RiskCheckResult(
                     passed=False,
-                    reason=f"position_pct_exceeded: {position_pct:.4f} > {self._limits.max_position_pct}",
+                    reason=f"position_pct_exceeded: {perp_position_pct:.4f} > {self._limits.max_position_pct}",
                     checked_limits=checked,
                 )
 
         # All checks passed
         # Check 4: Per-strategy max loss (design doc §8.1)
+        return self._check_strategy_loss(intent, float(equity), checked)
+
+    def _check_strategy_loss(self, intent: OrderIntent, equity: float, checked: list[str]) -> RiskCheckResult:
         strategy_id = str(intent.strategy_id) if intent.strategy_id else None
         if strategy_id and equity > 0:
             checked.append("max_strategy_loss")
             strategy_pnl = self._strategy_realized_pnl.get(strategy_id, 0.0)
-            # Check if strategy has lost more than max_strategy_loss_pct of equity
             if strategy_pnl < 0 and abs(strategy_pnl) > equity * self._limits.max_strategy_loss_pct:
                 return RiskCheckResult(
                     passed=False,
@@ -212,5 +245,4 @@ class RiskChecker:
                     ),
                     checked_limits=checked,
                 )
-
         return RiskCheckResult(passed=True, checked_limits=checked)

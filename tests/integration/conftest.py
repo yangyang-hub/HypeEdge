@@ -29,7 +29,7 @@ _TESTNET_HOST = "api.hyperliquid-testnet.xyz"
 _MAX_NOTIONAL_HARD_CAP_USD = 25.0
 _MIN_CONFIGURED_NOTIONAL_USD = 12.5
 _MIN_ACTION_CREDITS = 100
-_ACTION_CREDIT_WATERMARK = 50
+_ACTION_CREDIT_WATERMARK = 100
 _TERMINAL_EXCHANGE_STATUSES = {"canceled", "cancelled", "filled", "rejected", "expired", "margincanceled"}
 
 
@@ -263,6 +263,34 @@ async def _noop_component() -> None:
     """Skip lifecycle hooks for a daemon intentionally held idle."""
 
 
+async def _testnet_info_call(method: Any, *args: object) -> Any:
+    """Run one read-only SDK call with bounded retries for transient testnet TLS failures."""
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            return await asyncio.to_thread(method, *args)
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(0.25 * (2**attempt))
+    assert last_error is not None
+    raise last_error
+
+
+async def _build_testnet_info(info_type: Any, base_url: str) -> Any:
+    """Construct the SDK Info client with the same bounded transient-failure policy."""
+    last_error: Exception | None = None
+    for attempt in range(3):
+        try:
+            return await asyncio.to_thread(info_type, base_url, skip_ws=True)
+        except Exception as exc:
+            last_error = exc
+            if attempt < 2:
+                await asyncio.sleep(0.25 * (2**attempt))
+    assert last_error is not None
+    raise last_error
+
+
 def _disable_non_trading_side_effects(app: HypeEdgeApp) -> None:
     """Keep the production trading branch intact while suppressing unrelated daemons."""
     idle_targets = (
@@ -296,15 +324,15 @@ async def testnet_harness(
     # explicitly selected test database the single authority for app + Alembic.
     monkeypatch.setenv("HYPE_POSTGRES__URL", testnet_config.postgres_url)
 
-    preflight_info = Info(testnet_config.api_url, skip_ws=True)
     try:
-        meta, mids, user_state, open_orders, user_rate_limit = await asyncio.gather(
-            asyncio.to_thread(preflight_info.meta),
-            asyncio.to_thread(preflight_info.all_mids),
-            asyncio.to_thread(preflight_info.user_state, testnet_config.account_address),
-            asyncio.to_thread(preflight_info.open_orders, testnet_config.account_address),
-            asyncio.to_thread(preflight_info.user_rate_limit, testnet_config.account_address),
-        )
+        preflight_info = await _build_testnet_info(Info, testnet_config.api_url)
+        # The SDK owns one requests.Session; keep calls sequential because a
+        # shared Session is not safe for concurrent thread use.
+        meta = await _testnet_info_call(preflight_info.meta)
+        mids = await _testnet_info_call(preflight_info.all_mids)
+        user_state = await _testnet_info_call(preflight_info.user_state, testnet_config.account_address)
+        open_orders = await _testnet_info_call(preflight_info.open_orders, testnet_config.account_address)
+        user_rate_limit = await _testnet_info_call(preflight_info.user_rate_limit, testnet_config.account_address)
     except Exception as exc:
         pytest.fail(f"testnet preflight request failed: {exc}", pytrace=False)
 

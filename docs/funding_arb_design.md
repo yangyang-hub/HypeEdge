@@ -1,7 +1,8 @@
 # 资金费套利设计（单所内 delta-neutral）
 
 > 状态：主线策略设计文档。受 `docs/design.md` §7.0 约束；多类型控制面契约见 `docs/strategy_control_plane.md`。
-> 当前实现：**控制面骨架 + 运行时 stub**（可创建/配置/启停，不下单）。真实执行分阶段补全（见 §5）。
+> 当前目标：在 Hyperliquid **testnet** 完成可恢复的真实两腿执行；mainnet 继续硬禁用。
+> 安全约束：测试网执行也必须经过现货元数据、持久化订单、成交驱动状态机、补偿交易、现货/永续对账和动作额度门禁。
 
 ## 1. 形态与立论
 
@@ -22,14 +23,22 @@ Hyperliquid funding **每小时结算**（非币安 8h）。
 
 | 字段 | 类型 | 约束 | 默认 | 含义 |
 |---|---|---|---|---|
-| `entry_funding_rate` | NUMERIC(38,18) | ≥ 0 | 0.0001 | 入场 funding 阈值（绝对小时率，>0 时空永续收 funding） |
-| `exit_funding_rate` | NUMERIC(38,18) | ≥ 0 | 0 | 平仓阈值（funding 回落至此以下了结） |
+| `spot_coin` | VARCHAR(64) | 非空，完整 HL 现货市场标识 | `PURR/USDC` | 未来现货腿使用的交易所市场名；不得用可能与永续重名的裸 token 名 |
+| `entry_funding_rate` | NUMERIC(38,18) | > 0 | 0.0001 | 入场 funding 阈值（绝对小时率，>0 时空永续收 funding） |
+| `exit_funding_rate` | NUMERIC(38,18) | ≥ 0 且 < entry | 0 | 平仓阈值（funding 回落至此以下了结） |
 | `max_notional_usd` | NUMERIC(38,18) | > 0 | 1000 | 单策略最大对冲名义敞口（USDC） |
 | `hedge_ratio` | NUMERIC(38,18) | (0, 1] | 1.0 | 现货腿相对永续腿的对冲比例（1.0 = 完全对冲） |
 | `rebalance_threshold_bps` | BigInt | > 0 | 50 | 两腿 delta 偏离触发再平衡的阈值（bps） |
 | `leverage` | NUMERIC(38,18) | > 0 | 1 | 永续腿杠杆 |
+| `max_slippage_bps` | BigInt | 1–500 | 50 | 每条 IOC 市价保护限价相对参考价的最大滑点 |
+| `max_basis_bps` | BigInt | > 0 | 500 | 现货与永续价格偏离的最大入场门槛 |
+| `min_expected_edge_bps` | NUMERIC(38,18) | ≥ 0 | 5 | 预期持有期 funding 扣除费用/盘口成本后的最低净 edge |
+| `expected_hold_hours` | BigInt | 1–168 | 8 | 入场经济性估算使用的持有小时数，不阻止 funding 反转时提前退出 |
+| `round_trip_fee_bps` | NUMERIC(38,18) | ≥ 0 | 20 | 两腿完整往返手续费与保守成本缓冲 |
+| `max_unhedged_seconds` | BigInt | 1–60 | 15 | 第一腿成交后允许处于未完全对冲状态的最长时间 |
 
-> 现货腿 symbol 由 `strategy_instances.symbol`（永续 coin）派生，不单独版本化；待真实执行接入后再决定是否引入显式 `spot_symbol`。参数集合为骨架初版，随执行逻辑演进调整。
+> `spot_coin` 会在 testnet runtime 构造时通过交易所 `spotMeta` 解析为 `@N` exchange coin，并验证其 base token 与
+> `strategy_instances.symbol` 的永续风险单位一致、quote token 为 USDC；字符串相似不能作为 delta-neutral 依据。
 
 ## 4. 控制面契约
 
@@ -38,26 +47,84 @@ Hyperliquid funding **每小时结算**（非币安 8h）。
 - **创建**：`POST /api/v1/strategies`，`strategy_type="funding_arb"`，`initial_config` 为上表字段（判别联合，见 `api/schemas.py`）。
 - **配置版本**：`funding_arb_config_versions` 子表 + 通用 `strategy_config_versions`；`POST .../config-versions` 追加版本、`.../activate` 热替换（`apply_config` 解码为 `FundingArbParams`）。
 - **生命周期**：`start/stop/pause/resume` 经 Supervisor + CapabilityGate；对 `drain` 或目标 `shadow` 返回 409/422。
-- **DB 约束**：`strategy_instances.strategy_type` CHECK 已含 `funding_arb`（`STRATEGY_TYPES`）。
+- **DB 约束**：`strategy_instances.strategy_type` CHECK 由 Alembic 迁移显式加入 `funding_arb`，不得只修改 ORM metadata。
+  收紧的资金费阈值/现货标识 CHECK 以 `NOT VALID` 加入：不改写带内容哈希的不可变历史版本，但会约束所有新写入；
+  激活配置前由 Strategy Type Plugin 再校验一次，因此旧非法版本不能成为新的 desired config。
 
-## 5. 运行时与分阶段执行路线
+## 5. 真实执行架构
 
-### 5.1 当前（已实现）：运行时 stub
+### 5.1 环境与账户门禁
 
-`FundingArbRuntimeHandle`（`src/hypeedge/strategy/funding_arb/runtime.py`）实现 `StrategyRuntimeHandle`：
-- `start` / `set_mode(running|paused|stopped|faulted)` / `stop` 仅记录状态并打日志，**不创建下单任务**；`shadow/warming` 跳过（不被该类型支持）。
-- `apply_config` 解码配置为 `FundingArbParams` 并存储，不触发交易。
+- 只有 `HYPE_ENV=testnet`、完整 V2 交易链、`funding_arb_execution_enabled=true`、启动对账成功、Kill Switch 未触发、
+  账户健康与动作额度新鲜时可启动真实 runtime。
+- `dev` 只运行观察/控制面；`mainnet` 即使误开环境变量也必须拒绝构造真实 runtime。
+- Agent wallet 只负责交易签名，不执行资金转账。现货 USDC 必须由操作员事先在 Hyperliquid UI/受控流程中划入；
+  运行时禁止持有主钱包私钥或自动调用 `usdClassTransfer`。
+- 每策略仍要求独立账户范围；第一版要求实例 `sub_account` 与当前配置账户一致，禁止伪装为未实际路由的子账户。
 
-目的：让控制面、配置版本、启停端到端可用，为真实执行提供接入点。
+### 5.2 元数据、行情与精度
 
-### 5.2 后续阶段（待实现）
+- `InstrumentMetaCache` 同时加载 perp `meta` 与 `spotMeta`，保存 display name、exchange coin、base/quote token、
+  size decimals、最小数量和价格精度规则。display 与 `@N` 都可配置，但下单、成交和持久化统一使用 exchange coin。
+- runtime 启动时验证 `spot.base_token == perp symbol` 且 `spot.quote_token == USDC`；任一元数据缺失即 fail closed。
+- 现货 L2 必须订阅解析后的 exchange coin（例如 testnet 的 `@1035`），不能把 `HYPE/USDC` 原样发送给原始 WS。
+- 入场要求两边盘口和 funding 快照新鲜、非空、非交叉；`basis_bps <= max_basis_bps`。
+- 预期净 edge：`funding_rate × expected_hold_hours × 10000 - round_trip_fee_bps - observable_spread_cost_bps`，
+  必须不低于 `min_expected_edge_bps`。
 
-1. **现货行情**：HL 现货（HIP-1/HIP-2）L2/trades 订阅与 `MarketDataProvider` 扩展。
-2. **现货下单**：execution 引擎支持现货 order type（当前仅永续）；与永续腿共用 NonceManager 串行签名。
-3. **对冲再平衡**：按 `rebalance_threshold_bps` 监控两腿 delta，偏离时补腿；受 §3.2 地址动作额度约束（降频、留额度）。
-4. **入场/平仓逻辑**：funding 信号（每小时）驱动开/平两腿；funding 数据已具备（`FundingRate` 模型、`EVENT_FUNDING_UPDATE`、ClickHouse `funding` 表）。
-5. **PnL 归因**：funding 收益、两腿已实现/未实现 PnL、手续费分离，与 Accounting 对账一致。
-6. **回测**：利用已回填的 funding/现货历史，按小时建模两腿与价差。
+### 5.3 Cycle 状态机
+
+```text
+IDLE
+  -> ENTERING_SPOT
+      -> IDLE                         (零成交/明确拒绝)
+      -> ENTERING_PERP               (按现货权威成交量计算永续目标)
+          -> OPEN                    (共同对冲规模成立)
+          -> COMPENSATING_ENTRY      (永续拒绝/部分成交，卖出现货剩余)
+              -> OPEN | CLOSED | FAULTED
+
+OPEN
+  -> REBALANCING                     (只缩减较大一腿，不主动扩大风险)
+      -> OPEN | FAULTED
+  -> EXITING_PERP                    (funding 回落、stop 或 operator close)
+      -> EXITING_SPOT                (按已平永续规模卖出现货)
+          -> CLOSED | FAULTED
+```
+
+- 入场先现货、后永续；退出先永续、后现货。
+- 每个 leg 使用唯一规范 cloid 和 IOC 市价保护单。UNKNOWN 先查询，不换 cloid 重发。
+- 部分成交按 authenticated fill 的累计 `filled_size` 推进；ACK/REST 请求返回只能作为临时信息。
+- 第二腿部分成交后只保留 `min(spot_filled / hedge_ratio, perp_filled)` 对应的共同规模，其余现货立即补偿卖出。
+- 再平衡第一版只允许缩减敞口：现货不足时 reduce-only 买回部分永续；现货过多时卖出现货。增加仓位留待后续版本。
+
+### 5.4 持久化与恢复
+
+- `orders` / `fills` 增加 `is_spot`；`orders` 同时持久化 `risk_reducing` 和 `max_slippage_bps`，保证重启后的 SDK 请求
+  与原业务意图一致。现货订单禁止 `reduce_only=true`。
+- 新增 `spot_balances` 权威投影，来源为 `spotClearinghouseState`；现货 fill 不得写入 perp `positions`。
+- 新增 `funding_arb_cycles` 当前/历史 cycle 与 `funding_arb_cycle_events` 追加型状态转换事实，记录配置版本、两腿
+  target/filled、cloid、funding/basis、错误与 revision。
+- 新增 `funding_payments`，通过 `userFunding` inbox/cursor 幂等补缺；归因到当时覆盖该 symbol 的 active cycle。
+- 重启时先恢复订单和账户事实，再恢复 cycle。任何 cycle 状态与现货余额/永续持仓/订单终态不一致时进入
+  `FAULTED`，禁止自动新开仓。
+
+### 5.5 风控与补偿
+
+- Spot BUY 必须有足够可用 quote USDC；Spot SELL 不得超过可用 base token。Spot SELL 只有在权威余额证明减少现货
+  敞口时才标记 `risk_reducing`。
+- Perp 平仓必须 `reduce_only=true`；入场前按配置设置 isolated leverage，失败即不开仓。
+- `max_notional_usd` 同时受部署级 `funding_arb.max_notional_usd` 硬上限约束。
+- 达到 `max_unhedged_seconds`、补偿 UNKNOWN、账户/行情过期或对账不一致时停止新增风险并 fault；撤单始终允许。
+- Kill Switch 会停止信号并撤单。已确认的单腿敞口由专用风险缩减路径处理；该路径只能减少权威敞口，不能借机开仓。
+
+### 5.6 Testnet 验收门禁
+
+1. 预检：官方 testnet URL、专用账户、无既有挂单/目标币仓位、现货 USDC 已预充值、动作额度 ≥100。
+2. 最大配置名义不超过 25 USDC；只运行一个 `HYPE + HYPE/USDC` cycle，使用最小可成交共同 size。
+3. 实测完成：现货买入成交 → 永续空单成交 → 两边权威对账 → reduce-only 平永续 → 卖出现货 → 最终两边归零。
+4. 故障注入覆盖：第一腿拒绝、第二腿拒绝、两腿部分成交、UNKNOWN、重启恢复、Kill Switch 和补偿失败。
+5. 测试 teardown 必须按交易所权威状态清理挂单、永续持仓和本策略现货余额；无法清理即测试失败并保留告警。
+6. 至少连续 14 天 clean soak 后才允许另行设计 mainnet canary；本版本没有 mainnet 解锁路径。
 
 ## 6. 风险
 

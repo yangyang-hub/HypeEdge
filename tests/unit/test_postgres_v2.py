@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+from decimal import Decimal
+from types import SimpleNamespace
 from typing import cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -11,12 +14,17 @@ from sqlalchemy.dialects import postgresql
 from sqlalchemy.schema import CreateIndex, CreateTable
 
 from hypeedge.config.settings import PostgresSettings
+from hypeedge.core.enums import OrderStatus, OrderType, Side, TimeInForce
+from hypeedge.core.models import Order
+from hypeedge.core.types import Cloid, OrderId, Price, Size, Symbol
 from hypeedge.storage.postgres import (
     Base,
     ExecutionCommandRecord,
+    FundingArbConfigVersionRecord,
     OrderRecord,
     OutboxEventRecord,
     PositionRecord,
+    PostgresDurableOrderStore,
     PostgresUnitOfWork,
     create_pg_engine,
     create_pg_session_factory,
@@ -27,6 +35,7 @@ V2_TABLES = {
     "order_events",
     "fills",
     "positions",
+    "spot_balances",
     "account_state",
     "system_state",
     "risk_events",
@@ -41,6 +50,11 @@ V2_TABLES = {
     "strategy_allocations",
     "strategy_config_versions",
     "market_maker_config_versions",
+    "trend_follow_config_versions",
+    "funding_arb_config_versions",
+    "funding_arb_cycles",
+    "funding_arb_cycle_events",
+    "funding_payments",
     "strategy_runtime_state",
     "strategy_state_events",
     "market_making_sessions",
@@ -55,6 +69,40 @@ V2_TABLES = {
 }
 
 
+def test_transport_transition_never_regresses_authenticated_partial_fill() -> None:
+    record = SimpleNamespace(
+        exchange_oid=None,
+        status=OrderStatus.PARTIAL_FILL.value,
+        error_message=None,
+        submitted_at=datetime.now(UTC),
+        acknowledged_at=None,
+        filled_size=Decimal("0.5"),
+        avg_fill_price=Decimal("100"),
+        filled_at=None,
+    )
+    response_order = Order(
+        cloid=Cloid("0x" + "a" * 32),
+        exchange_oid=OrderId("42"),
+        symbol=Symbol("BTC"),
+        side=Side.BUY,
+        size=Size("1"),
+        price=Price("100"),
+        order_type=OrderType.MARKET,
+        time_in_force=TimeInForce.IOC,
+        status=OrderStatus.FILLED,
+        filled_size=Size("1"),
+        avg_fill_price=Price("101"),
+        acknowledged_at=datetime.now(UTC),
+    )
+
+    PostgresDurableOrderStore._merge_transport_transition(record, response_order)  # type: ignore[arg-type]
+
+    assert record.exchange_oid == "42"
+    assert record.status == OrderStatus.PARTIAL_FILL.value
+    assert record.filled_size == Decimal("0.5")
+    assert record.avg_fill_price == Decimal("100")
+
+
 class TestPostgresV2Metadata:
     def test_all_transactional_tables_are_registered(self) -> None:
         assert set(Base.metadata.tables) >= V2_TABLES
@@ -66,11 +114,14 @@ class TestPostgresV2Metadata:
             OrderRecord.__table__.c.filled_size,
             Base.metadata.tables["fills"].c.fee,
             Base.metadata.tables["positions"].c.realized_pnl,
+            Base.metadata.tables["spot_balances"].c.total,
             Base.metadata.tables["account_state"].c.equity,
             Base.metadata.tables["risk_reservations"].c.reserved_notional,
             Base.metadata.tables["market_maker_config_versions"].c.soft_inventory_notional,
             Base.metadata.tables["quote_plans"].c.fair_price,
             Base.metadata.tables["quote_plan_items"].c.desired_size,
+            Base.metadata.tables["funding_arb_cycles"].c.perp_open_size,
+            Base.metadata.tables["funding_payments"].c.amount,
         )
         for column in exact_columns:
             assert isinstance(column.type, Numeric)
@@ -93,9 +144,12 @@ class TestPostgresV2Metadata:
             "ck_orders_filled_size",
             "ck_orders_price_positive",
             "ck_orders_cloid_format",
+            "ck_orders_max_slippage_bps",
+            "ck_orders_spot_not_reduce_only",
         } <= constraint_names
         assert OrderRecord.__table__.c.order_id.unique
         assert OrderRecord.__table__.c.cloid.unique
+        assert {"is_spot", "risk_reducing", "max_slippage_bps"} <= set(OrderRecord.__table__.c.keys())
 
     def test_delivery_tables_have_idempotency_and_replay_indexes(self) -> None:
         command_table = cast(Table, ExecutionCommandRecord.__table__)
@@ -130,6 +184,27 @@ class TestPostgresV2Metadata:
         }
         assert "fk_strategy_instances_desired_config" in instance_fks
         assert "fk_strategy_runtime_state_effective_config" in runtime_fks
+
+    def test_funding_arb_constraints_are_fail_closed(self) -> None:
+        instance_constraint = next(
+            constraint
+            for constraint in Base.metadata.tables["strategy_instances"].constraints
+            if constraint.name == "ck_strategy_instances_type"
+        )
+        assert "funding_arb" in str(instance_constraint.sqltext)
+
+        funding_constraints = {constraint.name for constraint in FundingArbConfigVersionRecord.__table__.constraints}
+        assert {
+            "ck_fa_config_spot_market",
+            "ck_fa_config_entry_funding",
+            "ck_fa_config_rate_hysteresis",
+            "ck_fa_config_max_slippage",
+            "ck_fa_config_unhedged_seconds",
+        } <= funding_constraints
+
+        cycle_constraints = {constraint.name for constraint in Base.metadata.tables["funding_arb_cycles"].constraints}
+        assert {"ck_funding_arb_cycles_state", "fk_funding_arb_cycles_config"} <= cycle_constraints
+        assert "is_spot" in Base.metadata.tables["fills"].c
 
     def test_quote_and_execution_children_have_revision_idempotency(self) -> None:
         expected_constraints = {

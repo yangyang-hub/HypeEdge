@@ -49,12 +49,17 @@ class StaticAccountStateSource:
 
 
 class StaticClearinghouseClient:
-    def __init__(self, response: dict[str, object]) -> None:
+    def __init__(self, response: dict[str, object], spot_response: dict[str, object] | None = None) -> None:
         self.response = response
+        self.spot_response = spot_response or {"balances": []}
 
     async def get_clearinghouse_state(self, user: str) -> dict[str, object]:
         assert user == "0xaccount"
         return self.response
+
+    async def get_spot_user_state(self, user: str) -> dict[str, object]:
+        assert user == "0xaccount"
+        return self.spot_response
 
 
 class TestLayeredAccountHealthProvider:
@@ -300,6 +305,22 @@ class TestRestAccountStateSource:
         assert snapshot.positions[0].mark_price == Price(50_000.0)
         assert snapshot.positions[0].liquidation_price == Price(30_000.0)
         assert snapshot.positions[0].leverage == 2
+
+    async def test_parses_spot_balances_with_available_amount(self) -> None:
+        tracker = AccountTracker()
+        source = RestAccountStateSource(
+            StaticClearinghouseClient(
+                {"withdrawable": "100", "marginSummary": {"accountValue": "100"}, "assetPositions": []},
+                {"balances": [{"coin": "USDC", "total": "25", "hold": "5", "entryNtl": "0"}]},
+            ),
+            "0xaccount",
+            tracker,
+        )
+
+        snapshot = await source.fetch_account_state()
+
+        assert snapshot.spot_balances[0].token == "USDC"
+        assert snapshot.spot_balances[0].available == Size("20")
 
     async def test_invalid_clearinghouse_response_fails_closed(self) -> None:
         source = RestAccountStateSource(StaticClearinghouseClient({"marginSummary": {}}), "0xaccount", AccountTracker())

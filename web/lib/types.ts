@@ -423,6 +423,12 @@ export interface FundingArbConfig {
   hedge_ratio: DecimalString
   rebalance_threshold_bps: number
   leverage: DecimalString
+  max_slippage_bps: number
+  max_basis_bps: number
+  min_expected_edge_bps: DecimalString
+  expected_hold_hours: number
+  round_trip_fee_bps: DecimalString
+  max_unhedged_seconds: number
 }
 
 /** Payload for POST /api/v1/strategies (discriminated by strategy_type). */

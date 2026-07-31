@@ -1,11 +1,8 @@
-"""Funding-rate arbitrage strategy (single-venue delta-neutral skeleton).
-
-HL perpetual short funded by funding income, delta-hedged long spot on the same
-venue. The runtime here is a lifecycle stub; real execution is a later phase.
-"""
+"""Single-venue, testnet-gated funding-rate arbitrage strategy."""
 
 from hypeedge.strategy.funding_arb.models import FundingArbParams
 from hypeedge.strategy.funding_arb.runtime import (
+    FundingArbRuntimeDependencies,
     FundingArbRuntimeHandle,
     build_funding_arb_plugin,
     decode_funding_arb_config,
@@ -13,6 +10,7 @@ from hypeedge.strategy.funding_arb.runtime import (
 
 __all__ = [
     "FundingArbParams",
+    "FundingArbRuntimeDependencies",
     "FundingArbRuntimeHandle",
     "build_funding_arb_plugin",
     "decode_funding_arb_config",

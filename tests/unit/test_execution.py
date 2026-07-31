@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import uuid
 from datetime import UTC, datetime
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from hypeedge.account.tracker import AccountTracker
 from hypeedge.core.enums import OrderStatus, OrderType, SafetyMode, Side, TimeInForce
 from hypeedge.core.events import (
     EVENT_ORDER_ACKNOWLEDGED,
@@ -16,7 +18,7 @@ from hypeedge.core.events import (
     EventBus,
 )
 from hypeedge.core.exceptions import KillSwitchTriggeredError, NonceError, OrderRejectedError, OrderTimeoutError
-from hypeedge.core.models import AccountState, Order, OrderIntent, RiskCheckResult
+from hypeedge.core.models import AccountState, Order, OrderIntent, RiskCheckResult, SpotBalance
 from hypeedge.core.types import Cloid, Price, Size, StrategyId, Symbol, Usd
 from hypeedge.execution.cloid import CloidGenerator
 from hypeedge.execution.durable import DurableExecutionCommand
@@ -286,6 +288,121 @@ def _make_intent(
 
 
 class TestExecutionEngine:
+    @pytest.mark.asyncio
+    async def test_spot_execution_is_fail_closed_until_designed(self) -> None:
+        bus = EventBus()
+        manager = MagicMock(exchange=MagicMock())
+        manager.submit = AsyncMock()
+        engine = ExecutionEngine(manager, bus, KillSwitch(bus))
+        base = _make_intent()
+        intent = OrderIntent(
+            **{
+                **base.__dict__,
+                "symbol": Symbol("PURR/USDC"),
+                "is_spot": True,
+            }
+        )
+
+        with pytest.raises(OrderRejectedError, match="spot execution is not enabled"):
+            await engine.submit_order(intent)
+        manager.submit.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_enabled_spot_market_buy_routes_exchange_coin_through_market_open(self) -> None:
+        bus = EventBus()
+        manager = NonceManager()
+        exchange = MagicMock()
+        exchange.market_open.return_value = {
+            "status": "ok",
+            "response": {"data": {"statuses": [{"filled": {"oid": 7, "avgPx": "100", "totalSz": "0.2"}}]}},
+        }
+        manager.set_exchange(exchange)
+        tracker = AccountTracker()
+        tracker.update_account_state(AccountState(Usd("500"), Usd("500"), Usd(0), Usd(0), Usd("500")))
+        tracker.update_spot_balances(
+            (SpotBalance("USDC", Size("100"), updated_at=datetime.now(UTC)),),
+            observed_at=datetime.now(UTC),
+        )
+        provider = MagicMock()
+        provider.get_price_snapshot.return_value = MarketPriceSnapshot(100.0, datetime.now(UTC))
+        cache = MagicMock()
+        cache.resolve_spot.return_value = SimpleNamespace(base_token="HYPE", quote_token="USDC")
+        risk_checker = MagicMock()
+        risk_checker.check = AsyncMock(return_value=RiskCheckResult(True))
+        engine = ExecutionEngine(
+            manager,
+            bus,
+            KillSwitch(bus),
+            risk_checker=risk_checker,
+            account_tracker=tracker,
+            market_data_provider=provider,
+            instrument_cache=cache,
+            spot_execution_enabled=True,
+        )
+        task = await _start_manager(manager)
+        intent = OrderIntent(
+            symbol=Symbol("@1035"),
+            side=Side.BUY,
+            size=Size("0.2"),
+            order_type=OrderType.MARKET,
+            time_in_force=TimeInForce.IOC,
+            strategy_id=StrategyId("fa-1"),
+            is_spot=True,
+            max_slippage_bps=50,
+        )
+
+        await engine.submit_order(intent)
+
+        exchange.market_open.assert_called_once()
+        assert exchange.market_open.call_args.args[:3] == ("@1035", True, 0.2)
+        assert exchange.market_open.call_args.kwargs["slippage"] == pytest.approx(0.005)
+        await _stop_manager(manager, task)
+
+    @pytest.mark.asyncio
+    async def test_spot_balance_preflight_rejects_insufficient_quote_or_base(self) -> None:
+        bus = EventBus()
+        manager = MagicMock(exchange=MagicMock())
+        manager.submit = AsyncMock()
+        tracker = AccountTracker()
+        tracker.update_account_state(AccountState(Usd("500"), Usd("500"), Usd(0), Usd(0), Usd("500")))
+        tracker.update_spot_balances(
+            (
+                SpotBalance("USDC", Size("1"), updated_at=datetime.now(UTC)),
+                SpotBalance("HYPE", Size("0.05"), updated_at=datetime.now(UTC)),
+            ),
+            observed_at=datetime.now(UTC),
+        )
+        provider = MagicMock()
+        provider.get_price_snapshot.return_value = MarketPriceSnapshot(100.0, datetime.now(UTC))
+        cache = MagicMock()
+        cache.resolve_spot.return_value = SimpleNamespace(base_token="HYPE", quote_token="USDC")
+        engine = ExecutionEngine(
+            manager,
+            bus,
+            KillSwitch(bus),
+            account_tracker=tracker,
+            market_data_provider=provider,
+            instrument_cache=cache,
+            spot_execution_enabled=True,
+        )
+        common = {
+            "symbol": Symbol("@1035"),
+            "size": Size("0.2"),
+            "price": None,
+            "order_type": OrderType.MARKET,
+            "time_in_force": TimeInForce.IOC,
+            "is_spot": True,
+        }
+
+        buy = await engine.submit_order(OrderIntent(side=Side.BUY, **common))
+        sell = await engine.submit_order(OrderIntent(side=Side.SELL, risk_reducing=True, **common))
+
+        assert buy.status == OrderStatus.REJECTED
+        assert buy.error_message == "insufficient_spot_quote_balance"
+        assert sell.status == OrderStatus.REJECTED
+        assert sell.error_message == "insufficient_spot_base_balance"
+        manager.submit.assert_not_awaited()
+
     @pytest.mark.asyncio
     async def test_same_canonical_cloid_is_idempotent_before_kill_gate(self) -> None:
         bus = EventBus()
@@ -599,6 +716,7 @@ class TestExecutionEngine:
         with pytest.raises(RuntimeError, match="postgres_down"):
             await engine.submit_order(_make_intent())
         exchange.order.assert_not_called()
+        assert await engine.get_open_orders() == []
 
     @pytest.mark.asyncio
     async def test_recover_open_orders_restores_engine_projection(self):

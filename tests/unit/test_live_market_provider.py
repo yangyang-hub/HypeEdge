@@ -54,6 +54,24 @@ def test_funding_cache_returns_authoritative_snapshot() -> None:
     assert provider.get_funding(Symbol("BTC")) is funding
 
 
+def test_funding_cache_ignores_older_backfill_snapshot() -> None:
+    provider = _provider()
+    live = FundingRate(Symbol("BTC"), 0.0002, 0.0001, Price(60_000), 1000.0, Timestamp(200))
+    historical = FundingRate(Symbol("BTC"), 0.0009, 0.0008, Price(0), 0.0, Timestamp(100))
+    provider._handle_funding(live)
+    provider._handle_funding(historical)
+    assert provider.get_funding(Symbol("BTC")) is live
+
+
+def test_funding_cache_keeps_richer_equal_timestamp_snapshot() -> None:
+    provider = _provider()
+    live = FundingRate(Symbol("BTC"), 0.0002, 0.0001, Price(60_000), 1000.0, Timestamp(200))
+    sparse = FundingRate(Symbol("BTC"), 0.0002, 0.0001, Price(0), 0.0, Timestamp(200))
+    provider._handle_funding(live)
+    provider._handle_funding(sparse)
+    assert provider.get_funding(Symbol("BTC")) is live
+
+
 async def test_start_stop_unsubscribes_all_market_queues() -> None:
     from hypeedge.core.events import EventBus
 

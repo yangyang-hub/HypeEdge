@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from typing import TYPE_CHECKING, Any
 
@@ -21,8 +22,8 @@ import structlog
 from hypeedge.account.tracker import AccountTracker
 from hypeedge.core.enums import OrderStatus, OrderType, Side, TimeInForce
 from hypeedge.core.events import EVENT_RECONCILIATION_COMPLETE, Event, EventBus
-from hypeedge.core.models import AccountState, Order, Position
-from hypeedge.core.types import Cloid, OrderId, Price, Size, Symbol
+from hypeedge.core.models import AccountState, Order, Position, SpotBalance
+from hypeedge.core.types import Cloid, OrderId, Price, Size, SubAccount, Symbol, Usd
 from hypeedge.execution.cloid import CloidGenerator
 from hypeedge.execution.engine import ExecutionEngine
 
@@ -41,6 +42,7 @@ class ReconciliationResult:
     orders_corrected: int
     positions_corrected: int
     errors: list[str]
+    spot_balances_corrected: int = 0
 
 
 class Reconciler:
@@ -99,16 +101,18 @@ class Reconciler:
                 positions_corrected=0,
                 errors=["info_client_or_address_not_configured"],
             )
-            await self._persist_reconciliation(run_id, result, [], {}, None)
+            await self._persist_reconciliation(run_id, result, [], {}, {}, None)
             return result
 
         errors: list[str] = []
         orders_corrected = 0
         positions_corrected = 0
+        spot_balances_corrected = 0
 
         logger.info("reconciliation_start", address=self._account_address)
         local_orders = await self._engine.get_open_orders()
         local_positions = dict(self._tracker.get_all_positions())
+        local_spot_balances = dict(self._tracker.get_all_spot_balances())
 
         # Step 1: Fetch exchange state
         try:
@@ -119,12 +123,15 @@ class Reconciler:
             exchange_open_orders = []
 
         try:
-            exchange_positions = await self._fetch_exchange_positions()
-            exchange_account = await self._fetch_account_state()
+            clearinghouse_state = await self._fetch_exchange_clearinghouse_state()
+            exchange_positions = self._positions_from_clearinghouse(clearinghouse_state)
+            exchange_spot_balances = await self._fetch_exchange_spot_balances()
+            exchange_account = self._account_from_clearinghouse(clearinghouse_state)
         except Exception as e:
             errors.append(f"fetch_positions_failed: {e}")
             logger.error("reconcile_fetch_positions_failed", error=str(e))
             exchange_positions = {}
+            exchange_spot_balances = {}
             exchange_account = None
 
         # Never mutate local state from partial/failed snapshots.
@@ -132,6 +139,7 @@ class Reconciler:
             try:
                 orders_corrected = await self._reconcile_orders(exchange_open_orders)
                 positions_corrected = self._reconcile_positions(exchange_positions)
+                spot_balances_corrected = self._reconcile_spot_balances(exchange_spot_balances)
                 self._tracker.update_account_state(exchange_account)
             except Exception as e:
                 errors.append(f"reconcile_apply_failed: {e}")
@@ -144,9 +152,24 @@ class Reconciler:
             orders_corrected=orders_corrected,
             positions_corrected=positions_corrected,
             errors=errors,
+            spot_balances_corrected=spot_balances_corrected,
         )
-        diffs = self._build_diffs(local_orders, local_positions, exchange_open_orders, exchange_positions)
-        await self._persist_reconciliation(run_id, result, diffs, exchange_positions, exchange_account)
+        diffs = self._build_diffs(
+            local_orders,
+            local_positions,
+            local_spot_balances,
+            exchange_open_orders,
+            exchange_positions,
+            exchange_spot_balances,
+        )
+        await self._persist_reconciliation(
+            run_id,
+            result,
+            diffs,
+            exchange_positions,
+            exchange_spot_balances,
+            exchange_account,
+        )
 
         if result.success:
             if self._account_health is not None:
@@ -164,6 +187,7 @@ class Reconciler:
                 "reconciliation_complete",
                 orders_corrected=orders_corrected,
                 positions_corrected=positions_corrected,
+                spot_balances_corrected=spot_balances_corrected,
             )
         else:
             if self._account_health is not None:
@@ -182,6 +206,7 @@ class Reconciler:
         result: ReconciliationResult,
         diffs: list[dict[str, Any]],
         exchange_positions: dict[str, dict[str, Any]],
+        exchange_spot_balances: dict[str, dict[str, Any]],
         exchange_account: Any | None,
     ) -> None:
         if self._reconciliation_store is None or run_id is None:
@@ -193,6 +218,7 @@ class Reconciler:
                 errors=result.errors,
                 diffs=diffs,
                 exchange_positions=exchange_positions,
+                exchange_spot_balances=exchange_spot_balances,
                 exchange_account=exchange_account,
             )
         except Exception as exc:
@@ -204,8 +230,10 @@ class Reconciler:
     def _build_diffs(
         local_orders: list[Order],
         local_positions: dict[Symbol, Position],
+        local_spot_balances: dict[str, SpotBalance],
         exchange_orders: list[dict[str, Any]],
         exchange_positions: dict[str, dict[str, Any]],
+        exchange_spot_balances: dict[str, dict[str, Any]],
     ) -> list[dict[str, Any]]:
         diffs: list[dict[str, Any]] = []
         local_cloids = {str(order.cloid): order for order in local_orders}
@@ -260,6 +288,24 @@ class Reconciler:
                         "difference_type": "closed_on_exchange",
                         "local_value": {"size": str(local.size)},
                         "exchange_value": None,
+                        "severity": "critical",
+                    }
+                )
+        for token in set(local_spot_balances) | set(exchange_spot_balances):
+            spot_local = local_spot_balances.get(token)
+            spot_exchange = exchange_spot_balances.get(token)
+            local_total = Decimal(spot_local.total) if spot_local is not None else Decimal(0)
+            exchange_total = Decimal(str(spot_exchange.get("total", 0))) if spot_exchange is not None else Decimal(0)
+            local_hold = Decimal(spot_local.hold) if spot_local is not None else Decimal(0)
+            exchange_hold = Decimal(str(spot_exchange.get("hold", 0))) if spot_exchange is not None else Decimal(0)
+            if local_total != exchange_total or local_hold != exchange_hold:
+                diffs.append(
+                    {
+                        "entity_type": "spot_balance",
+                        "entity_key": token,
+                        "difference_type": "spot_balance_mismatch",
+                        "local_value": {"total": str(local_total), "hold": str(local_hold)},
+                        "exchange_value": {"total": str(exchange_total), "hold": str(exchange_hold)},
                         "severity": "critical",
                     }
                 )
@@ -321,17 +367,27 @@ class Reconciler:
         """Fetch all open orders from the exchange."""
         if not self._info:
             raise RuntimeError("info_client_not_configured")
-        result = await asyncio.to_thread(self._info.open_orders, self._account_address)
+        result = await self._call_info(self._info.open_orders, self._account_address)
         if not isinstance(result, list):
             raise RuntimeError("invalid_open_orders_response")
         return result
 
     async def _fetch_exchange_positions(self) -> dict[str, dict[str, Any]]:
         """Fetch positions from the exchange clearinghouse state."""
+        return self._positions_from_clearinghouse(await self._fetch_exchange_clearinghouse_state())
+
+    async def _fetch_exchange_clearinghouse_state(self) -> dict[str, Any]:
+        """Fetch one complete perpetual account snapshot for all parsers."""
         if not self._info:
             raise RuntimeError("info_client_not_configured")
-        state = await asyncio.to_thread(self._info.user_state, self._account_address)
-        if not isinstance(state, dict) or "assetPositions" not in state:
+        state = await self._call_info(self._info.user_state, self._account_address)
+        if not isinstance(state, dict):
+            raise RuntimeError("invalid_user_state_response")
+        return state
+
+    @staticmethod
+    def _positions_from_clearinghouse(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        if "assetPositions" not in state or not isinstance(state.get("assetPositions"), list):
             raise RuntimeError("invalid_user_state_response")
         positions: dict[str, dict[str, Any]] = {}
         for pos_data in state.get("assetPositions", []):
@@ -341,15 +397,38 @@ class Reconciler:
                 positions[coin] = pos_info
         return positions
 
-    async def _fetch_account_state(self) -> Any:
-        """Fetch account state from exchange."""
+    async def _fetch_exchange_spot_balances(self) -> dict[str, dict[str, Any]]:
+        """Fetch token balances from the authoritative spot clearinghouse."""
         if not self._info:
             raise RuntimeError("info_client_not_configured")
-        state = await asyncio.to_thread(self._info.user_state, self._account_address)
+        # Compatibility fakes and older adapters that do not declare the SDK
+        # method have no spot scope. The production SDK class declares it and is
+        # therefore always held to the complete-snapshot contract below.
+        if not callable(getattr(type(self._info), "spot_user_state", None)):
+            return {}
+        state = await self._call_info(self._info.spot_user_state, self._account_address)
+        if not isinstance(state, dict) or not isinstance(state.get("balances"), list):
+            raise RuntimeError("invalid_spot_user_state_response")
+        balances: dict[str, dict[str, Any]] = {}
+        for raw in state["balances"]:
+            if not isinstance(raw, dict):
+                raise RuntimeError("invalid_spot_balance_response")
+            token = raw.get("coin", raw.get("token"))
+            if not isinstance(token, str) or not token:
+                raise RuntimeError("spot_balance_missing_token")
+            balances[token] = raw
+        return balances
+
+    async def _fetch_account_state(self) -> Any:
+        """Fetch account state from exchange."""
+        return self._account_from_clearinghouse(await self._fetch_exchange_clearinghouse_state())
+
+    def _account_from_clearinghouse(self, state: dict[str, Any]) -> AccountState:
         if not isinstance(state, dict) or "marginSummary" not in state:
             raise RuntimeError("invalid_account_state_response")
         margin_summary = state["marginSummary"]
-        from hypeedge.core.types import Usd
+        if not isinstance(margin_summary, dict):
+            raise RuntimeError("invalid_account_state_response")
 
         unrealized_pnl = sum(
             (
@@ -367,6 +446,20 @@ class Reconciler:
             total_unrealized_pnl=Usd(unrealized_pnl),
             peak_equity=max(self._tracker.peak_equity, Usd(account_value)),
         )
+
+    @staticmethod
+    async def _call_info(method: Any, *args: object) -> Any:
+        """Retry transient read-only SDK failures without changing endpoints."""
+        last_error: Exception | None = None
+        for attempt in range(3):
+            try:
+                return await asyncio.to_thread(method, *args)
+            except Exception as exc:
+                last_error = exc
+                if attempt < 2:
+                    await asyncio.sleep(0.25 * (2**attempt))
+        assert last_error is not None
+        raise last_error
 
     # --- Order reconciliation ---
 
@@ -467,6 +560,7 @@ class Reconciler:
             status=OrderStatus.ACKNOWLEDGED,
             exchange_oid=OrderId(str(data.get("oid"))) if data.get("oid") is not None else None,
             reduce_only=bool(data.get("reduceOnly", False)),
+            is_spot=str(data.get("coin", "")).startswith("@"),
         )
 
     # --- Position reconciliation ---
@@ -537,4 +631,30 @@ class Reconciler:
                 self._tracker.remove_position(symbol)
                 corrected += 1
 
+        return corrected
+
+    def _reconcile_spot_balances(self, exchange_balances: dict[str, dict[str, Any]]) -> int:
+        """Replace local spot balances with one complete exchange snapshot."""
+        local = self._tracker.get_all_spot_balances()
+        corrected = sum(
+            1
+            for token in set(local) | set(exchange_balances)
+            if Decimal(local[token].total if token in local else 0)
+            != Decimal(str(exchange_balances.get(token, {}).get("total", 0)))
+            or Decimal(local[token].hold if token in local else 0)
+            != Decimal(str(exchange_balances.get(token, {}).get("hold", 0)))
+        )
+        observed_at = datetime.now(UTC)
+        balances = tuple(
+            SpotBalance(
+                token=token,
+                total=Size(raw.get("total", 0)),
+                hold=Size(raw.get("hold", 0)),
+                entry_ntl=Usd(raw.get("entryNtl", 0)),
+                sub_account=SubAccount(self._account_address.lower()),
+                updated_at=observed_at,
+            )
+            for token, raw in exchange_balances.items()
+        )
+        self._tracker.update_spot_balances(balances, observed_at=observed_at)
         return corrected

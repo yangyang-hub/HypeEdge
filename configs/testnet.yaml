@@ -13,9 +13,11 @@ market_data:
     - BTC
     - ETH
     - SOL
+    - HYPE
   # Hyperliquid spot (HIP-1/HIP-2) coins to subscribe l2Book for; empty by default.
   # Add spot tokens that have a perpetual counterpart for funding-rate arbitrage.
-  spot_coins: []
+  spot_coins:
+    - HYPE/USDC
   ws_subscriptions:
     - l2Book
     - trades
@@ -114,6 +116,14 @@ market_making:
   testnet_soak_min_days: 14
   canary_observation_min_days: 30
 
+funding_arb:
+  # Hard testnet ceiling; strategy config cannot raise this limit.
+  max_notional_usd: "25"
+  poll_interval_seconds: 2.0
+  order_status_poll_interval_seconds: 0.25
+  max_leg_attempts: 3
+  market_stale_seconds: 5.0
+
 monitor:
   prometheus_port: 9091
 
@@ -160,3 +170,4 @@ features:
   api_v1: true
   strategy_runner_v2: true
   market_making_enabled: false
+  funding_arb_execution_enabled: true

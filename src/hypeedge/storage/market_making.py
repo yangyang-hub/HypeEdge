@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import uuid
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -261,16 +262,25 @@ def default_trend_follow_config() -> dict[str, Decimal | int]:
     }
 
 
-_FA_INTEGER_FIELDS = ("rebalance_threshold_bps",)
+_FA_INTEGER_FIELDS = (
+    "rebalance_threshold_bps",
+    "max_slippage_bps",
+    "max_basis_bps",
+    "expected_hold_hours",
+    "max_unhedged_seconds",
+)
 _FA_DECIMAL_FIELDS = (
     "entry_funding_rate",
     "exit_funding_rate",
     "max_notional_usd",
     "hedge_ratio",
     "leverage",
+    "min_expected_edge_bps",
+    "round_trip_fee_bps",
 )
 _FA_STRING_FIELDS = ("spot_coin",)
 _FA_CONFIG_FIELDS = frozenset((*_FA_INTEGER_FIELDS, *_FA_DECIMAL_FIELDS, *_FA_STRING_FIELDS))
+_FA_SPOT_MARKET_PATTERN = re.compile(r"^(?:@[0-9]+|[A-Za-z0-9_.:-]+/[A-Za-z0-9_.:-]+)$")
 
 
 def normalize_funding_arb_config(values: Mapping[str, Any]) -> dict[str, Decimal | int | str]:
@@ -300,12 +310,20 @@ def normalize_funding_arb_config(values: Mapping[str, Any]) -> dict[str, Decimal
         value = supplied[name]
         if not isinstance(value, str) or not value.strip():
             raise StrategyRegistrationError(f"Funding-arb config field must be a non-empty string: {name}")
-        normalized[name] = value.strip()
-    for name in ("entry_funding_rate", "exit_funding_rate"):
-        value = normalized[name]
-        assert isinstance(value, Decimal)
-        if value < 0:
-            raise StrategyRegistrationError(f"{name} must be >= 0")
+        normalized_value = value.strip()
+        if not _FA_SPOT_MARKET_PATTERN.fullmatch(normalized_value):
+            raise StrategyRegistrationError("spot_coin must be a valid Hyperliquid spot market identifier")
+        normalized[name] = normalized_value
+    entry_funding_rate = normalized["entry_funding_rate"]
+    exit_funding_rate = normalized["exit_funding_rate"]
+    assert isinstance(entry_funding_rate, Decimal)
+    assert isinstance(exit_funding_rate, Decimal)
+    if entry_funding_rate <= 0:
+        raise StrategyRegistrationError("entry_funding_rate must be > 0")
+    if exit_funding_rate < 0:
+        raise StrategyRegistrationError("exit_funding_rate must be >= 0")
+    if exit_funding_rate >= entry_funding_rate:
+        raise StrategyRegistrationError("exit_funding_rate must be < entry_funding_rate")
     for name in ("max_notional_usd", "leverage"):
         value = normalized[name]
         assert isinstance(value, Decimal)
@@ -317,6 +335,26 @@ def normalize_funding_arb_config(values: Mapping[str, Any]) -> dict[str, Decimal
         raise StrategyRegistrationError("hedge_ratio must be in (0, 1]")
     if int(normalized["rebalance_threshold_bps"]) <= 0:
         raise StrategyRegistrationError("rebalance_threshold_bps must be > 0")
+    leverage = normalized["leverage"]
+    assert isinstance(leverage, Decimal)
+    if leverage != leverage.to_integral_value():
+        raise StrategyRegistrationError("leverage must be an integer")
+    if not 1 <= int(normalized["max_slippage_bps"]) <= 500:
+        raise StrategyRegistrationError("max_slippage_bps must be in [1, 500]")
+    if int(normalized["max_basis_bps"]) <= 0:
+        raise StrategyRegistrationError("max_basis_bps must be > 0")
+    min_edge = normalized["min_expected_edge_bps"]
+    round_trip_fee = normalized["round_trip_fee_bps"]
+    assert isinstance(min_edge, Decimal)
+    assert isinstance(round_trip_fee, Decimal)
+    if min_edge < 0:
+        raise StrategyRegistrationError("min_expected_edge_bps must be >= 0")
+    if round_trip_fee < 0:
+        raise StrategyRegistrationError("round_trip_fee_bps must be >= 0")
+    if not 1 <= int(normalized["expected_hold_hours"]) <= 168:
+        raise StrategyRegistrationError("expected_hold_hours must be in [1, 168]")
+    if not 1 <= int(normalized["max_unhedged_seconds"]) <= 60:
+        raise StrategyRegistrationError("max_unhedged_seconds must be in [1, 60]")
     return normalized
 
 
@@ -335,13 +373,19 @@ def default_funding_arb_config() -> dict[str, Decimal | int | str]:
     """Safe create defaults aligned with ``FundingArbParams``."""
 
     return {
-        "spot_coin": "PURR",
+        "spot_coin": "PURR/USDC",
         "entry_funding_rate": Decimal("0.0001"),
         "exit_funding_rate": Decimal("0"),
         "max_notional_usd": Decimal("1000"),
         "hedge_ratio": Decimal("1"),
         "rebalance_threshold_bps": 50,
         "leverage": Decimal("1"),
+        "max_slippage_bps": 50,
+        "max_basis_bps": 500,
+        "min_expected_edge_bps": Decimal("5"),
+        "expected_hold_hours": 8,
+        "round_trip_fee_bps": Decimal("20"),
+        "max_unhedged_seconds": 15,
     }
 
 

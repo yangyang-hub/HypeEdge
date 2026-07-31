@@ -87,6 +87,13 @@ class HypeEdgeApp:
         self.settings = settings or load_settings()
         self.event_bus = EventBus()
         self._tasks: list[asyncio.Task[Any]] = []
+        # One-shot background tasks that must NOT gate the process lifetime.
+        # Unlike ``self._tasks`` (long-lived loops whose completion signals
+        # shutdown), these are expected to return on their own and are only
+        # cancelled/awaited during graceful shutdown. Putting a finite task in
+        # ``self._tasks`` makes ``run()`` shut the whole app down as soon as it
+        # finishes.
+        self._background_tasks: list[asyncio.Task[Any]] = []
         self._shutdown_event = asyncio.Event()
         self._kill_switch_active = False
         from hypeedge.risk.safety import SafetyController
@@ -128,6 +135,7 @@ class HypeEdgeApp:
         self._durable_order_store: DurableOrderStore | None = None
         self._api_command_service: ApiCommandService | None = None
         self._signed_action_executor: SignedActionExecutor | None = None
+        self._api_server: Any = None  # uvicorn.Server — kept so we can request a graceful exit
         self._outbox_store: PostgresOutboxStore | None = None
         self._outbox_dispatcher: OutboxDispatcher | None = None
         self._control_event_writer: DurableControlEventWriter | None = None
@@ -175,19 +183,30 @@ class HypeEdgeApp:
 
             logger.info("hypeedge_running", tasks=len(self._tasks))
 
-            # Wait for shutdown signal or first task exception
+            # Wait for shutdown signal or first task ending. Any long-lived
+            # task in ``self._tasks`` completing (normally or by error) triggers
+            # shutdown, so one-shot setup tasks must live in
+            # ``self._background_tasks`` — otherwise a task that returns on its
+            # own (e.g. market_making_restore) tears the whole app down.
+            shutdown_waiter = asyncio.create_task(self._shutdown_event.wait(), name="shutdown_waiter")
             done, pending = await asyncio.wait(
-                self._tasks + [asyncio.create_task(self._shutdown_event.wait())],
+                self._tasks + [shutdown_waiter],
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            signal_triggered = shutdown_waiter in done
+            shutdown_waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await shutdown_waiter
 
-            # Check for unexpected task failures
+            # Check for unexpected task endings.
             for task in done:
-                if task.cancelled():
+                if task is shutdown_waiter or task.cancelled():
                     continue
                 exc = task.exception()
                 if exc and not isinstance(exc, (asyncio.CancelledError, KillSwitchTriggeredError)):
                     logger.error("task_failed", task=task.get_name(), error=str(exc))
+                elif not signal_triggered:
+                    logger.warning("task_exited_triggering_shutdown", task=task.get_name())
 
         except Exception:
             logger.exception("hypeedge_fatal_error")
@@ -230,8 +249,27 @@ class HypeEdgeApp:
             self.event_bus,
             dedup_filter=dedup_filter,
         )
-        self._ws_feed = WebSocketFeed(self.settings, self.event_bus)
         self._rest_client = RestClient(self.settings, self.event_bus, self._rate_limiter)
+        self._instrument_cache = InstrumentMetaCache(self._rest_client)
+        metadata_required_for_trading = (
+            self.settings.exchange.is_configured and self.settings.features.v2_trading_enabled
+        )
+        if (
+            self.settings.market_data.spot_coins
+            or self.settings.features.funding_arb_execution_enabled
+            or metadata_required_for_trading
+        ):
+            try:
+                await self._instrument_cache.ensure_loaded()
+            except Exception:
+                if self.settings.features.funding_arb_execution_enabled or metadata_required_for_trading:
+                    raise
+                logger.exception("spot_metadata_initial_load_failed")
+        self._ws_feed = WebSocketFeed(
+            self.settings,
+            self.event_bus,
+            spot_resolver=self._instrument_cache,
+        )
         self._market_data_provider = LiveMarketDataProvider(
             self.settings,
             self.event_bus,
@@ -244,7 +282,6 @@ class HypeEdgeApp:
             self._rest_client,
             self._checkpoint_store,
         )
-        self._instrument_cache = InstrumentMetaCache(self._rest_client)
         self._external_reference_provider = LatestExternalReferenceProvider(self.settings.external_reference)
         if self.settings.external_reference.external_reference_enabled:
             self._binance_reference_feed = BinanceReferenceFeed(
@@ -311,8 +348,9 @@ class HypeEdgeApp:
                 self._control_event_writer = DurableControlEventWriter(self.event_bus, self._outbox_store)
                 self._trading_prerequisites_ok = True
                 self._init_trading_components()
-                if self.settings.features.market_making_enabled:
-                    self._init_market_making_components()
+                # The persistent strategy control plane serves trend-follow and
+                # funding-arb even when live market making is disabled.
+                self._init_market_making_components()
                 if self._execution_engine is None:
                     raise RuntimeError("execution_engine_not_initialized")
                 from hypeedge.execution.worker import SignedActionExecutor
@@ -420,6 +458,8 @@ class HypeEdgeApp:
             market_price_stale_seconds=risk_settings.market_price_stale_seconds,
             durable_kill_trigger=self.trigger_kill_switch,
             order_normalizer=OrderNormalizer(self._instrument_cache) if self._instrument_cache is not None else None,
+            instrument_cache=self._instrument_cache,
+            spot_execution_enabled=(self.settings.is_testnet and self.settings.features.funding_arb_execution_enabled),
         )
 
         # Reconciler
@@ -447,14 +487,13 @@ class HypeEdgeApp:
         logger.info("trading_components_initialized")
 
     def _init_market_making_components(self) -> None:
-        """Build the persistent market-making control plane.
+        """Build the persistent multi-strategy control plane.
 
         Runtime restoration is intentionally deferred until reconciliation,
         account health, and all three action budgets are fresh.
         """
         if (
-            not self.settings.features.market_making_enabled
-            or self._pg_session_factory is None
+            self._pg_session_factory is None
             or self._tracker is None
             or self._account_health is None
             or self._action_budget_controller is None
@@ -508,7 +547,7 @@ class HypeEdgeApp:
             funding=self._market_data_provider,
         )
         from hypeedge.storage.market_making import normalize_market_maker_config
-        from hypeedge.strategy.funding_arb import build_funding_arb_plugin
+        from hypeedge.strategy.funding_arb import FundingArbRuntimeDependencies, build_funding_arb_plugin
         from hypeedge.strategy.plugin import (
             MARKET_MAKER_CAPABILITIES,
             StaticStrategyTypePlugin,
@@ -535,20 +574,42 @@ class HypeEdgeApp:
                 strategy_factory=self._build_trend_follow_strategy,
             )
         )
-        registry.register_plugin(
-            build_funding_arb_plugin(
+        funding_dependencies = None
+        if (
+            self.settings.is_testnet
+            and self.settings.features.funding_arb_execution_enabled
+            and self._execution_engine is not None
+            and self._market_data_provider is not None
+            and self._instrument_cache is not None
+            and self._reconciler is not None
+        ):
+            from hypeedge.storage.funding_arb import PostgresFundingArbCycleStore
+
+            funding_dependencies = FundingArbRuntimeDependencies(
                 execution=self._execution_engine,
                 provider=self._market_data_provider,
                 tracker=self._tracker,
+                metadata=self._instrument_cache,
+                cycles=PostgresFundingArbCycleStore(self._pg_session_factory),
+                account_health=self._account_health,
+                reconcile=self._reconcile_for_funding_arb,
+                trading_ready=lambda: self.trading_enabled,
+                kill_switch_active=lambda: self._kill_switch.is_active,
+                deployment=self.settings.funding_arb,
+                account_address=self.settings.exchange.account_address,
             )
-        )
+        registry.register_plugin(build_funding_arb_plugin(dependencies=funding_dependencies))
         concrete_supervisor = StrategySupervisor(
             registry,
             state_store,
             PostgresStrategyAllocationManager(self._pg_session_factory),
         )
         supervisor = LiveCapabilityStrategySupervisor(concrete_supervisor, commands, registry=registry)
-        if self._execution_engine is not None and self._market_data_provider is not None:
+        if (
+            self.settings.features.market_making_enabled
+            and self._execution_engine is not None
+            and self._market_data_provider is not None
+        ):
             from hypeedge.execution.quote_plan_worker import AppQuoteDispatchGuardProvider, QuotePlanWorker
 
             guard = AppQuoteDispatchGuardProvider(
@@ -579,7 +640,16 @@ class HypeEdgeApp:
             safety_mode=lambda: self.safety_mode,
             kill_switch_active=lambda: self._kill_switch.is_active,
         )
-        logger.info("market_making_control_plane_initialized")
+        logger.info(
+            "strategy_control_plane_initialized",
+            market_making_enabled=self.settings.features.market_making_enabled,
+            funding_arb_execution_enabled=funding_dependencies is not None,
+        )
+
+    async def _reconcile_for_funding_arb(self) -> bool:
+        if self._reconciler is None:
+            return False
+        return (await self._reconciler.reconcile()).success
 
     def _decode_market_maker_config(self, snapshot: Any, symbol: Any) -> Any:
         """Join durable strategy knobs with authoritative instrument metadata."""
@@ -770,16 +840,34 @@ class HypeEdgeApp:
             base_url = self.settings.exchange.api_url.rstrip("/")
 
             wallet = eth_account.Account.from_key(self.settings.exchange.agent_private_key)
-
-            # Create Info client
-            info = Info(base_url, skip_ws=False)
-
-            # Create Exchange client
-            exchange = Exchange(
-                wallet=wallet,
-                base_url=base_url,
-                account_address=self.settings.exchange.account_address,
-            )
+            info = None
+            exchange = None
+            last_error: Exception | None = None
+            for attempt in range(3):
+                try:
+                    # Both SDK constructors fetch metadata synchronously. Keep
+                    # them off the event loop and retry transient testnet/API
+                    # gateway failures without ever switching endpoints.
+                    info = await asyncio.to_thread(Info, base_url, skip_ws=False)
+                    exchange = await asyncio.to_thread(
+                        Exchange,
+                        wallet=wallet,
+                        base_url=base_url,
+                        account_address=self.settings.exchange.account_address,
+                    )
+                    break
+                except Exception as exc:
+                    last_error = exc
+                    if info is not None:
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(info.disconnect_websocket)
+                    info = None
+                    exchange = None
+                    if attempt < 2:
+                        logger.warning("hl_sdk_connection_retry", attempt=attempt + 1, error=str(exc))
+                        await asyncio.sleep(0.25 * (2**attempt))
+            if info is None or exchange is None:
+                raise RuntimeError("Hyperliquid SDK construction failed after retries") from last_error
 
             # Wire into components
             if self._nonce_manager:
@@ -908,9 +996,6 @@ class HypeEdgeApp:
                     self._safety_controller.enter_cancel_only("emergency_cancel_recovery_unresolved")
                     logger.error("emergency_cancel_recovery_unresolved", count=len(recovery.unresolved))
 
-            if self._account_state_poller is not None:
-                tasks.append(asyncio.create_task(self._account_state_poller.run(), name="account_state_poller"))
-
             if self._execution_engine:
                 await self._execution_engine.recover_open_orders()
 
@@ -987,7 +1072,12 @@ class HypeEdgeApp:
                     if self._rest_client is not None:
                         tasks.append(asyncio.create_task(self._poll_action_credits(), name="action_credits_poll"))
                     if self._strategy_supervisor is not None:
-                        tasks.append(
+                        # This is a one-shot setup task: it polls until
+                        # prerequisites are fresh, restores durable instances,
+                        # then RETURNS. It must not live in ``self._tasks`` (a
+                        # return there triggers FIRST_COMPLETED shutdown) — it
+                        # goes in ``self._background_tasks`` instead.
+                        self._background_tasks.append(
                             asyncio.create_task(
                                 self._restore_market_making_when_ready(),
                                 name="market_making_restore",
@@ -1004,8 +1094,11 @@ class HypeEdgeApp:
                         self._metrics.set_trading_enabled(False)
                     logger.warning("trading_stay_disabled", reconciliation="failed", errors=result.errors)
 
-                # Periodic reconciliation starts only after the startup cycle
-                # completes, preventing concurrent snapshots and mutations.
+                # Account polling and periodic reconciliation start only after
+                # the startup snapshot completes, preventing duplicate SDK
+                # account calls from racing the startup gate.
+                if self._account_state_poller is not None:
+                    tasks.append(asyncio.create_task(self._account_state_poller.run(), name="account_state_poller"))
                 tasks.append(
                     asyncio.create_task(
                         self._reconciler.run_periodic(
@@ -1110,7 +1203,7 @@ class HypeEdgeApp:
         """Restore durable strategy instances after placement prerequisites are fresh.
 
         Market makers restart through SHADOW and keep RUNNING as desired intent only.
-        Trend-follow instances start directly into RUNNING when that was desired.
+        Non-market-making types start directly into RUNNING when that was desired.
         """
         if self._strategy_supervisor is None or self._market_making_state_store is None:
             return
@@ -1121,7 +1214,7 @@ class HypeEdgeApp:
             if desired in {MarketMakerLifecycle.STOPPED, MarketMakerLifecycle.FAULTED}:
                 continue
             try:
-                if instance.strategy_type == "trend_follow":
+                if instance.strategy_type != "market_maker":
                     start_target = (
                         MarketMakerLifecycle.RUNNING
                         if desired in {MarketMakerLifecycle.RUNNING, MarketMakerLifecycle.PAUSED}
@@ -1182,6 +1275,7 @@ class HypeEdgeApp:
                 log_level="warning",
             )
             server = uvicorn.Server(config)
+            self._api_server = server
             logger.info("api_server_starting", port=self.settings.api.port)
             return asyncio.create_task(server.serve(), name="api_server")
         except ImportError:
@@ -1291,19 +1385,43 @@ class HypeEdgeApp:
                 if self._ch_writer:
                     await self._ch_writer.flush()
 
-                # Step 5: Cancel all tasks
+                # Step 5: Cancel all tasks. The uvicorn api_server is exempt:
+                # serve() has no try/finally, so cancelling it skips
+                # Server.shutdown() and never sends the ASGI lifespan.shutdown
+                # event, leaving starlette's lifespan parked on receive() and
+                # surfacing a noisy asyncio.CancelledError traceback during loop
+                # teardown. Instead we set should_exit so uvicorn unwinds via its
+                # main_loop and runs the full shutdown path (incl. lifespan).
+                if self._api_server is not None:
+                    self._api_server.should_exit = True
                 for task in self._tasks:
+                    if task.get_name() == "api_server":
+                        continue
                     task.cancel()
 
-                # Step 6: Wait for tasks to finish
+                # Step 6: Wait for tasks to finish (api_server exits cleanly;
+                # the rest unwind via cancellation above).
                 if self._tasks:
                     await asyncio.gather(*self._tasks, return_exceptions=True)
+
+                # One-shot background tasks are cancelled too, but they never
+                # kept the process alive.
+                for task in self._background_tasks:
+                    if not task.done():
+                        task.cancel()
+                if self._background_tasks:
+                    await asyncio.gather(*self._background_tasks, return_exceptions=True)
 
                 # Step 7: Close connections
                 if self._ch_writer:
                     await self._ch_writer.close()
                 if self._rest_client:
                     await self._rest_client.close()
+                if self._nonce_manager is not None and self._nonce_manager.info is not None:
+                    disconnect_websocket = getattr(self._nonce_manager.info, "disconnect_websocket", None)
+                    if callable(disconnect_websocket):
+                        with contextlib.suppress(Exception):
+                            await asyncio.to_thread(disconnect_websocket)
                 if self._pg_engine:
                     await self._pg_engine.dispose()
 

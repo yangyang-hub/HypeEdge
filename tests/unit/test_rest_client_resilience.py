@@ -68,6 +68,33 @@ async def test_funding_backfill_posts_flat_body() -> None:
     }
 
 
+async def test_info_request_retries_429_with_fresh_rate_budget_acquisition() -> None:
+    limiter = MagicMock()
+    limiter.acquire = AsyncMock()
+    client = RestClient(AppSettings(), EventBus(), limiter)
+    http_client = AsyncMock()
+    request = httpx.Request("POST", "https://api.hyperliquid-testnet.xyz/info")
+    throttled = MagicMock()
+    throttled.status_code = 429
+    throttled.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "rate limited",
+        request=request,
+        response=httpx.Response(429, request=request),
+    )
+    success = MagicMock()
+    success.raise_for_status.return_value = None
+    success.json.return_value = {"remaining": 9999}
+    http_client.post = AsyncMock(side_effect=[throttled, success])
+    client._ensure_client = AsyncMock(return_value=http_client)  # type: ignore[method-assign]
+
+    with patch("hypeedge.market_data.rest_client.asyncio.sleep", new=AsyncMock()):
+        result = await client.post_info("userRateLimit", {"user": "0xabc"})
+
+    assert result == {"remaining": 9999}
+    assert http_client.post.await_count == 2
+    assert limiter.acquire.await_count == 2
+
+
 async def test_candle_backfill_skips_empty_pages() -> None:
     """Sparse early history must advance past empty pages instead of exiting."""
     limiter = MagicMock()

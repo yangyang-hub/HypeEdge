@@ -267,6 +267,27 @@ class LiveMarketDataProvider:
 
     def _handle_funding(self, payload: Any) -> None:
         if isinstance(payload, FundingRate):
+            current = self._funding.get(payload.symbol)
+            if current is not None and payload.timestamp < current.timestamp:
+                logger.debug(
+                    "funding_snapshot_out_of_order_ignored",
+                    symbol=str(payload.symbol),
+                    incoming_ts=int(payload.timestamp),
+                    current_ts=int(current.timestamp),
+                )
+                return
+            if (
+                current is not None
+                and payload.timestamp == current.timestamp
+                and current.mark_price > 0
+                and payload.mark_price <= 0
+            ):
+                logger.debug(
+                    "funding_snapshot_lower_quality_ignored",
+                    symbol=str(payload.symbol),
+                    timestamp=int(payload.timestamp),
+                )
+                return
             self._funding[payload.symbol] = payload
 
     def _handle_candle(self, payload: Any) -> None:

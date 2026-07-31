@@ -36,6 +36,9 @@ DB `strategy_instances.strategy_type` CHECK 已预留 `trend_follow` / `legacy`�
 4. **配置权威**：实例参数以 Postgres 不可变配置版本为主；YAML / 环境 Settings 只保留安全默认与上限。
 5. **禁止**：按类型永久平行 create API；以无约束 JSONB 作为交易关键配置主存；强制所有策略走完整做市 shadow/drain 语义；前端可建但 runtime 仍以 YAML 为双主。
 
+统一控制面随完整 V2 `strategy_runner_v2` 交易链初始化，不依赖 `market_making_enabled`。后者只控制做市专用 quote worker
+与 RUNNING 执行能力，不能阻断 trend-follow / funding-arb 的实例、配置和生命周期管理。
+
 做市算法、quote plan、action budget 仍以 `docs/design.md` §18 与 `docs/market_making_design.md` 为准；本文只定义**多类型控制面与创建契约**。
 
 ## 3. 目标架构
@@ -93,7 +96,7 @@ flowchart TB
 |------|----------------|------|
 | `market_maker` | `stopped` / `shadow` / `running` / `paused`，并支持 `drain` | 完整做市语义；shadow 为决策/执行影子模式 |
 | `trend_follow` | `stopped` / `running` / `paused` | 不要求对外 shadow；启动时可短暂内部 `warming`（数据就绪），不作为独立产品态强加给 UI |
-| `funding_arb` | `stopped` / `running` / `paused` | 单所内对冲资金费套利；运行时为 stub，不支持 shadow/drain；执行能力后续补全（见 `docs/funding_arb_design.md`） |
+| `funding_arb` | `stopped` / `running` / `paused` | 单所内对冲资金费套利；testnet 可注入真实执行依赖，dev 为观察模式，mainnet 硬禁用；不支持 shadow/drain（见 `docs/funding_arb_design.md`） |
 
 CapabilityGate 规则：
 
@@ -242,13 +245,13 @@ P1/P2 完成后：
 
 ## 11. 验收标准
 
-- 前端可为 `market_maker` 与 `trend_follow` 创建实例，且均走 `POST /api/v1/strategies`。
+- 前端可为 `market_maker`、`trend_follow` 与 `funding_arb` 创建实例，且均走 `POST /api/v1/strategies`。
 - MM control plane 启用时，列表不再依赖「repository 关闭才露出 trend」的 fallback（P2 完成后）。
 - 同 `(sub_account, symbol)` 仍受 allocation 排他约束。
 - 配置变更只追加 version，可 activate / rollback；精确数值为 decimal string / `NUMERIC(38,18)`。
 - 对 `trend_follow` 调用 `drain` 或 `start` 目标为 `shadow` 时被 CapabilityGate 拒绝。
 - 新增第三种策略时，不必再改通用 create Dialog 壳与 Supervisor 核心状态机。
-- `funding_arb` 实例可经 `POST /api/v1/strategies` 创建，配置落 `funding_arb_config_versions`；对它调用 `drain` 或目标为 `shadow` 时被 CapabilityGate 拒绝；运行时为 stub（启停仅记录状态，不下单）。
+- `funding_arb` 实例可经 `POST /api/v1/strategies` 创建，配置落 `funding_arb_config_versions`；对它调用 `drain` 或目标为 `shadow` 时被 CapabilityGate 拒绝；只有满足 testnet、V2、安全门禁和账户对账条件时 runtime 才获得真实下单依赖。
 
 ## 12. 刻意不做
 

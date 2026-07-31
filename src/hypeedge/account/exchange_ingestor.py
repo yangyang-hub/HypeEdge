@@ -28,6 +28,8 @@ from hypeedge.core.types import Cloid, OrderId, Price, Size, StrategyId, SubAcco
 from hypeedge.storage.postgres import (
     ExchangeSyncCursorRecord,
     FillRecord,
+    FundingArbCycleRecord,
+    FundingPaymentRecord,
     InboxEventRecord,
     LedgerEntryRecord,
     OrderEvent,
@@ -77,6 +79,19 @@ def fill_external_id(fill: dict[str, Any]) -> str:
     return "fill:" + ":".join(str(fill.get(key, "")) for key in ("hash", "oid", "time", "coin", "side", "px", "sz"))
 
 
+def funding_external_id(update: dict[str, Any]) -> str:
+    delta = update.get("delta", {})
+    return "funding:" + ":".join(
+        str(value)
+        for value in (
+            update.get("hash", ""),
+            update.get("time", ""),
+            delta.get("coin", "") if isinstance(delta, dict) else "",
+            delta.get("usdc", "") if isinstance(delta, dict) else "",
+        )
+    )
+
+
 def fill_position_after(fill: dict[str, Any]) -> Decimal:
     start = _decimal(fill.get("startPosition"))
     signed_size = _decimal(fill.get("sz")) * (Decimal(1) if str(fill.get("side", "")).upper() == "B" else Decimal(-1))
@@ -104,8 +119,8 @@ def projected_entry_price(
 
 
 def _status(raw: Any) -> str:
-    value = str(raw or "").lower()
-    return {
+    value = str(raw or "").strip().lower().replace("_", "")
+    normalized = {
         "open": "acknowledged",
         "filled": "filled",
         "canceled": "cancelled",
@@ -113,7 +128,25 @@ def _status(raw: Any) -> str:
         "rejected": "rejected",
         "expired": "expired",
         "triggered": "acknowledged",
-    }.get(value, "acknowledged")
+    }.get(value)
+    if normalized is not None:
+        return normalized
+    if value.endswith(("canceled", "cancelled")) or value in {"ioccancel", "scheduledcancel"}:
+        return "cancelled"
+    if value.endswith("rejected"):
+        return "rejected"
+    return "acknowledged"
+
+
+def _order_from_status_response(response: Any) -> dict[str, Any] | None:
+    """Extract the exchange order payload from an ``orderStatus`` response."""
+    if not isinstance(response, dict) or response.get("status") != "order":
+        return None
+    wrapper = response.get("order")
+    if not isinstance(wrapper, dict):
+        return None
+    nested = wrapper.get("order")
+    return nested if isinstance(nested, dict) else wrapper
 
 
 @dataclass(frozen=True)
@@ -121,6 +154,7 @@ class IngestResult:
     processed: bool
     external_event_id: str
     fill_projection: CommittedFillProjection | None = None
+    funding_amount: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -139,10 +173,11 @@ class CommittedFillProjection:
     occurred_at: datetime
     strategy_id: str | None
     sub_account: str | None
-    position_size: Decimal
+    position_size: Decimal | None
     position_entry_price: Decimal | None
     position_mark_price: Decimal | None
     order_status: str
+    is_spot: bool = False
 
 
 class ExchangeFactProjector:
@@ -163,6 +198,9 @@ class ExchangeFactProjector:
 
             exchange_oid = str(fill["oid"])
             order = await self._find_or_create_order(session, exchange_oid, fill)
+            is_spot = bool(getattr(order, "is_spot", False)) or str(fill.get("coin", "")).startswith("@")
+            if is_spot and not bool(getattr(order, "is_spot", False)):
+                order.is_spot = True
             fill_id = uuid.uuid4()
             size = _decimal(fill["sz"])
             price = _decimal(fill["px"])
@@ -183,6 +221,7 @@ class ExchangeFactProjector:
                     fee=fee,
                     realized_pnl=realized_pnl,
                     is_maker=not bool(fill.get("crossed", False)),
+                    is_spot=is_spot,
                     strategy_id=order.strategy_id,
                     sub_account=order.sub_account or self._account,
                     occurred_at=occurred_at,
@@ -206,7 +245,11 @@ class ExchangeFactProjector:
                 if reservation.reserved_size == 0 or order.status == "filled":
                     reservation.status = "consumed"
                     reservation.released_at = occurred_at
-            position = await self._apply_fill_to_position(session, order, fill, price, realized_pnl, occurred_at)
+            position = (
+                None
+                if is_spot
+                else await self._apply_fill_to_position(session, order, fill, price, realized_pnl, occurred_at)
+            )
             for entry_type, amount in (("realized_pnl", realized_pnl), ("fee", -fee)):
                 session.add(
                     LedgerEntryRecord(
@@ -231,7 +274,8 @@ class ExchangeFactProjector:
                         "symbol": str(fill["coin"]),
                         "price": str(price),
                         "size": str(size),
-                        "position_size": str(position.size),
+                        "position_size": str(position.size) if position is not None else None,
+                        "is_spot": is_spot,
                     },
                     occurred_at=occurred_at,
                 )
@@ -256,9 +300,10 @@ class ExchangeFactProjector:
                 occurred_at=occurred_at,
                 strategy_id=order.strategy_id,
                 sub_account=order.sub_account or self._account,
-                position_size=position.size,
-                position_entry_price=position.entry_price,
-                position_mark_price=position.mark_price,
+                is_spot=is_spot,
+                position_size=position.size if position is not None else None,
+                position_entry_price=position.entry_price if position is not None else None,
+                position_mark_price=position.mark_price if position is not None else None,
                 order_status=order.status,
             ),
         )
@@ -283,6 +328,8 @@ class ExchangeFactProjector:
                 if collision is None:
                     order.legacy_cloid = order.cloid
                     order.cloid = actual_cloid
+                elif collision != getattr(order, "id", None):
+                    raise ValueError("exchange_order_cloid_collision")
             order.symbol = str(raw_order.get("coin", order.symbol))
             order.side = "buy" if str(raw_order.get("side", "B")).upper() == "B" else "sell"
             order.size = _decimal(raw_order.get("origSz", raw_order.get("sz", order.size)))
@@ -291,7 +338,6 @@ class ExchangeFactProjector:
             # Older open messages must never regress a terminal/fill projection.
             if order.status not in TERMINAL_STATUSES or event_status in TERMINAL_STATUSES:
                 order.status = event_status
-            order.filled_size = min(order.size, max(order.filled_size, order.size - _decimal(raw_order.get("sz"))))
             order.revision += 1
             if event_status in TERMINAL_STATUSES:
                 reservation = (
@@ -335,7 +381,56 @@ class ExchangeFactProjector:
             inbox = await session.get(InboxEventRecord, inbox_id)
             assert inbox is not None
             inbox.processed_at = _utcnow()
-        return IngestResult(True, external_id)
+            return IngestResult(True, external_id)
+
+    async def ingest_funding(self, update: dict[str, Any]) -> IngestResult:
+        external_id = funding_external_id(update)
+        payload_hash, payload = _canonical_payload(update)
+        delta = update.get("delta")
+        if not isinstance(delta, dict) or delta.get("type") != "funding":
+            raise ValueError("invalid_user_funding_update")
+        occurred_at = datetime.fromtimestamp(int(update["time"]) / 1000, tz=UTC)
+        symbol = str(delta.get("coin", ""))
+        if not symbol:
+            raise ValueError("user_funding_missing_coin")
+        amount = _decimal(delta.get("usdc"))
+        funding_rate = _decimal(delta.get("fundingRate"))
+        position_size = _decimal(delta.get("szi"))
+        async with self._session_factory() as session, session.begin():
+            inbox_id = await self._claim_inbox(session, external_id, "funding", payload_hash, payload)
+            if inbox_id is None:
+                return IngestResult(False, external_id)
+            cycle_id = await session.scalar(
+                select(FundingArbCycleRecord.cycle_id)
+                .where(
+                    FundingArbCycleRecord.strategy_id.is_not(None),
+                    FundingArbCycleRecord.sub_account == self._account,
+                    FundingArbCycleRecord.perp_symbol == symbol,
+                    FundingArbCycleRecord.created_at <= occurred_at,
+                    (FundingArbCycleRecord.closed_at.is_(None)) | (FundingArbCycleRecord.closed_at >= occurred_at),
+                )
+                .order_by(FundingArbCycleRecord.created_at.desc())
+                .limit(1)
+            )
+            session.add(
+                FundingPaymentRecord(
+                    payment_id=uuid.uuid4(),
+                    external_event_id=external_id,
+                    sub_account=self._account,
+                    cycle_id=cycle_id,
+                    symbol=symbol,
+                    amount=amount,
+                    funding_rate=funding_rate,
+                    position_size=position_size,
+                    occurred_at=occurred_at,
+                    raw_event=payload,
+                )
+            )
+            await self._advance_cursor(session, "funding", int(update["time"]), external_id)
+            inbox = await session.get(InboxEventRecord, inbox_id)
+            assert inbox is not None
+            inbox.processed_at = _utcnow()
+        return IngestResult(True, external_id, funding_amount=amount)
 
     async def _claim_inbox(
         self,
@@ -367,10 +462,22 @@ class ExchangeFactProjector:
         ).scalar_one_or_none()
         if order is not None:
             return order
+        raw_cloid = str(payload.get("cloid") or "")
+        if raw_cloid.startswith("0x") and len(raw_cloid) == 34:
+            order = (
+                await session.execute(select(OrderRecord).where(OrderRecord.cloid == raw_cloid).with_for_update())
+            ).scalar_one_or_none()
+            if order is not None:
+                if order.exchange_oid not in {None, exchange_oid}:
+                    raise ValueError("exchange_order_cloid_oid_conflict")
+                order.exchange_oid = exchange_oid
+                if str(payload.get("coin", "")).startswith("@"):
+                    order.is_spot = True
+                return order
         size = _decimal(payload.get("origSz", payload.get("sz")), "0.000000000000000001")
         if size <= 0:
             size = Decimal("0.000000000000000001")
-        cloid = str(payload.get("cloid") or "")
+        cloid = raw_cloid
         if not cloid.startswith("0x") or len(cloid) != 34:
             cloid = _synthetic_cloid(exchange_oid)
         order = OrderRecord(
@@ -385,11 +492,20 @@ class ExchangeFactProjector:
             price=_decimal(payload.get("limitPx")) or _decimal(payload.get("px")) or None,
             status="acknowledged",
             sub_account=self._account,
+            is_spot=str(payload.get("coin", "")).startswith("@"),
             revision=0,
         )
         session.add(order)
         await session.flush()
         return order
+
+    async def has_order(self, exchange_oid: str) -> bool:
+        """Return whether an exchange OID is already bound in the durable projection."""
+        async with self._session_factory() as session:
+            order_id = (
+                await session.execute(select(OrderRecord.order_id).where(OrderRecord.exchange_oid == exchange_oid))
+            ).scalar_one_or_none()
+            return order_id is not None
 
     async def _apply_fill_to_order(
         self,
@@ -407,7 +523,13 @@ class ExchangeFactProjector:
                 (previous_filled * (order.avg_fill_price or fill_price)) + (fill_size * fill_price)
             ) / (previous_filled + fill_size)
         order.filled_size = new_filled
-        order.status = "filled" if new_filled >= order.size else "partial_fill"
+        previous_status = order.status
+        if new_filled >= order.size:
+            order.status = "filled"
+        elif previous_status in {"cancelled", "rejected", "expired"}:
+            order.status = previous_status
+        else:
+            order.status = "partial_fill"
         order.filled_at = occurred_at if order.status == "filled" else None
         order.revision += 1
         session.add(
@@ -588,9 +710,30 @@ class ExchangeEventIngestor:
                     self._record_stream_failure("order_update_queue_overflow")
 
     async def recover_history(self) -> None:
+        end_ms = int(_utcnow().timestamp() * 1000)
+        # Establish oid/cloid ownership before replaying fills. Hyperliquid fill
+        # payloads do not always include cloid, so fill-first recovery can create
+        # a synthetic duplicate and lose strategy attribution after a crash.
+        orders = await asyncio.to_thread(self._info.historical_orders, self._account)
+        if not isinstance(orders, list):
+            raise RuntimeError("invalid_historical_orders_response")
+        order_cursor = await self._projector.cursor("orders")
+        if len(orders) >= 2000 and order_cursor:
+            oldest_ms = min(
+                int(item.get("statusTimestamp", item.get("order", {}).get("timestamp", 0))) for item in orders
+            )
+            if order_cursor < oldest_ms:
+                raise RuntimeError("historical_orders_gap_exceeds_exchange_retention")
+        for update in sorted(
+            orders,
+            key=lambda item: int(item.get("statusTimestamp", item.get("order", {}).get("timestamp", 0))),
+        ):
+            timestamp_ms = int(update.get("statusTimestamp", update.get("order", {}).get("timestamp", 0)))
+            if timestamp_ms >= order_cursor:
+                await self._projector.ingest_order_update(update)
+
         fill_cursor = await self._projector.cursor("fills")
         start_ms = max(0, fill_cursor - 1)
-        end_ms = int(_utcnow().timestamp() * 1000)
         while start_ms <= end_ms:
             fills = await asyncio.to_thread(
                 self._info.user_fills_by_time,
@@ -613,28 +756,44 @@ class ExchangeEventIngestor:
                 raise RuntimeError("user_fills_history_cursor_not_advancing")
             start_ms = latest_ms
 
-        orders = await asyncio.to_thread(self._info.historical_orders, self._account)
-        if not isinstance(orders, list):
-            raise RuntimeError("invalid_historical_orders_response")
-        order_cursor = await self._projector.cursor("orders")
-        if len(orders) >= 2000 and order_cursor:
-            oldest_ms = min(
-                int(item.get("statusTimestamp", item.get("order", {}).get("timestamp", 0))) for item in orders
+        if callable(getattr(type(self._info), "user_funding_history", None)):
+            funding_cursor = await self._projector.cursor("funding")
+            funding_updates = await asyncio.to_thread(
+                self._info.user_funding_history,
+                self._account,
+                max(0, funding_cursor - 1),
+                end_ms,
             )
-            if order_cursor < oldest_ms:
-                raise RuntimeError("historical_orders_gap_exceeds_exchange_retention")
-        for update in sorted(
-            orders,
-            key=lambda item: int(item.get("statusTimestamp", item.get("order", {}).get("timestamp", 0))),
-        ):
-            timestamp_ms = int(update.get("statusTimestamp", update.get("order", {}).get("timestamp", 0)))
-            if timestamp_ms >= order_cursor:
-                await self._projector.ingest_order_update(update)
+            if not isinstance(funding_updates, list):
+                raise RuntimeError("invalid_user_funding_history_response")
+            for update in sorted(funding_updates, key=lambda item: int(item.get("time", 0))):
+                result = await self._projector.ingest_funding(update)
+                if result.processed and result.funding_amount is not None and self._tracker is not None:
+                    self._tracker.apply_funding(Usd(result.funding_amount))
         self._history_recovered = True
 
     async def _ingest_fill(self, fill_payload: dict[str, Any]) -> IngestResult:
         """Commit a fill, then update process projections and publish its domain event."""
-        result = await self._projector.ingest_fill(fill_payload)
+        payload = dict(fill_payload)
+        exchange_oid = str(payload.get("oid", ""))
+        raw_cloid = str(payload.get("cloid") or "")
+        if exchange_oid and (not raw_cloid.startswith("0x") or len(raw_cloid) != 34):
+            has_order = getattr(type(self._projector), "has_order", None)
+            order_known = await self._projector.has_order(exchange_oid) if callable(has_order) else True
+            if not order_known:
+                query_by_oid = getattr(self._info, "query_order_by_oid", None)
+                if callable(query_by_oid):
+                    response = await asyncio.to_thread(query_by_oid, self._account, int(exchange_oid))
+                    exchange_order = _order_from_status_response(response)
+                    if exchange_order is not None:
+                        payload.update(
+                            {
+                                key: value
+                                for key, value in exchange_order.items()
+                                if key in {"cloid", "origSz", "limitPx"} and value is not None
+                            }
+                        )
+        result = await self._projector.ingest_fill(payload)
         if self._tracker is None and self._engine is None and self._event_bus is None:
             return result
         projection = result.fill_projection
@@ -653,16 +812,23 @@ class ExchangeEventIngestor:
             timestamp=Timestamp(int(projection.occurred_at.timestamp() * 1000)),
             strategy_id=StrategyId(projection.strategy_id) if projection.strategy_id else None,
             sub_account=SubAccount(projection.sub_account) if projection.sub_account else None,
+            is_spot=projection.is_spot,
         )
-        position = Position(
-            symbol=fill.symbol,
-            size=Size(projection.position_size),
-            entry_price=Price(projection.position_entry_price) if projection.position_entry_price is not None else None,
-            mark_price=Price(projection.position_mark_price)
-            if projection.position_mark_price is not None
-            else fill.price,
-            sub_account=fill.sub_account,
-            strategy_id=fill.strategy_id,
+        position = (
+            None
+            if projection.is_spot
+            else Position(
+                symbol=fill.symbol,
+                size=Size(projection.position_size or 0),
+                entry_price=Price(projection.position_entry_price)
+                if projection.position_entry_price is not None
+                else None,
+                mark_price=Price(projection.position_mark_price)
+                if projection.position_mark_price is not None
+                else fill.price,
+                sub_account=fill.sub_account,
+                strategy_id=fill.strategy_id,
+            )
         )
         if self._tracker is not None:
             self._tracker.apply_authoritative_fill(projection.external_event_id, fill, position)

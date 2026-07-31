@@ -262,7 +262,7 @@ class MarketMakingRepositoryFacade:
         metadata: Mapping[str, Any] | None = None,
         strategy_type: str = "market_maker",
     ) -> dict[str, Any]:
-        create = self._repository.create_strategy_instance
+        create = cast(Any, self._repository).create_strategy_instance
         view = await create(
             strategy_id=strategy_id,
             sub_account=sub_account,

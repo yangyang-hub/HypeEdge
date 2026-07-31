@@ -19,7 +19,7 @@ from typing import Protocol
 import structlog
 
 from hypeedge.account.tracker import AccountTracker
-from hypeedge.core.models import AccountState, Position
+from hypeedge.core.models import AccountState, Position, SpotBalance
 from hypeedge.core.types import Price, Size, SubAccount, Symbol, Usd
 
 logger = structlog.get_logger(__name__)
@@ -256,6 +256,7 @@ class PolledAccountSnapshot:
     account_state: AccountState
     positions: tuple[Position, ...]
     received_at: datetime
+    spot_balances: tuple[SpotBalance, ...] = ()
 
 
 class AccountStateSource(Protocol):
@@ -316,6 +317,7 @@ class AccountStatePoller:
                 equity=float(snapshot.account_state.equity),
                 available_balance=float(snapshot.account_state.available_balance),
                 positions=len(snapshot.positions),
+                spot_balances=len(snapshot.spot_balances),
                 near_risk=near_risk,
                 next_interval_seconds=interval,
             )
@@ -365,12 +367,15 @@ class AccountStatePoller:
                 self._tracker.update_position_from_exchange(position.symbol, position)
         for missing_symbol in current_symbols - exchange_symbols:
             self._tracker.remove_position(missing_symbol)
+        self._tracker.update_spot_balances(snapshot.spot_balances, observed_at=snapshot.received_at)
 
 
 class ClearinghouseRestClient(Protocol):
     """Narrow REST client boundary needed by the account-state adapter."""
 
     async def get_clearinghouse_state(self, user: str) -> dict[str, object]: ...
+
+    async def get_spot_user_state(self, user: str) -> dict[str, object]: ...
 
 
 class RestAccountStateSource:
@@ -384,7 +389,15 @@ class RestAccountStateSource:
         self._tracker = tracker
 
     async def fetch_account_state(self) -> PolledAccountSnapshot:
-        raw = await self._client.get_clearinghouse_state(self._account_address)
+        spot_fetch = getattr(self._client, "get_spot_user_state", None)
+        if callable(spot_fetch):
+            raw, spot_raw = await asyncio.gather(
+                self._client.get_clearinghouse_state(self._account_address),
+                spot_fetch(self._account_address),
+            )
+        else:
+            raw = await self._client.get_clearinghouse_state(self._account_address)
+            spot_raw = {"balances": []}
         margin_summary = raw.get("marginSummary")
         asset_positions = raw.get("assetPositions")
         if not isinstance(margin_summary, dict) or not isinstance(asset_positions, list):
@@ -396,6 +409,7 @@ class RestAccountStateSource:
         margin_used_raw = margin_summary.get("totalMarginUsed", max(0.0, account_value - available))
         margin_used = _as_float(margin_used_raw, "totalMarginUsed")
         positions = tuple(self._parse_position(item) for item in asset_positions)
+        spot_balances = self._parse_spot_balances(spot_raw)
         unrealized = sum(float(position.unrealized_pnl or Usd(0.0)) for position in positions)
         state = AccountState(
             equity=Usd(account_value),
@@ -405,7 +419,40 @@ class RestAccountStateSource:
             peak_equity=max(self._tracker.peak_equity, Usd(account_value)),
             sub_account=SubAccount(self._account_address.lower()),
         )
-        return PolledAccountSnapshot(state, positions, datetime.now(UTC))
+        received_at = datetime.now(UTC)
+        normalized_spot = tuple(
+            SpotBalance(
+                token=balance.token,
+                total=balance.total,
+                hold=balance.hold,
+                entry_ntl=balance.entry_ntl,
+                sub_account=balance.sub_account,
+                updated_at=received_at,
+            )
+            for balance in spot_balances
+        )
+        return PolledAccountSnapshot(state, positions, received_at, normalized_spot)
+
+    def _parse_spot_balances(self, raw: object) -> tuple[SpotBalance, ...]:
+        if not isinstance(raw, dict) or not isinstance(raw.get("balances"), list):
+            raise ValueError("invalid_spot_clearinghouse_state_response")
+        balances: list[SpotBalance] = []
+        for item in raw["balances"]:
+            if not isinstance(item, dict):
+                raise ValueError("invalid_spot_balance")
+            token = item.get("coin", item.get("token"))
+            if not isinstance(token, str) or not token:
+                raise ValueError("spot_balance_missing_token")
+            balances.append(
+                SpotBalance(
+                    token=token,
+                    total=Size(_as_float(item.get("total", 0), "spot.total")),
+                    hold=Size(_as_float(item.get("hold", 0), "spot.hold")),
+                    entry_ntl=Usd(_as_float(item.get("entryNtl", 0), "spot.entryNtl")),
+                    sub_account=SubAccount(self._account_address.lower()),
+                )
+            )
+        return tuple(balances)
 
     def _parse_position(self, item: object) -> Position:
         if not isinstance(item, dict) or not isinstance(item.get("position"), dict):

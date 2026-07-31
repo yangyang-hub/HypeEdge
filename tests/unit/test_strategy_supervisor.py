@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
+
 import pytest
 
 from hypeedge.core.enums import MarketMakerLifecycle
@@ -113,6 +115,37 @@ async def test_desired_config_precedes_effective_config() -> None:
     runtime = await supervisor.activate_config(sid, 3)
     assert runtime.effective_config_revision == 3
     assert handles[0].calls[-1] == "config:3"
+
+
+@pytest.mark.asyncio
+async def test_plugin_validation_rejects_legacy_invalid_config_before_activation() -> None:
+    from hypeedge.storage.market_making import default_funding_arb_config
+    from hypeedge.strategy.funding_arb import build_funding_arb_plugin
+
+    store = InMemoryStrategyStateStore()
+    sid = StrategyId("fa-1")
+    valid = default_funding_arb_config()
+    invalid = {**valid, "entry_funding_rate": Decimal("0")}
+    await store.add_instance(
+        StrategyInstanceDefinition(
+            strategy_id=sid,
+            strategy_type="funding_arb",
+            sub_account=SubAccount("sub-1"),
+            symbol=Symbol("BTC"),
+        ),
+        [
+            StrategyConfigSnapshot(sid, 1, valid),
+            StrategyConfigSnapshot(sid, 2, invalid),
+        ],
+    )
+    registry = StrategyRegistry()
+    registry.register_plugin(build_funding_arb_plugin())
+    supervisor = StrategySupervisor(registry, store, InMemoryStrategyAllocationManager())
+
+    with pytest.raises(StrategyRegistrationError, match="entry_funding_rate"):
+        await supervisor.activate_config(sid, 2)
+
+    assert (await store.get_instance(sid)).desired_config_revision == 1
 
 
 @pytest.mark.asyncio

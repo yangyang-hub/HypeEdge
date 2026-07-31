@@ -6,7 +6,7 @@ import asyncio
 import json
 import time
 from datetime import UTC, datetime
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
 import websockets
@@ -27,6 +27,9 @@ from hypeedge.core.models import Candle, FundingRate, Trade
 from hypeedge.core.types import Price, Size, Symbol, Timestamp
 from hypeedge.market_data.book import BookManager
 
+if TYPE_CHECKING:
+    from hypeedge.market_data.instrument_cache import InstrumentMetaCache
+
 logger = structlog.get_logger(__name__)
 
 
@@ -42,12 +45,28 @@ class WebSocketFeed:
     - Latency measurement (exchange ts vs local ts)
     """
 
-    def __init__(self, settings: AppSettings, event_bus: EventBus) -> None:
+    def __init__(
+        self,
+        settings: AppSettings,
+        event_bus: EventBus,
+        *,
+        spot_resolver: InstrumentMetaCache | None = None,
+    ) -> None:
         self._settings = settings
         self._event_bus = event_bus
         self._ws_url = settings.exchange.ws_url
         self._coins = [Symbol(c) for c in settings.market_data.coins]
-        self._spot_coins = [Symbol(c) for c in settings.market_data.spot_coins]
+        self._spot_coins: list[Symbol] = []
+        for configured in settings.market_data.spot_coins:
+            if configured.startswith("@"):
+                self._spot_coins.append(Symbol(configured))
+                continue
+            if spot_resolver is None:
+                raise ValueError(f"spot metadata resolver is required for display market {configured}")
+            info = spot_resolver.resolve_spot(configured)
+            if info is None:
+                raise ValueError(f"unknown Hyperliquid spot market: {configured}")
+            self._spot_coins.append(info.symbol)
         self._channels = settings.market_data.ws_subscriptions
         self._candle_intervals = settings.market_data.candle_intervals
         self._book_manager = BookManager(depth=settings.market_data.l2_book_depth)

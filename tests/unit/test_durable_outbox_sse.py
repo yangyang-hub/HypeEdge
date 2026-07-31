@@ -293,6 +293,7 @@ async def test_reconciliation_result_and_outbox_event_share_transaction() -> Non
         errors=["exchange_timeout"],
         diffs=[],
         exchange_positions={},
+        exchange_spot_balances={},
         exchange_account=None,
     )
 

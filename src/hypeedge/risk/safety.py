@@ -59,7 +59,7 @@ class SafetyController:
         """Reject placements not permitted by the current lifecycle mode."""
         if self.mode == SafetyMode.NORMAL:
             return
-        if self.mode == SafetyMode.REDUCE_ONLY and intent.reduce_only:
+        if self.mode == SafetyMode.REDUCE_ONLY and (intent.reduce_only or intent.risk_reducing):
             return
         if self.mode in {SafetyMode.HALTING, SafetyMode.HALTED}:
             raise KillSwitchTriggeredError(reason=self.reason)

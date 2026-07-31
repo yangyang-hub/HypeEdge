@@ -498,7 +498,9 @@ class TestExecutionFailureModes:
         [
             ("filled", OrderStatus.FILLED),
             ("cancelled", OrderStatus.CANCELLED),
+            ("iocCancel", OrderStatus.CANCELLED),
             ("margincanceled", OrderStatus.REJECTED),
+            ("insufficientSpotBalanceRejected", OrderStatus.REJECTED),
             ("open", OrderStatus.ACKNOWLEDGED),
         ],
     )
@@ -512,7 +514,10 @@ class TestExecutionFailureModes:
         manager = MagicMock(exchange=MagicMock())
         manager.submit = AsyncMock(return_value={"status": "order", "order": {"status": exchange_status}})
         engine = ExecutionEngine(manager, bus, KillSwitch(bus))
-        assert (await engine.submit_order(_intent())).status == expected
+        order = await engine.submit_order(_intent())
+        assert order.status == expected
+        if expected == OrderStatus.FILLED:
+            assert order.filled_size == Size(0)
 
     @pytest.mark.asyncio
     async def test_success_without_detailed_status_is_acknowledged(self) -> None:

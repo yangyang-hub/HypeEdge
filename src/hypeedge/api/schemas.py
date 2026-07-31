@@ -267,13 +267,31 @@ class TrendFollowConfigVersionCreateRequest(StrictModel):
 
 
 class FundingArbConfigCreateRequest(StrictModel):
-    spot_coin: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9@_.:-]+$")
-    entry_funding_rate: DecimalString = Field(default=Decimal("0.0001"), ge=0)
+    spot_coin: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=r"^(?:@[0-9]+|[A-Za-z0-9_.:-]+/[A-Za-z0-9_.:-]+)$",
+    )
+    entry_funding_rate: DecimalString = Field(default=Decimal("0.0001"), gt=0)
     exit_funding_rate: DecimalString = Field(default=Decimal("0"), ge=0)
     max_notional_usd: DecimalString = Field(default=Decimal("1000"), gt=0)
     hedge_ratio: DecimalString = Field(default=Decimal("1"), gt=0, le=1)
     rebalance_threshold_bps: int = Field(default=50, gt=0, le=1_000_000)
     leverage: DecimalString = Field(default=Decimal("1"), gt=0)
+    max_slippage_bps: int = Field(default=50, ge=1, le=500)
+    max_basis_bps: int = Field(default=500, gt=0, le=100_000)
+    min_expected_edge_bps: DecimalString = Field(default=Decimal("5"), ge=0)
+    expected_hold_hours: int = Field(default=8, ge=1, le=168)
+    round_trip_fee_bps: DecimalString = Field(default=Decimal("20"), ge=0)
+    max_unhedged_seconds: int = Field(default=15, ge=1, le=60)
+
+    @model_validator(mode="after")
+    def validate_rate_hysteresis(self) -> FundingArbConfigCreateRequest:
+        if self.exit_funding_rate >= self.entry_funding_rate:
+            raise ValueError("exit_funding_rate must be < entry_funding_rate")
+        if self.leverage != self.leverage.to_integral_value():
+            raise ValueError("leverage must be an integer")
+        return self
 
 
 class FundingArbConfigVersionCreateRequest(StrictModel):

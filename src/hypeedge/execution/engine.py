@@ -15,6 +15,7 @@ import time
 import uuid
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from decimal import Decimal
 from typing import TYPE_CHECKING, Any, Protocol
 
 import structlog
@@ -40,6 +41,7 @@ if TYPE_CHECKING:
     from hypeedge.execution.durable import DurableExecutionCommand, DurableOrderStore
     from hypeedge.execution.nonce import NonceManager
     from hypeedge.execution.normalizer import OrderNormalizer
+    from hypeedge.market_data.instrument_cache import InstrumentMetaCache
     from hypeedge.market_data.provider import MarketDataProvider
     from hypeedge.market_data.rate_limiter import RateLimiter
     from hypeedge.risk.checker import RiskChecker
@@ -55,6 +57,20 @@ _TIF_MAP: dict[str, str] = {
     TimeInForce.ALO: "Alo",
     TimeInForce.GTX: "Gtx",
 }
+
+
+def _terminal_exchange_status(raw: Any) -> OrderStatus | None:
+    """Classify documented Hyperliquid terminal order-status variants."""
+    value = str(raw or "").strip().lower().replace("_", "")
+    if value == "filled":
+        return OrderStatus.FILLED
+    if value == "margincanceled" or value == "rejected" or value.endswith("rejected"):
+        return OrderStatus.REJECTED
+    if value in {"canceled", "cancelled", "ioccancel", "scheduledcancel"} or value.endswith(("canceled", "cancelled")):
+        return OrderStatus.CANCELLED
+    if value == "expired":
+        return OrderStatus.EXPIRED
+    return None
 
 
 class ExecutionClient(Protocol):
@@ -83,6 +99,14 @@ class ExecutionClient(Protocol):
         """Get all open (non-terminal) orders."""
         ...
 
+    async def refresh_order_from_durable(self, cloid: str) -> Order | None:
+        """Refresh an authenticated/durable order projection."""
+        ...
+
+    async def update_leverage(self, symbol: str, leverage: int, *, is_cross: bool) -> Any:
+        """Set leverage through the serialized signing boundary."""
+        ...
+
 
 class ExecutionEngine:
     """Real execution engine that submits orders to Hyperliquid.
@@ -109,6 +133,8 @@ class ExecutionEngine:
         market_price_stale_seconds: float = 5.0,
         durable_kill_trigger: Callable[[str], Awaitable[bool]] | None = None,
         order_normalizer: OrderNormalizer | None = None,
+        instrument_cache: InstrumentMetaCache | None = None,
+        spot_execution_enabled: bool = False,
     ) -> None:
         self._nonce = nonce_manager
         self._event_bus = event_bus
@@ -125,6 +151,8 @@ class ExecutionEngine:
         self._market_price_stale_seconds = market_price_stale_seconds
         self._durable_kill_trigger = durable_kill_trigger
         self._order_normalizer = order_normalizer
+        self._instrument_cache = instrument_cache
+        self._spot_execution_enabled = spot_execution_enabled
         self._orders: dict[Cloid, Order] = {}
 
     async def submit_order(self, intent: OrderIntent, *, deferred: bool | None = None) -> Order:
@@ -139,8 +167,27 @@ class ExecutionEngine:
         6. Handle response → ACKNOWLEDGED or REJECTED
         7. Publish lifecycle events
         """
+        if intent.is_spot and not self._spot_execution_enabled:
+            raise OrderRejectedError(
+                "Hyperliquid spot execution is not enabled for this deployment",
+                cloid=str(intent.cloid or ""),
+                reason="spot_execution_not_enabled",
+            )
+        if intent.is_spot and intent.reduce_only:
+            raise OrderRejectedError(
+                "Spot orders cannot use reduce_only",
+                cloid=str(intent.cloid or ""),
+                reason="spot_reduce_only_invalid",
+            )
+        if intent.risk_reducing and not (intent.reduce_only or (intent.is_spot and intent.side == Side.SELL)):
+            raise OrderRejectedError(
+                "risk_reducing is valid only for perp reduce-only or spot sell orders",
+                cloid=str(intent.cloid or ""),
+                reason="invalid_risk_reducing_intent",
+            )
+
         deferred_execution = self._deferred_execution if deferred is None else deferred
-        if self._order_normalizer is not None and not intent.is_spot:
+        if self._order_normalizer is not None:
             best_bid: Price | None = None
             best_ask: Price | None = None
             if self._market_data_provider is not None:
@@ -166,6 +213,8 @@ class ExecutionEngine:
             cloid=cloid,
             client_id=intent.client_id,
             is_spot=intent.is_spot,
+            risk_reducing=intent.risk_reducing,
+            max_slippage_bps=intent.max_slippage_bps,
         )
 
         # Idempotency precedes every new-placement gate: replaying an already
@@ -223,6 +272,20 @@ class ExecutionEngine:
             )
             return order
 
+        if intent.is_spot:
+            spot_rejection = self._spot_balance_rejection(intent, reference_price)
+            if spot_rejection is not None:
+                risk_result = RiskCheckResult(False, spot_rejection, ["spot_balance"])
+                order = self._rejected_order(intent, spot_rejection)
+                await self._persist_placement(
+                    order,
+                    risk_result,
+                    dispatch=False,
+                    reference_price=reference_price,
+                    price_observed_at=price_observed_at,
+                )
+                return order
+
         risk_result = RiskCheckResult(passed=True)
         if self._risk_checker is not None:
             risk_result = await self._risk_checker.check(intent, reference_price=reference_price)
@@ -265,6 +328,9 @@ class ExecutionEngine:
             strategy_id=intent.strategy_id,
             sub_account=intent.sub_account,
             reduce_only=intent.reduce_only,
+            is_spot=intent.is_spot,
+            risk_reducing=intent.risk_reducing,
+            max_slippage_bps=intent.max_slippage_bps,
             created_at=datetime.now(UTC),
         )
         self._orders[cloid] = order
@@ -273,14 +339,18 @@ class ExecutionEngine:
         self._state_machine.transition(order, OrderStatus.SUBMITTED, reason="submit_order")
         order.submitted_at = datetime.now(UTC)
         command_id = uuid.uuid4()
-        durable_risk = await self._persist_placement(
-            order,
-            risk_result,
-            command_id=command_id,
-            dispatch=True,
-            reference_price=reference_price,
-            price_observed_at=price_observed_at,
-        )
+        try:
+            durable_risk = await self._persist_placement(
+                order,
+                risk_result,
+                command_id=command_id,
+                dispatch=True,
+                reference_price=reference_price,
+                price_observed_at=price_observed_at,
+            )
+        except Exception:
+            self._orders.pop(cloid, None)
+            raise
         if durable_risk is not None and not durable_risk.passed:
             order.status = OrderStatus.REJECTED
             order.error_message = durable_risk.reason
@@ -488,6 +558,9 @@ class ExecutionEngine:
             sub_account=order.sub_account,
             reduce_only=order.reduce_only,
             cloid=order.cloid,
+            is_spot=order.is_spot,
+            risk_reducing=order.risk_reducing,
+            max_slippage_bps=order.max_slippage_bps,
         )
 
     async def cancel_order(self, cloid: str) -> bool:
@@ -563,16 +636,17 @@ class ExecutionEngine:
         if top_status == "order":
             order_data = response.get("order", {})
             exchange_status = str(order_data.get("status", "")).lower() if isinstance(order_data, dict) else ""
-            if exchange_status in {"canceled", "cancelled"}:
+            terminal_status = _terminal_exchange_status(exchange_status)
+            if terminal_status == OrderStatus.CANCELLED:
                 return await self._mark_cancelled(order, "cancel_status_confirmed", command_id=command_id)
-            if exchange_status == "filled":
+            if terminal_status == OrderStatus.FILLED:
                 self._state_machine.transition(order, OrderStatus.FILLED, reason="cancel_status_filled")
                 order.filled_at = datetime.now(UTC)
                 order.error_message = "cancel_not_applied_order_filled"
                 await self._persist_transition(order, "filled", command_id=command_id, command_status="failed")
                 logger.warning("cancel_order_already_filled", cloid=cloid)
                 return False
-            if exchange_status in {"rejected", "margincanceled"}:
+            if terminal_status in {OrderStatus.REJECTED, OrderStatus.EXPIRED}:
                 self._state_machine.transition(order, OrderStatus.REJECTED, reason="cancel_status_rejected")
                 order.error_message = "cancel_not_applied_order_rejected"
                 await self._persist_transition(order, "rejected", command_id=command_id, command_status="failed")
@@ -683,36 +757,10 @@ class ExecutionEngine:
         def preflight() -> None:
             self._placement_preflight(intent)
 
-        # Spot orders route exclusively through exchange.order: market_open /
-        # market_close infer direction from the perp user_state and do not apply
-        # to the spot book, and spot has no reduce-only concept (positions are
-        # token balances). A spot "market" is an IoC limit at a caller-provided
-        # aggressive price (the SDK has no perp-free spot market helper).
-        if intent.is_spot:
-            if intent.price is None:
-                raise OrderRejectedError(
-                    "Spot orders require an explicit price",
-                    cloid=cloid_hint,
-                    reason="spot_order_requires_price",
-                )
-            tif = "Ioc" if intent.order_type == OrderType.MARKET else _TIF_MAP.get(str(intent.time_in_force), "Gtc")
-            return await self._nonce.submit(
-                exchange.order,
-                name,
-                is_buy,
-                sz,
-                float(intent.price),
-                {"limit": {"tif": tif}},
-                False,  # reduce_only is invalid for spot
-                sdk_cloid,
-                cloid_hint=cloid_hint,
-                preflight_check=preflight,
-            )
-
         # Price: for market orders use a very aggressive price
         if intent.order_type == OrderType.MARKET:
             # Market order: use IoC with a very aggressive limit price
-            order_type: dict[str, Any] = {"limit": {"tif": "Ioc"}}  # SDK market_open/market_close handle price calc
+            slippage = intent.max_slippage_bps / 10_000
             if intent.reduce_only:
                 # market_close derives the safe side from the exchange position and
                 # always sends reduce-only semantics in the SDK.
@@ -721,7 +769,7 @@ class ExecutionEngine:
                     name,
                     sz,
                     px=None,
-                    slippage=0.05,
+                    slippage=slippage,
                     cloid=sdk_cloid,
                     cloid_hint=cloid_hint,
                     preflight_check=preflight,
@@ -732,7 +780,7 @@ class ExecutionEngine:
                 is_buy,
                 sz,
                 px=None,
-                slippage=0.05,
+                slippage=slippage,
                 cloid=sdk_cloid,
                 cloid_hint=cloid_hint,
                 preflight_check=preflight,
@@ -759,12 +807,70 @@ class ExecutionEngine:
         self._kill_switch.check()
         if self._safety is not None:
             self._safety.check_placement(intent)
+        if intent.is_spot:
+            reference_price: float | None = float(intent.price) if intent.price is not None else None
+            if reference_price is None and self._market_data_provider is not None:
+                snapshot = self._market_data_provider.get_price_snapshot(intent.symbol)
+                reference_price = snapshot.price if snapshot is not None else None
+            rejection = self._spot_balance_rejection(intent, reference_price)
+            if rejection is not None:
+                raise OrderRejectedError(rejection, cloid=str(intent.cloid or ""), reason=rejection)
         if self._rate_limiter is not None and not self._rate_limiter.check_action_credits():
             raise OrderRejectedError(
                 "Action credits are stale or below the low watermark",
                 cloid=str(intent.cloid or ""),
                 reason="action_credits_below_threshold",
             )
+
+    def _spot_balance_rejection(self, intent: OrderIntent, reference_price: float | None) -> str | None:
+        if not intent.is_spot:
+            return None
+        if self._instrument_cache is None or self._tracker is None:
+            return "spot_risk_dependencies_unavailable"
+        info = self._instrument_cache.resolve_spot(intent.symbol)
+        if info is None or info.base_token is None or info.quote_token is None:
+            return "spot_metadata_unavailable"
+        if self._tracker.last_spot_update_ts is None:
+            return "spot_balances_not_available"
+        if intent.side == Side.BUY:
+            if reference_price is None or reference_price <= 0:
+                return "spot_reference_price_not_available"
+            quote = self._tracker.get_spot_balance(info.quote_token)
+            available = quote.available if quote is not None else Size(0)
+            slippage_multiplier = Decimal(10_000 + intent.max_slippage_bps) / Decimal(10_000)
+            required = intent.size * Price(reference_price) * slippage_multiplier
+            if available < required:
+                return "insufficient_spot_quote_balance"
+            return None
+        base = self._tracker.get_spot_balance(info.base_token)
+        available = base.available if base is not None else Size(0)
+        if available < intent.size:
+            return "insufficient_spot_base_balance"
+        return None
+
+    async def update_leverage(self, symbol: str, leverage: int, *, is_cross: bool = False) -> Any:
+        """Serialize a leverage update and re-check global safety immediately before signing."""
+        if leverage <= 0:
+            raise ValueError("leverage must be positive")
+        exchange = self._nonce.exchange
+        if exchange is None:
+            raise ExecutionError("No Exchange instance available")
+
+        def preflight() -> None:
+            self._kill_switch.check()
+            if self._safety is not None and self._safety.mode.value != "normal":
+                raise OrderRejectedError(
+                    f"Trading mode {self._safety.mode.value} does not permit leverage updates",
+                    reason=f"safety_mode_{self._safety.mode.value}",
+                )
+
+        return await self._nonce.submit(
+            exchange.update_leverage,
+            leverage,
+            symbol,
+            is_cross,
+            preflight_check=preflight,
+        )
 
     async def _handle_risk_rejection(self, reason: str | None) -> None:
         if not reason:
@@ -793,6 +899,9 @@ class ExecutionEngine:
             and order.strategy_id == intent.strategy_id
             and order.sub_account == intent.sub_account
             and order.reduce_only == intent.reduce_only
+            and order.is_spot == intent.is_spot
+            and order.risk_reducing == intent.risk_reducing
+            and order.max_slippage_bps == intent.max_slippage_bps
         )
 
     @staticmethod
@@ -815,6 +924,9 @@ class ExecutionEngine:
             strategy_id=intent.strategy_id,
             sub_account=intent.sub_account,
             reduce_only=intent.reduce_only,
+            is_spot=intent.is_spot,
+            risk_reducing=intent.risk_reducing,
+            max_slippage_bps=intent.max_slippage_bps,
             error_message=reason,
         )
         self._orders[order.cloid] = order
@@ -868,6 +980,7 @@ class ExecutionEngine:
                                     timestamp=Timestamp(int(time.time() * 1000)),
                                     strategy_id=order.strategy_id,
                                     sub_account=order.sub_account,
+                                    is_spot=order.is_spot,
                                 ),
                                 provisional=True,
                             )
@@ -915,15 +1028,15 @@ class ExecutionEngine:
                 # orderStatus lookup after an uncertain submission.
                 status_data = response.get("order", {})
                 exchange_status = str(status_data.get("status", "")).lower()
-                if exchange_status == "filled":
+                terminal_status = _terminal_exchange_status(exchange_status)
+                if terminal_status == OrderStatus.FILLED:
                     self._state_machine.transition(order, OrderStatus.FILLED, reason="status_query_filled")
-                    order.filled_size = order.size
                     order.filled_at = datetime.now(UTC)
                     await self._persist_transition(order, "filled", command_id=command_id, command_status="succeeded")
                     self._event_bus.publish_sync(
                         Event(event_type=EVENT_ORDER_FILLED, payload=order, correlation_id=cloid)
                     )
-                elif exchange_status in {"canceled", "cancelled"}:
+                elif terminal_status == OrderStatus.CANCELLED:
                     self._state_machine.transition(order, OrderStatus.CANCELLED, reason="status_query_cancelled")
                     await self._persist_transition(
                         order, "cancelled", command_id=command_id, command_status="succeeded"
@@ -931,7 +1044,7 @@ class ExecutionEngine:
                     self._event_bus.publish_sync(
                         Event(event_type=EVENT_ORDER_CANCELLED, payload=order, correlation_id=cloid)
                     )
-                elif exchange_status in {"rejected", "margincanceled"}:
+                elif terminal_status in {OrderStatus.REJECTED, OrderStatus.EXPIRED}:
                     self._state_machine.transition(order, OrderStatus.REJECTED, reason="status_query_rejected")
                     await self._persist_transition(order, "rejected", command_id=command_id, command_status="failed")
                     self._event_bus.publish_sync(

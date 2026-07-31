@@ -118,11 +118,13 @@ async def test_restart_recovery_replays_cursor_overlap_for_inbox_dedup() -> None
     info = MagicMock()
     info.user_fills_by_time.return_value = [_fill(time=1000)]
     info.historical_orders.return_value = []
+    info.user_funding_history.return_value = []
     ingestor = ExchangeEventIngestor(info, "0xAccount", MagicMock())
     projector = MagicMock()
-    projector.cursor = AsyncMock(side_effect=[1000, 0])
+    projector.cursor = AsyncMock(side_effect=[0, 1000])
     projector.ingest_fill = AsyncMock()
     projector.ingest_order_update = AsyncMock()
+    projector.ingest_funding = AsyncMock()
     ingestor._projector = projector
 
     await ingestor.recover_history()
@@ -139,13 +141,44 @@ async def test_restart_fails_closed_when_order_history_has_retention_gap() -> No
     ]
     ingestor = ExchangeEventIngestor(info, "0xAccount", MagicMock())
     projector = MagicMock()
-    projector.cursor = AsyncMock(side_effect=[0, 1000])
+    projector.cursor = AsyncMock(side_effect=[1000])
     projector.ingest_fill = AsyncMock()
     projector.ingest_order_update = AsyncMock()
     ingestor._projector = projector
 
     with pytest.raises(RuntimeError, match="retention"):
         await ingestor.recover_history()
+
+
+async def test_fill_without_cloid_resolves_oid_before_durable_projection() -> None:
+    class _IdentityProjector:
+        def __init__(self) -> None:
+            self.payload: dict[str, object] | None = None
+
+        async def has_order(self, exchange_oid: str) -> bool:
+            assert exchange_oid == "42"
+            return False
+
+        async def ingest_fill(self, payload: dict[str, object]) -> IngestResult:
+            self.payload = payload
+            return IngestResult(False, "fill:99")
+
+    cloid = "0x" + "f" * 32
+    info = MagicMock()
+    info.query_order_by_oid.return_value = {
+        "status": "order",
+        "order": {"status": "filled", "order": {"oid": 42, "cloid": cloid, "origSz": "2"}},
+    }
+    ingestor = ExchangeEventIngestor(info, "0xAccount", MagicMock())
+    projector = _IdentityProjector()
+    ingestor._projector = projector  # type: ignore[assignment]
+
+    await ingestor._ingest_fill(_fill())
+
+    info.query_order_by_oid.assert_called_once_with("0xAccount", 42)
+    assert projector.payload is not None
+    assert projector.payload["cloid"] == cloid
+    assert projector.payload["origSz"] == "2"
 
 
 async def test_resting_fill_converges_tracker_engine_and_strategy_after_commit() -> None:

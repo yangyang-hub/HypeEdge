@@ -105,7 +105,13 @@ class OrderIntent:
     reduce_only: bool = False
     cloid: Cloid | None = None  # Pre-assigned, or auto-generated
     client_id: str | None = None  # Additional client tracking ID
-    is_spot: bool = False  # True routes to the Hyperliquid spot (HIP-1/HIP-2) order book
+    is_spot: bool = False
+    risk_reducing: bool = False
+    max_slippage_bps: int = 50
+
+    def __post_init__(self) -> None:
+        if not 1 <= self.max_slippage_bps <= 500:
+            raise ValueError("max_slippage_bps must be between 1 and 500")
 
 
 @dataclass
@@ -123,6 +129,9 @@ class Order:
     strategy_id: StrategyId | None = None
     sub_account: SubAccount | None = None
     reduce_only: bool = False
+    is_spot: bool = False
+    risk_reducing: bool = False
+    max_slippage_bps: int = 50
     exchange_oid: OrderId | None = None
     filled_size: Size = field(default_factory=lambda: Size(0.0))
     avg_fill_price: Price | None = None
@@ -162,6 +171,7 @@ class Fill:
     timestamp: Timestamp
     strategy_id: StrategyId | None = None
     sub_account: SubAccount | None = None
+    is_spot: bool = False
 
 
 # --- Account Models ---
@@ -192,6 +202,22 @@ class Position:
     @property
     def is_flat(self) -> bool:
         return self.size == Size(0.0)
+
+
+@dataclass(frozen=True)
+class SpotBalance:
+    """Authoritative Hyperliquid spot token balance."""
+
+    token: str
+    total: Size
+    hold: Size = field(default_factory=lambda: Size(0))
+    entry_ntl: Usd = field(default_factory=lambda: Usd(0))
+    sub_account: SubAccount | None = None
+    updated_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+
+    @property
+    def available(self) -> Size:
+        return Size(max(Size(0), self.total - self.hold))
 
 
 @dataclass

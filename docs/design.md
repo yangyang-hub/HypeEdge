@@ -1,9 +1,9 @@
 # HypeEdge 量化交易系统 — 设计文档
 
-- 版本：v0.2
-- 日期：2026-06-01
+- 版本：v0.3.0
+- 日期：2026-07-31
 - 目标平台：Hyperliquid（永续 L1 订单簿）
-- 范围说明：**资金费套利为当前主线策略**，采用单所内 delta-neutral 对冲（HL 永续做空 + HL 现货做多），不依赖跨所基建；多策略控制面与配置已就绪，真实执行（现货腿行情/下单、对冲再平衡）分阶段补全，详见 §7。
+- 范围说明：**资金费套利为当前主线策略**，采用单所内 delta-neutral 对冲（HL 永续做空 + HL 现货做多），不依赖跨所基建；多策略控制面、持久化状态机与 testnet 真实执行已接入，mainnet 仍硬禁用，详见 §7。
 
 ---
 
@@ -235,12 +235,22 @@ Postgres 关键表：
 
 ## 7. 策略设计（资金费套利为主线）
 
-### 7.0 资金费套利（单所内对冲）—【主线策略，控制面已就绪，执行分阶段】
+### 7.0 资金费套利（单所内对冲）—【主线策略，测试网真实执行】
 
 - 形态：HL 永续做空（收取 funding）+ HL 现货做多（delta 对冲），同所内两腿，净 delta ≈ 0，靠永续 funding 收益获利。
 - 为何不再「移除」：早期设计否定的是「单腿收 funding = 裸方向暴露」；加现货对冲腿后即 delta-neutral，且在同一交易所内完成，不依赖跨所基建（§7.4 跨所项另行保留）。
-- 当前状态：多策略控制面已接入 `funding_arb` 类型——可经 `POST /api/v1/strategies` 创建、配置版本化（`funding_arb_config_versions`）、启停；运行时为 **stub**（仅响应生命周期、不下单）。
-- 待补全（后续阶段）：HL 现货行情订阅、现货下单（execution 改造）、两腿对冲再平衡、funding 结算与 PnL 归因、套利回测（funding 历史数据已具备）。
+- 执行范围：本阶段只允许 `HYPE_ENV=testnet` 且显式开启 `funding_arb_execution_enabled`；`dev` 保持观察模式，
+  `mainnet` 在代码层硬拒绝。测试网验证通过不代表主网收益成立。
+- 现货标识必须经 `spotMeta` 解析为交易所 coin（如 `HYPE/USDC -> @1035`），并验证现货 base token 与永续
+  `strategy_instances.symbol` 完全一致、quote 为 USDC；禁止只凭字符串相似推断对冲关系。
+- 入场固定为 **先买现货、后空永续**：第一腿失败则不产生永续风险；第二腿失败/部分成交时，按权威成交量卖出现货
+  剩余，保留的两腿只能是共同可对冲的最小规模。退出固定为 **先 reduce-only 平永续、后卖现货**，优先消除杠杆风险。
+- 每个套利 cycle 及其 cloid、目标/成交数量、配置版本、状态转换和失败原因持久化到 Postgres。ACK 不代表成交；
+  只有 authenticated fill / REST 补缺和现货/永续账户快照能推进 `open` / `closed`。
+- 任一腿 UNKNOWN 时禁止发送可能重复的替代订单；先按 cloid 查询。超过最大无对冲窗口仍无法证明终态时，策略进入
+  `faulted`、停止新增风险并告警。补偿订单只能减少已确认敞口。
+- 启动及周期对账同时覆盖永续持仓、现货余额、两腿订单和资金费事实；不一致时不恢复新 cycle。
+- 详细状态机、经济门槛、持久化模型及测试网门禁见 `docs/funding_arb_design.md`。
 - 风险：HL 现货流动性/价差、两腿执行延迟与滑点、资金费反转；须以小资金实盘验证，回测需建模每小时 funding 与现货价差。
 - 算法与控制面契约详见 `docs/funding_arb_design.md`；多类型创建/启停契约见 §19 与 `docs/strategy_control_plane.md`。
 
@@ -765,9 +775,11 @@ Alembic 管理，应用启动禁止 `create_all`。
 - 控制面采用 **Strategy Type Plugin**：共享实例 / 配置版本元数据 / allocation / Supervisor；按类型提供强类型
   校验、typed 配置子表、Runtime factory、生命周期能力与前端 ConfigFields。
 - 前端与 API 通过唯一入口 `POST /api/v1/strategies` 创建实例；请求体为 `strategy_type` 判别联合
-  （首期 `market_maker` | `trend_follow`）。禁止按类型永久平行 create API；禁止无约束 JSONB 作为交易关键配置主存。
+  （首期 `market_maker` | `trend_follow` | `funding_arb`）。禁止按类型永久平行 create API；禁止无约束 JSONB 作为交易关键配置主存。
 - 生命周期共用 Supervisor，按类型声明能力子集：`market_maker` 支持 shadow/running/paused/drain；
   `trend_follow` 支持 stopped/running/paused（不强制对外 shadow）。不支持的 action 由 CapabilityGate 拒绝。
+- 统一策略控制面随完整 V2 `strategy_runner_v2` 链初始化；`market_making_enabled` 只启用做市专用实时执行组件，
+  不得成为 trend-follow / funding-arb 控制面的总开关。
 - 实例参数以 Postgres 不可变配置版本为主；YAML 仅环境默认与上限。目标态删除 `app.py` 硬编码单一
   `TrendFollowStrategy` 与实例级文件 watcher 双主（§15.2）。
 - 新增策略类型的边际成本应为一份 plugin + typed 表 + ConfigFields，而不修改 create 壳与 Supervisor 核心。

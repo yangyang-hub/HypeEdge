@@ -83,3 +83,23 @@ def test_normalizer_fails_closed_without_metadata() -> None:
         OrderNormalizer(_Specs(None)).normalize(OrderIntent(symbol=Symbol("BTC"), side=Side.BUY, size=Size("0.002")))
 
     assert exc_info.value.reason == "instrument_meta_unavailable"
+
+
+def test_normalizer_applies_hyperliquid_five_significant_figure_rule() -> None:
+    normalizer = OrderNormalizer(
+        _Specs(
+            InstrumentSpec(
+                symbol=Symbol("BTC"),
+                tick_size=Decimal("0.0001"),
+                lot_size=Decimal("0.001"),
+                min_size=Decimal("0.001"),
+                max_price_decimals=4,
+            )
+        )
+    )
+
+    normalized = normalizer.normalize(
+        OrderIntent(symbol=Symbol("BTC"), side=Side.BUY, size=Size("0.001"), price=Price("123.456"))
+    )
+
+    assert normalized.price == Decimal("123.45")

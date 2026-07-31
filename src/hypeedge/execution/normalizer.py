@@ -21,6 +21,8 @@ class InstrumentSpec:
     lot_size: Decimal
     min_size: Decimal
     min_notional: Decimal | None = None
+    max_price_decimals: int | None = None
+    max_significant_figures: int = 5
 
     def __post_init__(self) -> None:
         for name in ("tick_size", "lot_size", "min_size"):
@@ -28,6 +30,10 @@ class InstrumentSpec:
                 raise ValueError(f"{name} must be positive")
         if self.min_notional is not None and self.min_notional <= 0:
             raise ValueError("min_notional must be positive when configured")
+        if self.max_price_decimals is not None and self.max_price_decimals < 0:
+            raise ValueError("max_price_decimals cannot be negative")
+        if self.max_significant_figures <= 0:
+            raise ValueError("max_significant_figures must be positive")
 
 
 class InstrumentSpecLike(Protocol):
@@ -45,6 +51,12 @@ class InstrumentSpecLike(Protocol):
 
     @property
     def min_notional(self) -> Decimal | None: ...
+
+    @property
+    def max_price_decimals(self) -> int | None: ...
+
+    @property
+    def max_significant_figures(self) -> int: ...
 
 
 class InstrumentSpecProvider(Protocol):
@@ -76,7 +88,7 @@ class OrderNormalizer:
 
         price: Decimal | None = None
         if intent.price is not None:
-            price = self._floor_to_step(Decimal(intent.price), spec.tick_size)
+            price = self._normalize_price(Decimal(intent.price), spec)
             if price <= 0:
                 self._reject(intent.symbol, "price_not_positive", "Normalized price must be positive")
 
@@ -106,6 +118,18 @@ class OrderNormalizer:
     def _floor_to_step(value: Decimal, step: Decimal) -> Decimal:
         units = (value / step).to_integral_value(rounding=ROUND_DOWN)
         return units * step
+
+    @classmethod
+    def _normalize_price(cls, value: Decimal, spec: InstrumentSpecLike) -> Decimal:
+        """Apply Hyperliquid's decimal-place and five-significant-figure rules."""
+        max_decimals = getattr(spec, "max_price_decimals", None)
+        if max_decimals is None or value == value.to_integral_value():
+            return cls._floor_to_step(value, spec.tick_size)
+        significant_figures = int(getattr(spec, "max_significant_figures", 5))
+        significant_decimals = max(0, significant_figures - value.adjusted() - 1)
+        allowed_decimals = min(max_decimals, significant_decimals)
+        dynamic_step = Decimal(1).scaleb(-allowed_decimals)
+        return cls._floor_to_step(value, max(spec.tick_size, dynamic_step))
 
     @staticmethod
     def _reject(symbol: Symbol, reason: str, message: str) -> NoReturn:

@@ -368,7 +368,7 @@ class ActionBudgetControllerAdapter:
             symbol=intent.symbol if intent.strategy_id is not None else None,
             child_actions=1,
             ip_weight=1,
-            risk_reducing=intent.reduce_only,
+            risk_reducing=intent.reduce_only or intent.risk_reducing,
         )
         return GateDecision(permission.allowed, permission.reason)
 

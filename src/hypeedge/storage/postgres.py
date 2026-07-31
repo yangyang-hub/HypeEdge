@@ -50,6 +50,7 @@ from hypeedge.core.events import (
     Event,
     EventBus,
 )
+from hypeedge.core.exceptions import StrategyLifecycleError
 from hypeedge.core.models import Order, RiskCheckResult
 from hypeedge.core.types import Cloid, OrderId, Price, Size, StrategyId, SubAccount, Symbol
 from hypeedge.execution.durable import DurableExecutionCommand
@@ -113,6 +114,17 @@ EXECUTION_ACTION_OUTCOMES = ("succeeded", "rejected", "timeout", "unknown", "tra
 BUDGET_MODES = ("normal", "conserve", "critical", "cancel_only", "exhausted")
 BUDGET_ALLOCATION_STATUSES = ("active", "released")
 RISK_OWNER_TYPES = ("legacy", "live_order", "inflight_place", "unknown", "new_quote")
+FUNDING_ARB_CYCLE_STATES = (
+    "entering_spot",
+    "entering_perp",
+    "compensating_entry",
+    "open",
+    "rebalancing",
+    "exiting_perp",
+    "exiting_spot",
+    "closed",
+    "faulted",
+)
 
 
 def _utcnow() -> datetime:
@@ -142,6 +154,8 @@ class OrderRecord(Base):
         CheckConstraint("filled_size >= 0 AND filled_size <= size", name="ck_orders_filled_size"),
         CheckConstraint("price IS NULL OR price > 0", name="ck_orders_price_positive"),
         CheckConstraint("cloid ~ '^0x[0-9a-f]{32}$'", name="ck_orders_cloid_format"),
+        CheckConstraint("max_slippage_bps BETWEEN 1 AND 500", name="ck_orders_max_slippage_bps"),
+        CheckConstraint("NOT (is_spot AND reduce_only)", name="ck_orders_spot_not_reduce_only"),
         Index("ix_orders_account_status_created", "sub_account", "status", "created_at"),
         Index("ix_orders_strategy_created", "strategy_id", "created_at"),
         Index(
@@ -170,6 +184,9 @@ class OrderRecord(Base):
     sub_account: Mapped[str | None] = mapped_column(Text, index=True)
     client_id: Mapped[str | None] = mapped_column(Text)
     reduce_only: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    is_spot: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    risk_reducing: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    max_slippage_bps: Mapped[int] = mapped_column(Integer, nullable=False, default=50, server_default="50")
     filled_size: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal(0), server_default="0")
     avg_fill_price: Mapped[Decimal | None] = mapped_column(MONEY)
     revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
@@ -251,6 +268,7 @@ class FillRecord(Base):
     fee: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal(0), server_default="0")
     realized_pnl: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal(0), server_default="0")
     is_maker: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
+    is_spot: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False, server_default="false")
     strategy_id: Mapped[str | None] = mapped_column(Text, index=True)
     sub_account: Mapped[str | None] = mapped_column(Text, index=True)
     occurred_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, nullable=False)
@@ -290,6 +308,40 @@ class PositionRecord(Base):
     leverage: Mapped[int] = mapped_column(Integer, nullable=False, default=1, server_default="1")
     liquidation_price: Mapped[Decimal | None] = mapped_column(MONEY)
     exchange_updated_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    created_at: Mapped[datetime] = mapped_column(
+        UTC_TIMESTAMP, nullable=False, default=_utcnow, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTC_TIMESTAMP, nullable=False, default=_utcnow, server_default=func.now(), onupdate=_utcnow
+    )
+
+
+class SpotBalanceRecord(Base):
+    """Current exchange-authoritative spot token balance projection."""
+
+    __tablename__ = "spot_balances"
+    __table_args__ = (
+        CheckConstraint("total >= 0", name="ck_spot_balances_total"),
+        CheckConstraint("hold >= 0 AND hold <= total", name="ck_spot_balances_hold"),
+        Index(
+            "uq_spot_balances_scope_token",
+            "sub_account",
+            "token",
+            unique=True,
+            postgresql_nulls_not_distinct=True,
+        ),
+        Index("ix_spot_balances_account_updated", "sub_account", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    balance_id: Mapped[uuid.UUID] = mapped_column(unique=True, nullable=False, default=_uuid)
+    sub_account: Mapped[str | None] = mapped_column(Text, index=True)
+    token: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    total: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal(0), server_default="0")
+    hold: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal(0), server_default="0")
+    entry_ntl: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal(0), server_default="0")
+    exchange_updated_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, nullable=False)
     revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
     created_at: Mapped[datetime] = mapped_column(
         UTC_TIMESTAMP, nullable=False, default=_utcnow, server_default=func.now()
@@ -537,12 +589,23 @@ class FundingArbConfigVersionRecord(Base):
     __tablename__ = "funding_arb_config_versions"
     __table_args__ = (
         CheckConstraint("length(spot_coin) > 0", name="ck_fa_config_spot_coin"),
-        CheckConstraint("entry_funding_rate >= 0", name="ck_fa_config_entry_funding"),
+        CheckConstraint(
+            "spot_coin ~ '^(@[0-9]+|[A-Za-z0-9_.:-]+/[A-Za-z0-9_.:-]+)$'",
+            name="ck_fa_config_spot_market",
+        ),
+        CheckConstraint("entry_funding_rate > 0", name="ck_fa_config_entry_funding"),
         CheckConstraint("exit_funding_rate >= 0", name="ck_fa_config_exit_funding"),
+        CheckConstraint("exit_funding_rate < entry_funding_rate", name="ck_fa_config_rate_hysteresis"),
         CheckConstraint("max_notional_usd > 0", name="ck_fa_config_max_notional"),
         CheckConstraint("hedge_ratio > 0 AND hedge_ratio <= 1", name="ck_fa_config_hedge_ratio"),
         CheckConstraint("rebalance_threshold_bps > 0", name="ck_fa_config_rebalance_bps"),
         CheckConstraint("leverage > 0", name="ck_fa_config_leverage"),
+        CheckConstraint("max_slippage_bps BETWEEN 1 AND 500", name="ck_fa_config_max_slippage"),
+        CheckConstraint("max_basis_bps > 0", name="ck_fa_config_max_basis"),
+        CheckConstraint("min_expected_edge_bps >= 0", name="ck_fa_config_min_edge"),
+        CheckConstraint("expected_hold_hours BETWEEN 1 AND 168", name="ck_fa_config_hold_hours"),
+        CheckConstraint("round_trip_fee_bps >= 0", name="ck_fa_config_round_trip_fee"),
+        CheckConstraint("max_unhedged_seconds BETWEEN 1 AND 60", name="ck_fa_config_unhedged_seconds"),
     )
 
     config_version_id: Mapped[int] = mapped_column(
@@ -555,6 +618,135 @@ class FundingArbConfigVersionRecord(Base):
     hedge_ratio: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
     rebalance_threshold_bps: Mapped[int] = mapped_column(BigInteger, nullable=False)
     leverage: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    max_slippage_bps: Mapped[int] = mapped_column(BigInteger, nullable=False, default=50, server_default="50")
+    max_basis_bps: Mapped[int] = mapped_column(BigInteger, nullable=False, default=500, server_default="500")
+    min_expected_edge_bps: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("5"), server_default="5"
+    )
+    expected_hold_hours: Mapped[int] = mapped_column(BigInteger, nullable=False, default=8, server_default="8")
+    round_trip_fee_bps: Mapped[Decimal] = mapped_column(
+        MONEY, nullable=False, default=Decimal("20"), server_default="20"
+    )
+    max_unhedged_seconds: Mapped[int] = mapped_column(BigInteger, nullable=False, default=15, server_default="15")
+
+
+class FundingArbCycleRecord(Base):
+    """Durable current/history row for one two-leg execution cycle."""
+
+    __tablename__ = "funding_arb_cycles"
+    __table_args__ = (
+        _enum_check("state", FUNDING_ARB_CYCLE_STATES, "ck_funding_arb_cycles_state"),
+        CheckConstraint("target_perp_size > 0", name="ck_funding_arb_cycles_target_perp"),
+        CheckConstraint("target_spot_size > 0", name="ck_funding_arb_cycles_target_spot"),
+        CheckConstraint("perp_open_size >= 0", name="ck_funding_arb_cycles_perp_open"),
+        CheckConstraint("spot_open_size >= 0", name="ck_funding_arb_cycles_spot_open"),
+        CheckConstraint("baseline_spot_size >= 0", name="ck_funding_arb_cycles_spot_baseline"),
+        CheckConstraint("revision >= 0", name="ck_funding_arb_cycles_revision"),
+        ForeignKeyConstraint(
+            ["config_version_id", "strategy_id"],
+            ["strategy_config_versions.id", "strategy_config_versions.strategy_id"],
+            name="fk_funding_arb_cycles_config",
+            ondelete="RESTRICT",
+        ),
+        Index("ix_funding_arb_cycles_strategy_created", "strategy_id", "created_at"),
+        Index("ix_funding_arb_cycles_config", "config_version_id"),
+        Index(
+            "uq_funding_arb_cycles_active_strategy",
+            "strategy_id",
+            unique=True,
+            postgresql_where="state <> 'closed'",
+        ),
+    )
+
+    cycle_id: Mapped[uuid.UUID] = mapped_column(primary_key=True, default=_uuid)
+    strategy_id: Mapped[str] = mapped_column(
+        ForeignKey("strategy_instances.strategy_id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    config_version_id: Mapped[int] = mapped_column(BigInteger, nullable=False, index=True)
+    config_revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    sub_account: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    perp_symbol: Mapped[str] = mapped_column(Text, nullable=False)
+    spot_symbol: Mapped[str] = mapped_column(Text, nullable=False)
+    spot_display: Mapped[str] = mapped_column(Text, nullable=False)
+    base_token: Mapped[str] = mapped_column(Text, nullable=False)
+    quote_token: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False)
+    target_perp_size: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    target_spot_size: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    perp_open_size: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal(0), server_default="0")
+    spot_open_size: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal(0), server_default="0")
+    baseline_spot_size: Mapped[Decimal] = mapped_column(MONEY, nullable=False, default=Decimal(0), server_default="0")
+    spot_entry_cloid: Mapped[str | None] = mapped_column(Text, index=True)
+    perp_entry_cloid: Mapped[str | None] = mapped_column(Text, index=True)
+    compensation_cloid: Mapped[str | None] = mapped_column(Text, index=True)
+    perp_exit_cloid: Mapped[str | None] = mapped_column(Text, index=True)
+    spot_exit_cloid: Mapped[str | None] = mapped_column(Text, index=True)
+    entry_funding_rate: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    entry_basis_bps: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    error_code: Mapped[str | None] = mapped_column(Text)
+    error_message: Mapped[str | None] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0, server_default="0")
+    opened_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)
+    closed_at: Mapped[datetime | None] = mapped_column(UTC_TIMESTAMP)
+    created_at: Mapped[datetime] = mapped_column(
+        UTC_TIMESTAMP, nullable=False, default=_utcnow, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTC_TIMESTAMP, nullable=False, default=_utcnow, server_default=func.now(), onupdate=_utcnow
+    )
+
+
+class FundingArbCycleEventRecord(Base):
+    """Append-only state transition and leg-attempt facts."""
+
+    __tablename__ = "funding_arb_cycle_events"
+    __table_args__ = (
+        UniqueConstraint("cycle_id", "revision", name="uq_funding_arb_cycle_events_revision"),
+        CheckConstraint("revision > 0", name="ck_funding_arb_cycle_events_revision"),
+        Index("ix_funding_arb_cycle_events_cycle_created", "cycle_id", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    event_id: Mapped[uuid.UUID] = mapped_column(unique=True, nullable=False, default=_uuid)
+    cycle_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("funding_arb_cycles.cycle_id", ondelete="RESTRICT"), nullable=False, index=True
+    )
+    revision: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    event_type: Mapped[str] = mapped_column(Text, nullable=False)
+    from_state: Mapped[str | None] = mapped_column(Text)
+    to_state: Mapped[str] = mapped_column(Text, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    occurred_at: Mapped[datetime] = mapped_column(
+        UTC_TIMESTAMP, nullable=False, default=_utcnow, server_default=func.now()
+    )
+
+
+class FundingPaymentRecord(Base):
+    """Idempotently recovered Hyperliquid user-funding payment."""
+
+    __tablename__ = "funding_payments"
+    __table_args__ = (
+        UniqueConstraint("source", "external_event_id", name="uq_funding_payments_source_event"),
+        Index("ix_funding_payments_symbol_occurred", "symbol", "occurred_at"),
+    )
+
+    id: Mapped[int] = mapped_column(BigInteger, Identity(always=True), primary_key=True)
+    payment_id: Mapped[uuid.UUID] = mapped_column(unique=True, nullable=False, default=_uuid)
+    source: Mapped[str] = mapped_column(Text, nullable=False, default="hyperliquid", server_default="hyperliquid")
+    external_event_id: Mapped[str] = mapped_column(Text, nullable=False)
+    sub_account: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    cycle_id: Mapped[uuid.UUID | None] = mapped_column(
+        ForeignKey("funding_arb_cycles.cycle_id", ondelete="RESTRICT"), index=True
+    )
+    symbol: Mapped[str] = mapped_column(Text, nullable=False, index=True)
+    amount: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    funding_rate: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    position_size: Mapped[Decimal] = mapped_column(MONEY, nullable=False)
+    occurred_at: Mapped[datetime] = mapped_column(UTC_TIMESTAMP, nullable=False)
+    raw_event: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        UTC_TIMESTAMP, nullable=False, default=_utcnow, server_default=func.now()
+    )
 
 
 class StrategyRuntimeStateRecord(Base):
@@ -1554,7 +1746,13 @@ class PostgresReconciliationStore:
                     sub_account=self._sub_account,
                     trigger=trigger,
                     status="running",
-                    required_queries=["open_orders", "historical_order_status", "positions", "account"],
+                    required_queries=[
+                        "open_orders",
+                        "historical_order_status",
+                        "positions",
+                        "spot_balances",
+                        "account",
+                    ],
                 )
             )
         return run_id
@@ -1567,6 +1765,7 @@ class PostgresReconciliationStore:
         errors: Sequence[str],
         diffs: Sequence[dict[str, Any]],
         exchange_positions: dict[str, dict[str, Any]],
+        exchange_spot_balances: dict[str, dict[str, Any]],
         exchange_account: Any | None,
     ) -> None:
         now = _utcnow()
@@ -1578,7 +1777,7 @@ class PostgresReconciliationStore:
             ).scalar_one()
             run.status = "succeeded" if success else "failed"
             run.completed_queries = (
-                ["open_orders", "historical_order_status", "positions", "account"] if success else []
+                ["open_orders", "historical_order_status", "positions", "spot_balances", "account"] if success else []
             )
             run.error_code = "reconciliation_failed" if errors else None
             run.error_message = "; ".join(errors) if errors else None
@@ -1658,6 +1857,41 @@ class PostgresReconciliationStore:
                 position.exchange_updated_at = now
                 position.revision += 1
 
+            active_tokens = set(exchange_spot_balances)
+            for token, raw in exchange_spot_balances.items():
+                values = {
+                    "sub_account": self._sub_account,
+                    "token": token,
+                    "total": _to_decimal(raw.get("total", 0)),
+                    "hold": _to_decimal(raw.get("hold", 0)),
+                    "entry_ntl": _to_decimal(raw.get("entryNtl", 0)),
+                    "exchange_updated_at": now,
+                    "revision": 1,
+                }
+                statement = pg_insert(SpotBalanceRecord).values(balance_id=_uuid(), **values)
+                await session.execute(
+                    statement.on_conflict_do_update(
+                        index_elements=["sub_account", "token"],
+                        set_={
+                            **values,
+                            "revision": SpotBalanceRecord.revision + 1,
+                            "updated_at": now,
+                        },
+                    )
+                )
+            stale_spot = select(SpotBalanceRecord).where(
+                SpotBalanceRecord.sub_account == self._sub_account,
+                SpotBalanceRecord.total != 0,
+            )
+            if active_tokens:
+                stale_spot = stale_spot.where(SpotBalanceRecord.token.not_in(active_tokens))
+            for balance in (await session.execute(stale_spot.with_for_update())).scalars():
+                balance.total = Decimal(0)
+                balance.hold = Decimal(0)
+                balance.entry_ntl = Decimal(0)
+                balance.exchange_updated_at = now
+                balance.revision += 1
+
             account_values = {
                 "equity": _to_decimal(exchange_account.equity),
                 "available_balance": _to_decimal(exchange_account.available_balance),
@@ -1729,26 +1963,33 @@ class PostgresDurableOrderStore:
             event_type = "submitted" if dispatch else "rejected"
             command_status = "pending" if dispatch else "failed"
             payload = self._order_payload(order)
-            session.add(
-                OrderRecord(
-                    order_id=order_id,
-                    command_id=command_id,
-                    cloid=str(order.cloid),
-                    symbol=str(order.symbol),
-                    side=str(order.side),
-                    order_type=str(order.order_type),
-                    time_in_force=str(order.time_in_force),
-                    size=Decimal(str(order.size)),
-                    price=Decimal(str(order.price)) if order.price is not None else None,
-                    status=str(order.status),
-                    strategy_id=str(order.strategy_id) if order.strategy_id else None,
-                    sub_account=str(order.sub_account) if order.sub_account else None,
-                    reduce_only=order.reduce_only,
-                    error_message=order.error_message,
-                    submitted_at=order.submitted_at,
-                    revision=revision,
-                )
+            order_record = OrderRecord(
+                order_id=order_id,
+                command_id=command_id,
+                cloid=str(order.cloid),
+                symbol=str(order.symbol),
+                side=str(order.side),
+                order_type=str(order.order_type),
+                time_in_force=str(order.time_in_force),
+                size=Decimal(str(order.size)),
+                price=Decimal(str(order.price)) if order.price is not None else None,
+                status=str(order.status),
+                strategy_id=str(order.strategy_id) if order.strategy_id else None,
+                sub_account=str(order.sub_account) if order.sub_account else None,
+                reduce_only=order.reduce_only,
+                is_spot=order.is_spot,
+                risk_reducing=order.risk_reducing,
+                max_slippage_bps=order.max_slippage_bps,
+                error_message=order.error_message,
+                submitted_at=order.submitted_at,
+                revision=revision,
             )
+            session.add(order_record)
+            # These mappers intentionally avoid ORM relationships, so the unit
+            # of work cannot infer insert ordering from Python object links.
+            # Materialize the parent row before adding FK-dependent command,
+            # risk, reservation and event facts.
+            await session.flush()
             session.add(
                 RiskEventRecord(
                     command_id=command_id,
@@ -1792,7 +2033,7 @@ class PostgresDurableOrderStore:
                         strategy_id=str(order.strategy_id) if order.strategy_id else None,
                         symbol=str(order.symbol),
                         side=str(order.side),
-                        reduce_only=order.reduce_only,
+                        reduce_only=order.reduce_only or order.risk_reducing,
                         reserved_size=Decimal(str(order.size)),
                         reserved_notional=Decimal(str(order.size)) * locked_reference_price,
                         expires_at=_utcnow() + timedelta(seconds=self._reservation_ttl_seconds),
@@ -1876,6 +2117,12 @@ class PostgresDurableOrderStore:
         reference_price = await self._reference_price(session, order, supplied_reference_price)
         if reference_price <= 0:
             return RiskCheckResult(False, "market_price_not_available", checked)
+        if order.is_spot:
+            checked.append("spot_balance_rechecked_at_dispatch")
+            # The final in-process preflight uses the latest authoritative spot
+            # balance immediately before signing. Spot does not mutate the perp
+            # position/leverage projection locked below.
+            return RiskCheckResult(True, checked_limits=checked)
         symbol = str(order.symbol)
         existing = next((position for position in positions if position.symbol == symbol), None)
         existing_size = existing.size if existing is not None else Decimal(0)
@@ -1981,7 +2228,7 @@ class PostgresDurableOrderStore:
                     select(OrderRecord).where(OrderRecord.cloid == str(order.cloid)).with_for_update()
                 )
             ).scalar_one()
-            self._update_order_record(record, order)
+            self._merge_transport_transition(record, order)
             record.revision += 1
             if command_id is not None and command_status is not None:
                 command = (
@@ -2003,17 +2250,18 @@ class PostgresDurableOrderStore:
                     .with_for_update()
                 )
             ).scalar_one_or_none()
+            persisted_order = self._to_domain(record)
             if reservation is not None and reservation.status == "active":
-                if order.status == OrderStatus.FILLED:
+                if persisted_order.status == OrderStatus.FILLED:
                     reservation.status = "consumed"
                     reservation.released_at = _utcnow()
-                elif order.status in {OrderStatus.REJECTED, OrderStatus.CANCELLED, OrderStatus.EXPIRED}:
+                elif persisted_order.status in {OrderStatus.REJECTED, OrderStatus.CANCELLED, OrderStatus.EXPIRED}:
                     reservation.status = "released"
                     reservation.released_at = _utcnow()
-            payload = self._order_payload(order)
+            payload = self._order_payload(persisted_order)
             self._append_event_rows(
                 session,
-                order,
+                persisted_order,
                 order_id=record.order_id,
                 revision=record.revision,
                 event_type=event_type,
@@ -2083,6 +2331,9 @@ class PostgresDurableOrderStore:
                     strategy_id=str(order.strategy_id) if order.strategy_id else None,
                     sub_account=str(order.sub_account) if order.sub_account else None,
                     reduce_only=order.reduce_only,
+                    is_spot=order.is_spot,
+                    risk_reducing=order.risk_reducing,
+                    max_slippage_bps=order.max_slippage_bps,
                     filled_size=Decimal(str(order.filled_size)),
                     acknowledged_at=order.acknowledged_at or _utcnow(),
                     revision=1,
@@ -2139,6 +2390,42 @@ class PostgresDurableOrderStore:
         record.filled_at = order.filled_at
 
     @staticmethod
+    def _merge_transport_transition(record: OrderRecord, order: Order) -> None:
+        """Merge a placement response without regressing committed fill facts.
+
+        SDK responses are useful for command completion and oid discovery, but
+        authenticated user-fill ingestion owns filled size, average price and
+        fill timestamps. A fill can commit while the placement worker is still
+        awaiting its response, so this merge must also preserve the stronger
+        terminal/partial state already present in Postgres.
+        """
+        if order.exchange_oid is not None:
+            exchange_oid = str(order.exchange_oid)
+            if record.exchange_oid not in {None, exchange_oid}:
+                raise StrategyLifecycleError("exchange order oid changed for an existing cloid")
+            record.exchange_oid = exchange_oid
+
+        current_status = OrderStatus(record.status)
+        incoming_status = order.status
+        terminal = {OrderStatus.FILLED, OrderStatus.CANCELLED, OrderStatus.REJECTED, OrderStatus.EXPIRED}
+        lower_than_fill = {
+            OrderStatus.PENDING,
+            OrderStatus.SUBMITTED,
+            OrderStatus.SUBMIT_UNKNOWN,
+            OrderStatus.ACKNOWLEDGED,
+            OrderStatus.FILLED,
+        }
+        preserve_current = current_status in terminal or (
+            current_status == OrderStatus.PARTIAL_FILL and incoming_status in lower_than_fill
+        )
+        merged_status = current_status if preserve_current else incoming_status
+
+        record.status = str(merged_status)
+        record.error_message = order.error_message
+        record.submitted_at = order.submitted_at or record.submitted_at
+        record.acknowledged_at = order.acknowledged_at or record.acknowledged_at
+
+    @staticmethod
     def _order_payload(order: Order) -> dict[str, Any]:
         return {
             "cloid": str(order.cloid),
@@ -2153,6 +2440,9 @@ class PostgresDurableOrderStore:
             "strategy_id": str(order.strategy_id) if order.strategy_id else None,
             "sub_account": str(order.sub_account) if order.sub_account else None,
             "reduce_only": order.reduce_only,
+            "is_spot": order.is_spot,
+            "risk_reducing": order.risk_reducing,
+            "max_slippage_bps": order.max_slippage_bps,
             "filled_size": str(order.filled_size),
             "avg_fill_price": str(order.avg_fill_price) if order.avg_fill_price is not None else None,
             "error_message": order.error_message,
@@ -2209,6 +2499,9 @@ class PostgresDurableOrderStore:
             strategy_id=StrategyId(record.strategy_id) if record.strategy_id else None,
             sub_account=SubAccount(record.sub_account) if record.sub_account else None,
             reduce_only=record.reduce_only,
+            is_spot=record.is_spot,
+            risk_reducing=record.risk_reducing,
+            max_slippage_bps=record.max_slippage_bps,
             exchange_oid=OrderId(record.exchange_oid) if record.exchange_oid else None,
             filled_size=Size(record.filled_size),
             avg_fill_price=Price(record.avg_fill_price) if record.avg_fill_price is not None else None,
@@ -2437,6 +2730,9 @@ class PostgresWriter:
                     strategy_id=str(order.strategy_id) if order.strategy_id else None,
                     sub_account=str(order.sub_account) if order.sub_account else None,
                     reduce_only=order.reduce_only,
+                    is_spot=order.is_spot,
+                    risk_reducing=order.risk_reducing,
+                    max_slippage_bps=order.max_slippage_bps,
                     filled_size=Decimal(str(order.filled_size)),
                     avg_fill_price=Decimal(str(order.avg_fill_price)) if order.avg_fill_price is not None else None,
                     error_message=order.error_message,
@@ -2509,6 +2805,7 @@ class PostgresWriter:
                         size=Decimal(str(order_or_fill.size)),
                         fee=Decimal(str(order_or_fill.fee)),
                         is_maker=bool(order_or_fill.is_maker),
+                        is_spot=bool(getattr(order_or_fill, "is_spot", False)),
                         strategy_id=str(order_or_fill.strategy_id) if order_or_fill.strategy_id else None,
                         sub_account=str(order_or_fill.sub_account) if order_or_fill.sub_account else None,
                         occurred_at=occurred_at,

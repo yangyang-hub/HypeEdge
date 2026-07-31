@@ -8,12 +8,14 @@ describe("dashboard authentication middleware", () => {
   })
 
   it("fails closed on an incomplete role credential", () => {
+    vi.stubEnv("HYPEEDGE_DASHBOARD_AUTH", "on")
     vi.stubEnv("HYPEEDGE_DASHBOARD_OPERATOR_USERNAME", "operator")
     const response = middleware(new NextRequest("http://dashboard.local/"))
     expect(response.status).toBe(503)
   })
 
   it("rate limits repeated Basic authentication failures", () => {
+    vi.stubEnv("HYPEEDGE_DASHBOARD_AUTH", "on")
     vi.stubEnv("HYPEEDGE_DASHBOARD_VIEWER_USERNAME", "viewer")
     vi.stubEnv("HYPEEDGE_DASHBOARD_VIEWER_PASSWORD", "viewer-password")
     vi.stubEnv("HYPEEDGE_VIEWER_API_TOKEN", "v".repeat(32))

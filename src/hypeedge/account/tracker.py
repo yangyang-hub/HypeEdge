@@ -13,7 +13,7 @@ from typing import Any
 import structlog
 
 from hypeedge.core.enums import Side
-from hypeedge.core.models import AccountState, Fill, Position
+from hypeedge.core.models import AccountState, Fill, Position, SpotBalance
 from hypeedge.core.types import Cloid, Price, Size, Symbol, Usd
 
 logger = structlog.get_logger(__name__)
@@ -34,12 +34,14 @@ class AccountTracker:
 
     def __init__(self) -> None:
         self._positions: dict[Symbol, Position] = {}
+        self._spot_balances: dict[str, SpotBalance] = {}
         self._account_state: AccountState | None = None
         self._peak_equity: Usd = Usd(0.0)
         self._total_fees: Usd = Usd(0.0)
         self._total_funding: Usd = Usd(0.0)
         self._fill_count: int = 0
         self._last_update_ts: datetime | None = None
+        self._last_spot_update_ts: datetime | None = None
         self._authoritative_fill_ids: set[str] = set()
         self._provisional_fill_fees: dict[Cloid, Usd] = {}
 
@@ -52,6 +54,16 @@ class AccountTracker:
         Called by ExecutionEngine after each fill event.
         """
         symbol = fill.symbol
+        if fill.is_spot:
+            self._record_fill_accounting(fill, provisional=provisional)
+            logger.debug(
+                "tracker_spot_fill_processed",
+                symbol=str(symbol),
+                side=str(fill.side),
+                size=float(fill.size),
+                price=float(fill.price),
+            )
+            return
         pos = self._positions.get(symbol)
 
         if pos is None:
@@ -101,7 +113,10 @@ class AccountTracker:
             if symbol in self._positions:
                 self._positions[symbol].mark_price = fill.price
 
-        # Track fees
+        self._record_fill_accounting(fill, provisional=provisional)
+
+    def _record_fill_accounting(self, fill: Fill, *, provisional: bool) -> None:
+        """Track fill fees/counts without assuming an asset class."""
         self._total_fees = Usd(self._total_fees + abs(float(fill.fee)))
         self._fill_count += 1
         if provisional:
@@ -110,20 +125,30 @@ class AccountTracker:
 
         logger.debug(
             "tracker_fill_processed",
-            symbol=str(symbol),
+            symbol=str(fill.symbol),
             side=str(fill.side),
             size=float(fill.size),
             price=float(fill.price),
             positions=len(self._positions),
         )
 
-    def apply_authoritative_fill(self, external_event_id: str, fill: Fill, position: Position) -> bool:
+    def apply_authoritative_fill(
+        self,
+        external_event_id: str,
+        fill: Fill,
+        position: Position | None,
+    ) -> bool:
         """Apply a committed exchange fill exactly once to the live projection."""
         if external_event_id in self._authoritative_fill_ids:
             return False
         self._authoritative_fill_ids.add(external_event_id)
 
-        if position.is_flat:
+        if fill.is_spot:
+            if position is not None:
+                raise ValueError("spot fills must not carry a perpetual position projection")
+        elif position is None:
+            raise ValueError("perpetual fills require a position projection")
+        elif position.is_flat:
             self._positions.pop(position.symbol, None)
         else:
             self._positions[position.symbol] = position
@@ -141,7 +166,8 @@ class AccountTracker:
             external_event_id=external_event_id,
             cloid=str(fill.cloid),
             symbol=str(fill.symbol),
-            position_size=float(position.size),
+            position_size=float(position.size) if position is not None else None,
+            is_spot=fill.is_spot,
         )
         return True
 
@@ -172,6 +198,20 @@ class AccountTracker:
     def remove_position(self, symbol: Symbol) -> None:
         """Remove a position (used when reconciler finds position closed on exchange)."""
         self._positions.pop(symbol, None)
+
+    def update_spot_balances(self, balances: tuple[SpotBalance, ...], *, observed_at: datetime) -> None:
+        """Atomically replace spot balances from ``spotClearinghouseState``."""
+        self._spot_balances = {
+            balance.token: balance for balance in balances if balance.total != 0 or balance.hold != 0
+        }
+        self._last_spot_update_ts = observed_at
+        self._last_update_ts = max(self._last_update_ts or observed_at, observed_at)
+
+    def get_spot_balance(self, token: str) -> SpotBalance | None:
+        return self._spot_balances.get(token)
+
+    def get_all_spot_balances(self) -> dict[str, SpotBalance]:
+        return dict(self._spot_balances)
 
     # --- Funding tracking ---
 
@@ -226,6 +266,10 @@ class AccountTracker:
     def last_update_ts(self) -> datetime | None:
         return self._last_update_ts
 
+    @property
+    def last_spot_update_ts(self) -> datetime | None:
+        return self._last_spot_update_ts
+
     def get_position_value(self, symbol: Symbol) -> Usd:
         """Get the notional value of a position."""
         pos = self._positions.get(symbol)
@@ -260,6 +304,7 @@ class AccountTracker:
             "total_funding": float(self._total_funding),
             "fill_count": self._fill_count,
             "position_count": len(self._positions),
+            "spot_balance_count": len(self._spot_balances),
             "leverage": round(self.get_leverage(), 2),
             "positions": {
                 str(sym): {
@@ -268,6 +313,15 @@ class AccountTracker:
                     "mark_price": float(pos.mark_price) if pos.mark_price else None,
                 }
                 for sym, pos in self._positions.items()
+            },
+            "spot_balances": {
+                token: {
+                    "total": float(balance.total),
+                    "hold": float(balance.hold),
+                    "available": float(balance.available),
+                    "entry_ntl": float(balance.entry_ntl),
+                }
+                for token, balance in self._spot_balances.items()
             },
             "last_update": self._last_update_ts.isoformat() if self._last_update_ts else None,
         }
