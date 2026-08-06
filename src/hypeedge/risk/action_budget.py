@@ -83,7 +83,7 @@ class RemoteActionSnapshot:
 
 @dataclass(frozen=True, slots=True)
 class CancelHeadroomSnapshot:
-    """Authoritative cumulative cancel-limit projection."""
+    """Conservative cumulative cancel-limit projection."""
 
     cap: int
     used: int
@@ -251,10 +251,16 @@ class ActionBudgetController:
         self._possible_live_orders = count
 
     def reconcile_remote(self, snapshot: RemoteActionSnapshot) -> None:
-        """Accept an authoritative address snapshot and correct shadow use."""
+        """Accept an authoritative address snapshot and advance conservative quota facts."""
         if snapshot.quota_owner_address != self._quota_owner_address:
             raise ValueError("remote snapshot belongs to a different quota owner")
         previous = self._remote_snapshot
+        if previous is not None:
+            if snapshot.observed_at < previous.observed_at:
+                raise ValueError("remote action snapshot timestamp regressed")
+            if snapshot.used < previous.used:
+                raise ValueError("remote action quota usage regressed")
+        self._advance_cancel_headroom(snapshot, previous)
         self._remote_snapshot = snapshot
         self._forced_cancel_only = False
         logger.info(
@@ -268,6 +274,31 @@ class ActionBudgetController:
 
     def reconcile_cancel_headroom(self, snapshot: CancelHeadroomSnapshot) -> None:
         self._cancel_snapshot = snapshot
+
+    def _advance_cancel_headroom(
+        self,
+        snapshot: RemoteActionSnapshot,
+        previous: RemoteActionSnapshot | None,
+    ) -> None:
+        """Roll a configured headroom floor forward without inventing remote capacity.
+
+        Hyperliquid's ``userRateLimit`` response does not expose an independent
+        cancel counter.  We therefore retain the configured conservative cap,
+        fold in local durable cancel debits, and pessimistically charge every
+        newly observed remote action as possible cancel usage.  Remote cap
+        growth never increases this projection.
+        """
+        cancel = self._cancel_snapshot
+        if cancel is None:
+            return
+        remaining = self._cancel_remaining()
+        remote_delta = snapshot.used if previous is None else snapshot.used - previous.used
+        remaining = max(0, remaining - remote_delta)
+        self._cancel_snapshot = CancelHeadroomSnapshot(
+            cap=cancel.cap,
+            used=cancel.cap - remaining,
+            observed_at=snapshot.observed_at,
+        )
 
     def debit_network_attempt(self, debit: NetworkAttemptDebit) -> bool:
         """Shadow-debit one actual request, idempotently by durable attempt id.

@@ -14,6 +14,7 @@ from typing import TYPE_CHECKING, Any
 import structlog
 
 from hypeedge.config.settings import FundingArbSettings
+from hypeedge.core.constants import AUTO_MARKET_SYMBOL
 from hypeedge.core.enums import FundingArbCycleState, MarketMakerLifecycle, OrderStatus, OrderType, Side, TimeInForce
 from hypeedge.core.exceptions import StrategyLifecycleError
 from hypeedge.core.models import L2BookSnapshot, Order, OrderIntent
@@ -28,8 +29,8 @@ if TYPE_CHECKING:
     from hypeedge.account.health import AccountHealthProvider
     from hypeedge.account.tracker import AccountTracker
     from hypeedge.execution.engine import ExecutionClient
+    from hypeedge.market_data.funding_arb_scanner import FundingArbMarketScanner, FundingArbMarketSnapshot
     from hypeedge.market_data.instrument_cache import InstrumentInfo, InstrumentMetaCache
-    from hypeedge.market_data.provider import MarketDataProvider
 
 logger = structlog.get_logger(__name__)
 
@@ -39,7 +40,7 @@ class FundingArbRuntimeDependencies:
     """Live boundaries captured by the app only for an enabled testnet deployment."""
 
     execution: ExecutionClient
-    provider: MarketDataProvider
+    scanner: FundingArbMarketScanner
     tracker: AccountTracker
     metadata: InstrumentMetaCache
     cycles: FundingArbCycleStore
@@ -53,8 +54,13 @@ class FundingArbRuntimeDependencies:
 
 @dataclass(frozen=True, slots=True)
 class _EntryPlan:
+    perp: InstrumentInfo
+    spot: InstrumentInfo
     funding_rate: Decimal
     basis_bps: Decimal
+    expected_edge_bps: Decimal
+    liquidity_volume_usd: Decimal
+    top_book_depth_usd: Decimal
     perp_size: Decimal
     spot_size: Decimal
 
@@ -67,12 +73,10 @@ class _OrderOutcome:
     unknown: bool = False
 
 
-def decode_funding_arb_config(snapshot: StrategyConfigSnapshot, *, symbol: str) -> FundingArbParams:
+def decode_funding_arb_config(snapshot: StrategyConfigSnapshot) -> FundingArbParams:
     """Decode a durable config snapshot into validated runtime parameters."""
-    del symbol
     normalized = normalize_funding_arb_config(snapshot.values)
     return FundingArbParams(
-        spot_coin=str(normalized["spot_coin"]),
         entry_funding_rate=Decimal(normalized["entry_funding_rate"]),
         exit_funding_rate=Decimal(normalized["exit_funding_rate"]),
         max_notional_usd=Decimal(normalized["max_notional_usd"]),
@@ -94,7 +98,6 @@ class FundingArbRuntimeHandle:
     def __init__(
         self,
         strategy_id: StrategyId,
-        perp_symbol: str,
         params: FundingArbParams,
         *,
         config_revision: int = 1,
@@ -102,7 +105,6 @@ class FundingArbRuntimeHandle:
         dependencies: FundingArbRuntimeDependencies | None = None,
     ) -> None:
         self._strategy_id = strategy_id
-        self._perp_symbol = perp_symbol
         self._params = params
         self._config_revision = config_revision
         self._sub_account = sub_account.lower()
@@ -117,7 +119,8 @@ class FundingArbRuntimeHandle:
         self._entry_diagnostics: dict[str, str] = {}
         self._stop_event = asyncio.Event()
         self._evaluation_lock = asyncio.Lock()
-        self._log = logger.bind(strategy_id=str(strategy_id), perp=perp_symbol, spot=params.spot_coin)
+        self._candidate_count = 0
+        self._log = logger.bind(strategy_id=str(strategy_id), market_scope=AUTO_MARKET_SYMBOL)
         if dependencies is not None:
             self._validate_live_dependencies()
 
@@ -132,6 +135,9 @@ class FundingArbRuntimeHandle:
             "allow_entry": self._allow_entry,
             "cycle_id": str(cycle.cycle_id) if cycle is not None else None,
             "cycle_state": cycle.state.value if cycle is not None else None,
+            "selected_perp": cycle.perp_symbol if cycle is not None else None,
+            "selected_spot": cycle.spot_display if cycle is not None else None,
+            "candidate_count": self._candidate_count,
             "perp_open_size": str(cycle.perp_open_size) if cycle is not None else "0",
             "spot_open_size": str(cycle.spot_open_size) if cycle is not None else "0",
             "error_code": cycle.error_code if cycle is not None else None,
@@ -149,6 +155,7 @@ class FundingArbRuntimeHandle:
             return
         self._cycle = await self._deps.cycles.get_active(str(self._strategy_id))
         if self._cycle is not None:
+            self._bind_cycle_instruments(self._cycle)
             await self._recover_cycle()
         self._stop_event.clear()
         self._task = asyncio.create_task(self._run_loop(), name=f"funding_arb:{self._strategy_id}")
@@ -176,11 +183,11 @@ class FundingArbRuntimeHandle:
         async with self._evaluation_lock:
             if self._cycle is not None and config.revision != self._config_revision:
                 raise StrategyLifecycleError("funding-arb config cannot change while a cycle is active")
-            params = decode_funding_arb_config(config, symbol=self._perp_symbol)
+            params = decode_funding_arb_config(config)
             self._params = params
             self._config_revision = config.revision
-            if self._deps is not None:
-                self._validate_instruments(params)
+            if self._deps is not None and self._perp is not None:
+                self._validate_leverage(self._perp, params)
         self._log.info("funding_arb_runtime_config_applied", revision=config.revision)
 
     async def stop(self) -> None:
@@ -192,6 +199,8 @@ class FundingArbRuntimeHandle:
                 await self._close_cycle("operator_stop")
                 if self._cycle is not None:
                     raise StrategyLifecycleError("funding-arb stop could not flatten both legs")
+            elif self._cycle is not None:
+                self._release_cycle_binding()
         self._stop_event.set()
         task = self._task
         self._task = None
@@ -208,25 +217,32 @@ class FundingArbRuntimeHandle:
             raise StrategyLifecycleError("funding-arb requires a configured testnet account")
         if self._sub_account != deps.account_address.lower():
             raise StrategyLifecycleError("funding-arb instance sub_account must match the routed exchange account")
-        self._validate_instruments(self._params)
 
-    def _validate_instruments(self, params: FundingArbParams) -> None:
+    def _bind_cycle_instruments(self, cycle: FundingArbCycle) -> None:
         deps = self._require_deps()
-        spot = deps.metadata.resolve_spot(params.spot_coin)
-        perp = deps.metadata.get(Symbol(self._perp_symbol))
+        spot = deps.metadata.resolve_spot(cycle.spot_symbol)
+        perp = deps.metadata.get(Symbol(cycle.perp_symbol))
         if spot is None or not spot.is_spot:
-            raise StrategyLifecycleError(f"spot metadata is unavailable for {params.spot_coin}")
+            raise StrategyLifecycleError(f"spot metadata is unavailable for {cycle.spot_symbol}")
         if perp is None or perp.is_spot:
-            raise StrategyLifecycleError(f"perpetual metadata is unavailable for {self._perp_symbol}")
-        if spot.base_token != self._perp_symbol or spot.quote_token != "USDC":
+            raise StrategyLifecycleError(f"perpetual metadata is unavailable for {cycle.perp_symbol}")
+        self._validate_pair(spot, perp)
+        self._validate_leverage(perp, self._params)
+        self._spot = spot
+        self._perp = perp
+
+    @staticmethod
+    def _validate_pair(spot: InstrumentInfo, perp: InstrumentInfo) -> None:
+        if spot.base_token != str(perp.symbol) or spot.quote_token != "USDC":
             raise StrategyLifecycleError(
-                f"spot/perp risk units do not match: spot={spot.display_name} perp={self._perp_symbol}"
+                f"spot/perp risk units do not match: spot={spot.display_name} perp={perp.symbol}"
             )
+
+    @staticmethod
+    def _validate_leverage(perp: InstrumentInfo, params: FundingArbParams) -> None:
         leverage = int(params.leverage)
         if leverage > perp.max_leverage:
             raise StrategyLifecycleError(f"configured leverage {leverage} exceeds exchange maximum {perp.max_leverage}")
-        self._spot = spot
-        self._perp = perp
 
     async def _run_loop(self) -> None:
         deps = self._require_deps()
@@ -249,7 +265,7 @@ class FundingArbRuntimeHandle:
         if self._cycle is None:
             if not self._allow_entry or not self._entry_runtime_ready():
                 return
-            plan = self._entry_plan()
+            plan = await self._entry_plan()
             if plan is not None:
                 await self._open_cycle(plan)
             return
@@ -258,8 +274,16 @@ class FundingArbRuntimeHandle:
         if self._cycle.state != FundingArbCycleState.OPEN:
             await self._recover_cycle()
             return
-        funding = self._require_deps().provider.get_funding(Symbol(self._perp_symbol))
-        if funding is not None and Decimal(str(funding.funding_rate)) <= self._params.exit_funding_rate:
+        cycle = self._cycle
+        try:
+            market = await self._require_deps().scanner.get_market(
+                Symbol(cycle.perp_symbol),
+                Symbol(cycle.spot_symbol),
+            )
+        except Exception:
+            self._log.exception("funding_arb_active_market_refresh_failed")
+            market = None
+        if market is not None and market.funding_rate <= self._params.exit_funding_rate:
             await self._close_cycle("funding_exit")
             return
         await self._rebalance_if_needed()
@@ -281,92 +305,235 @@ class FundingArbRuntimeHandle:
             return False
         return True
 
-    def _entry_plan(self) -> _EntryPlan | None:
+    async def _entry_plan(
+        self,
+        preferred: tuple[Symbol, Symbol] | None = None,
+    ) -> _EntryPlan | None:
         deps = self._require_deps()
-        spot = self._require_spot()
-        perp = self._require_perp()
-        perp_book = deps.provider.get_book(Symbol(self._perp_symbol))
-        spot_book = deps.provider.get_spot_book(spot.symbol)
-        funding = deps.provider.get_funding(Symbol(self._perp_symbol))
-        if funding is None:
-            return self._block_entry("funding_unavailable")
-        funding_rate = Decimal(str(funding.funding_rate))
-        if funding_rate < self._params.entry_funding_rate:
+        try:
+            if preferred is None:
+                candidates = await deps.scanner.scan()
+            else:
+                candidate = await deps.scanner.get_market(*preferred)
+                candidates = (candidate,) if candidate is not None else ()
+        except Exception as exc:
+            self._log.exception("funding_arb_market_scan_failed")
+            self._candidate_count = 0
+            return self._block_entry("market_scan_failed", error=type(exc).__name__)
+        self._candidate_count = len(candidates)
+        if not candidates:
+            return self._block_entry("no_common_spot_perp_markets", candidate_count=0)
+
+        accepted: list[_EntryPlan] = []
+        rejected: list[tuple[str, dict[str, Any]]] = []
+        for candidate in candidates:
+            plan, reason, diagnostics = self._candidate_plan(candidate)
+            if plan is not None:
+                accepted.append(plan)
+            else:
+                rejected.append((reason, diagnostics))
+        if not accepted:
+            if len(rejected) == 1:
+                return self._block_entry(rejected[0][0], **rejected[0][1])
+            reasons: dict[str, int] = {}
+            for reason, _ in rejected:
+                reasons[reason] = reasons.get(reason, 0) + 1
             return self._block_entry(
-                "funding_below_entry_threshold",
-                funding_rate=funding_rate,
-                entry_funding_rate=self._params.entry_funding_rate,
+                "no_eligible_liquid_market",
+                candidate_count=len(candidates),
+                rejection_counts=",".join(f"{key}:{value}" for key, value in sorted(reasons.items())),
             )
+        plan = max(
+            accepted,
+            key=lambda item: (item.expected_edge_bps, item.liquidity_volume_usd, item.top_book_depth_usd),
+        )
+        self._entry_block_reason = None
+        self._entry_diagnostics = {
+            "selected_perp": str(plan.perp.symbol),
+            "selected_spot": plan.spot.display_name,
+            "funding_rate": str(plan.funding_rate),
+            "basis_bps": str(plan.basis_bps),
+            "expected_edge_bps": str(plan.expected_edge_bps),
+            "liquidity_volume_usd": str(plan.liquidity_volume_usd),
+            "top_book_depth_usd": str(plan.top_book_depth_usd),
+            "perp_size": str(plan.perp_size),
+            "spot_size": str(plan.spot_size),
+        }
+        return plan
+
+    def _candidate_plan(
+        self,
+        candidate: FundingArbMarketSnapshot,
+    ) -> tuple[_EntryPlan | None, str, dict[str, Any]]:
+        deps = self._require_deps()
+        spot = deps.metadata.resolve_spot(candidate.spot_symbol)
+        perp = deps.metadata.get(candidate.perp_symbol)
+        market = {"perp": str(candidate.perp_symbol), "spot": candidate.spot_display}
+        if spot is None or perp is None or not spot.is_spot or perp.is_spot:
+            return None, "instrument_metadata_unavailable", market
+        try:
+            self._validate_pair(spot, perp)
+            self._validate_leverage(perp, self._params)
+        except StrategyLifecycleError as exc:
+            return None, "instrument_pair_invalid", {**market, "error": str(exc)}
+        if candidate.spot_24h_volume_usd < deps.deployment.min_spot_24h_volume_usd:
+            return (
+                None,
+                "spot_volume_below_minimum",
+                {
+                    **market,
+                    "spot_24h_volume_usd": candidate.spot_24h_volume_usd,
+                    "minimum": deps.deployment.min_spot_24h_volume_usd,
+                },
+            )
+        if candidate.perp_24h_volume_usd < deps.deployment.min_perp_24h_volume_usd:
+            return (
+                None,
+                "perp_volume_below_minimum",
+                {
+                    **market,
+                    "perp_24h_volume_usd": candidate.perp_24h_volume_usd,
+                    "minimum": deps.deployment.min_perp_24h_volume_usd,
+                },
+            )
+        perp_book = candidate.perp_book
+        spot_book = candidate.spot_book
         if not self._valid_book(perp_book):
-            return self._block_entry("perp_book_invalid_or_stale")
+            return None, "perp_book_invalid_or_stale", market
         if not self._valid_book(spot_book):
-            return self._block_entry("spot_book_invalid_or_stale")
-        assert perp_book is not None and spot_book is not None
+            return None, "spot_book_invalid_or_stale", market
+        funding_rate = candidate.funding_rate
+        if funding_rate < self._params.entry_funding_rate:
+            return (
+                None,
+                "funding_below_entry_threshold",
+                {
+                    **market,
+                    "funding_rate": funding_rate,
+                    "entry_funding_rate": self._params.entry_funding_rate,
+                },
+            )
         perp_mid = (Decimal(perp_book.bids[0].price) + Decimal(perp_book.asks[0].price)) / 2
         spot_mid = (Decimal(spot_book.bids[0].price) + Decimal(spot_book.asks[0].price)) / 2
         basis_bps = abs(perp_mid - spot_mid) / spot_mid * Decimal(10_000)
         if basis_bps > self._params.max_basis_bps:
-            return self._block_entry(
+            return (
+                None,
                 "basis_exceeds_limit",
-                basis_bps=basis_bps,
-                max_basis_bps=self._params.max_basis_bps,
+                {
+                    **market,
+                    "basis_bps": basis_bps,
+                    "max_basis_bps": self._params.max_basis_bps,
+                },
             )
         spread_cost_bps = (
             (Decimal(perp_book.asks[0].price) - Decimal(perp_book.bids[0].price)) / perp_mid
             + (Decimal(spot_book.asks[0].price) - Decimal(spot_book.bids[0].price)) / spot_mid
         ) * Decimal(10_000)
+        if spread_cost_bps > deps.deployment.max_combined_spread_bps:
+            return (
+                None,
+                "combined_spread_exceeds_limit",
+                {
+                    **market,
+                    "combined_spread_bps": spread_cost_bps,
+                    "maximum": deps.deployment.max_combined_spread_bps,
+                },
+            )
+        top_book_depth = min(
+            self._book_depth_usd(perp_book, bids=True),
+            self._book_depth_usd(perp_book, bids=False),
+            self._book_depth_usd(spot_book, bids=True),
+            self._book_depth_usd(spot_book, bids=False),
+        )
+        notional = min(self._params.max_notional_usd, deps.deployment.max_notional_usd)
+        required_depth = max(deps.deployment.min_top_book_depth_usd, notional)
+        if top_book_depth < required_depth:
+            return (
+                None,
+                "book_depth_below_minimum",
+                {
+                    **market,
+                    "top_book_depth_usd": top_book_depth,
+                    "minimum": required_depth,
+                },
+            )
         expected_edge = (
             funding_rate * self._params.expected_hold_hours * Decimal(10_000)
             - self._params.round_trip_fee_bps
             - spread_cost_bps
         )
         if expected_edge < self._params.min_expected_edge_bps:
-            return self._block_entry(
+            return (
+                None,
                 "expected_edge_below_minimum",
-                expected_edge_bps=expected_edge,
-                min_expected_edge_bps=self._params.min_expected_edge_bps,
-                spread_cost_bps=spread_cost_bps,
+                {
+                    **market,
+                    "expected_edge_bps": expected_edge,
+                    "min_expected_edge_bps": self._params.min_expected_edge_bps,
+                    "spread_cost_bps": spread_cost_bps,
+                },
             )
-        current_perp = deps.tracker.get_position(Symbol(self._perp_symbol))
+        current_perp = deps.tracker.get_position(perp.symbol)
         if current_perp is not None and not current_perp.is_flat:
-            return self._block_entry("existing_perp_position", position_size=current_perp.size)
-        notional = min(self._params.max_notional_usd, deps.deployment.max_notional_usd)
+            return None, "existing_perp_position", {**market, "position_size": current_perp.size}
         perp_size = self._floor(notional / perp_mid, perp.lot_size)
         spot_size = self._floor(perp_size * self._params.hedge_ratio, spot.lot_size)
         if perp_size < perp.min_size or spot_size < spot.min_size:
-            return self._block_entry(
+            return (
+                None,
                 "size_below_exchange_minimum",
-                perp_size=perp_size,
-                spot_size=spot_size,
+                {
+                    **market,
+                    "perp_size": perp_size,
+                    "spot_size": spot_size,
+                },
             )
         slippage_multiplier = Decimal(10_000 + self._params.max_slippage_bps) / Decimal(10_000)
         quote_balance = deps.tracker.get_spot_balance(spot.quote_token or "")
         required_quote = spot_size * Decimal(spot_book.asks[0].price) * slippage_multiplier
         if quote_balance is None or Decimal(quote_balance.available) < required_quote:
-            return self._block_entry(
+            return (
+                None,
                 "insufficient_spot_quote_balance",
-                required_quote=required_quote,
-                available_quote=Decimal(quote_balance.available) if quote_balance is not None else Decimal(0),
+                {
+                    **market,
+                    "required_quote": required_quote,
+                    "available_quote": Decimal(quote_balance.available) if quote_balance is not None else Decimal(0),
+                },
             )
         account = deps.tracker.get_account_state()
         required_margin = perp_size * perp_mid / self._params.leverage * slippage_multiplier
         if account is None or Decimal(account.available_balance) < required_margin:
-            return self._block_entry(
+            return (
+                None,
                 "insufficient_perp_margin",
-                required_margin=required_margin,
-                available_margin=Decimal(account.available_balance) if account is not None else Decimal(0),
+                {
+                    **market,
+                    "required_margin": required_margin,
+                    "available_margin": Decimal(account.available_balance) if account is not None else Decimal(0),
+                },
             )
-        self._entry_block_reason = None
-        self._entry_diagnostics = {
-            "funding_rate": str(funding_rate),
-            "basis_bps": str(basis_bps),
-            "expected_edge_bps": str(expected_edge),
-            "perp_size": str(perp_size),
-            "spot_size": str(spot_size),
-            "required_quote": str(required_quote),
-            "required_margin": str(required_margin),
-        }
-        return _EntryPlan(funding_rate, basis_bps, perp_size, spot_size)
+        liquidity_volume = min(candidate.perp_24h_volume_usd, candidate.spot_24h_volume_usd)
+        return (
+            _EntryPlan(
+                perp=perp,
+                spot=spot,
+                funding_rate=funding_rate,
+                basis_bps=basis_bps,
+                expected_edge_bps=expected_edge,
+                liquidity_volume_usd=liquidity_volume,
+                top_book_depth_usd=top_book_depth,
+                perp_size=perp_size,
+                spot_size=spot_size,
+            ),
+            "",
+            {
+                **market,
+                "required_quote": required_quote,
+                "required_margin": required_margin,
+            },
+        )
 
     def _block_entry(self, reason: str, **diagnostics: Any) -> _EntryPlan | None:
         self._entry_block_reason = reason
@@ -379,15 +546,38 @@ class FundingArbRuntimeHandle:
         age = (datetime.now(UTC) - book.received_at).total_seconds()
         return age <= self._require_deps().deployment.market_stale_seconds
 
+    def _book_depth_usd(self, book: L2BookSnapshot, *, bids: bool) -> Decimal:
+        levels = book.bids if bids else book.asks
+        if not levels:
+            return Decimal(0)
+        best = Decimal(levels[0].price)
+        slippage = Decimal(self._params.max_slippage_bps) / Decimal(10_000)
+        boundary = best * (Decimal(1) - slippage if bids else Decimal(1) + slippage)
+        total = Decimal(0)
+        for level in levels:
+            price = Decimal(level.price)
+            if (bids and price < boundary) or (not bids and price > boundary):
+                break
+            total += price * Decimal(level.size)
+        return total
+
     async def _open_cycle(self, plan: _EntryPlan) -> None:
         deps = self._require_deps()
-        spot = self._require_spot()
+        self._spot = plan.spot
+        self._perp = plan.perp
         if not await self._refresh_authoritative_account():
+            self._block_entry("account_reconciliation_failed")
+            self._clear_market_binding()
             return
-        refreshed_plan = self._entry_plan()
+        refreshed_plan = await self._entry_plan((plan.perp.symbol, plan.spot.symbol))
         if refreshed_plan is None:
+            self._clear_market_binding()
             return
         plan = refreshed_plan
+        spot = plan.spot
+        perp = plan.perp
+        self._spot = spot
+        self._perp = perp
         baseline = self._spot_total(spot.base_token or "")
         spot_cloid = self._new_cloid()
         cycle = FundingArbCycle(
@@ -395,7 +585,7 @@ class FundingArbRuntimeHandle:
             strategy_id=str(self._strategy_id),
             config_revision=self._config_revision,
             sub_account=self._sub_account,
-            perp_symbol=self._perp_symbol,
+            perp_symbol=str(perp.symbol),
             spot_symbol=str(spot.symbol),
             spot_display=spot.display_name,
             base_token=spot.base_token or "",
@@ -411,7 +601,11 @@ class FundingArbRuntimeHandle:
             revision=0,
             spot_entry_cloid=spot_cloid,
         )
-        self._cycle = await deps.cycles.create(cycle)
+        try:
+            self._cycle = await deps.cycles.create(cycle)
+        except Exception:
+            self._clear_market_binding()
+            raise
         spot_outcome = await self._execute_leg(
             spot.symbol,
             Side.BUY,
@@ -429,7 +623,7 @@ class FundingArbRuntimeHandle:
                 error_code="spot_entry_no_fill",
                 error_message="spot entry produced no authenticated fill",
             )
-            self._cycle = None
+            self._release_cycle_binding()
             return
         perp_target = self._floor(
             spot_outcome.filled_size / self._params.hedge_ratio,
@@ -446,9 +640,9 @@ class FundingArbRuntimeHandle:
             spot_open_size=spot_outcome.filled_size,
             perp_entry_cloid=perp_cloid,
         )
-        await deps.execution.update_leverage(self._perp_symbol, int(self._params.leverage), is_cross=False)
+        await deps.execution.update_leverage(str(perp.symbol), int(self._params.leverage), is_cross=False)
         perp_outcome = await self._execute_leg(
-            Symbol(self._perp_symbol),
+            perp.symbol,
             Side.SELL,
             min(perp_target, plan.perp_size),
             cloid=perp_cloid,
@@ -484,7 +678,7 @@ class FundingArbRuntimeHandle:
                 spot_open_size=Decimal(0),
                 perp_open_size=Decimal(0),
             )
-            self._cycle = None
+            self._release_cycle_binding()
             return
         if not self._hedge_matches(spot_size, perp_size):
             await self._fault("entry_compensation_incomplete", "two legs could not be aligned")
@@ -520,7 +714,7 @@ class FundingArbRuntimeHandle:
                 spot_open_size=Decimal(0),
                 perp_open_size=Decimal(0),
             )
-            self._cycle = None
+            self._release_cycle_binding()
             return
         filled = await self._execute_reducing(
             self._require_spot().symbol,
@@ -545,7 +739,7 @@ class FundingArbRuntimeHandle:
             spot_open_size=Decimal(0),
             perp_open_size=Decimal(0),
         )
-        self._cycle = None
+        self._release_cycle_binding()
 
     async def _close_cycle(self, reason: str) -> None:
         cycle = self._cycle
@@ -564,7 +758,7 @@ class FundingArbRuntimeHandle:
         )
         if perp_size > 0:
             filled = await self._execute_reducing(
-                Symbol(self._perp_symbol),
+                self._require_perp().symbol,
                 Side.BUY,
                 perp_size,
                 is_spot=False,
@@ -614,7 +808,7 @@ class FundingArbRuntimeHandle:
             error_code=None,
             error_message=None,
         )
-        self._cycle = None
+        self._release_cycle_binding()
 
     async def _rebalance_if_needed(self) -> None:
         if self._cycle is None or not await self._refresh_authoritative_account():
@@ -669,7 +863,7 @@ class FundingArbRuntimeHandle:
             excess = self._floor(perp_size - target_perp, self._require_perp().lot_size)
             if excess > 0:
                 filled = await self._execute_reducing(
-                    Symbol(self._perp_symbol),
+                    self._require_perp().symbol,
                     Side.BUY,
                     excess,
                     is_spot=False,
@@ -794,8 +988,15 @@ class FundingArbRuntimeHandle:
     async def _recover_cycle(self) -> None:
         cycle = self._cycle
         if cycle is None or cycle.state == FundingArbCycleState.CLOSED:
-            self._cycle = None
+            self._release_cycle_binding()
             return
+        if (
+            self._spot is None
+            or self._perp is None
+            or self._spot.symbol != Symbol(cycle.spot_symbol)
+            or self._perp.symbol != Symbol(cycle.perp_symbol)
+        ):
+            self._bind_cycle_instruments(cycle)
         if cycle.state == FundingArbCycleState.FAULTED:
             return
         if not await self._refresh_authoritative_account():
@@ -867,9 +1068,17 @@ class FundingArbRuntimeHandle:
             return Decimal(0), Decimal(0)
         spot_total = self._spot_total(self._cycle.base_token)
         spot_size = max(Decimal(0), spot_total - self._cycle.baseline_spot_size)
-        position = self._require_deps().tracker.get_position(Symbol(self._perp_symbol))
+        position = self._require_deps().tracker.get_position(Symbol(self._cycle.perp_symbol))
         perp_size = max(Decimal(0), -Decimal(position.size)) if position is not None else Decimal(0)
         return spot_size, perp_size
+
+    def _clear_market_binding(self) -> None:
+        self._spot = None
+        self._perp = None
+
+    def _release_cycle_binding(self) -> None:
+        self._cycle = None
+        self._clear_market_binding()
 
     def _spot_total(self, token: str) -> Decimal:
         balance = self._require_deps().tracker.get_spot_balance(token)
@@ -920,10 +1129,9 @@ def build_funding_arb_plugin(*, dependencies: FundingArbRuntimeDependencies | No
     from hypeedge.strategy.plugin import FUNDING_ARB_CAPABILITIES, StaticStrategyTypePlugin
 
     def factory(context: StrategyBuildContext) -> FundingArbRuntimeHandle:
-        params = decode_funding_arb_config(context.config, symbol=str(context.instance.symbol))
+        params = decode_funding_arb_config(context.config)
         return FundingArbRuntimeHandle(
             context.instance.strategy_id,
-            str(context.instance.symbol),
             params,
             config_revision=context.config.revision,
             sub_account=str(context.instance.sub_account),
@@ -936,7 +1144,7 @@ def build_funding_arb_plugin(*, dependencies: FundingArbRuntimeDependencies | No
         factory=factory,
         _default_config=default_funding_arb_config(),
         _validate=normalize_funding_arb_config,
-        _decode=lambda snapshot: decode_funding_arb_config(snapshot, symbol="BTC"),
+        _decode=decode_funding_arb_config,
     )
 
 

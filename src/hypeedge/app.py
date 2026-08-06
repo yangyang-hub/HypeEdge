@@ -52,6 +52,10 @@ if TYPE_CHECKING:
 
 logger = structlog.get_logger(__name__)
 
+_AUTOMATIC_SAFETY_REASON_PREFIX = "automatic_safety_degradation:"
+_HEALTH_MONITOR_INTERVAL_SECONDS = 1.0
+_RECOVERY_RETRY_INTERVAL_SECONDS = 5.0
+
 
 def setup_logging(log_level: str) -> None:
     """Configure structlog for structured JSON logging."""
@@ -145,6 +149,7 @@ class HypeEdgeApp:
         self._market_making_state_store: Any | None = None
         self._quote_plan_worker: Any | None = None
         self._trading_prerequisites_ok = False
+        self._automatic_safety_lock = asyncio.Lock()
 
         # Strategy components
         self._strategy: TrendFollowStrategy | None = None
@@ -475,6 +480,7 @@ class HypeEdgeApp:
                 else None
             ),
             account_health=self._account_health,
+            on_health_failure=self._on_account_health_failure,
         )
 
         # Kill Switch first imports the exchange-authoritative target set and
@@ -582,12 +588,21 @@ class HypeEdgeApp:
             and self._market_data_provider is not None
             and self._instrument_cache is not None
             and self._reconciler is not None
+            and self._rest_client is not None
+            and self._ws_feed is not None
         ):
+            from hypeedge.market_data.funding_arb_scanner import HyperliquidFundingArbMarketScanner
             from hypeedge.storage.funding_arb import PostgresFundingArbCycleStore
 
+            funding_scanner = HyperliquidFundingArbMarketScanner(
+                self._rest_client,
+                self._instrument_cache,
+                self._ws_feed.book_manager,
+                self.settings.funding_arb,
+            )
             funding_dependencies = FundingArbRuntimeDependencies(
                 execution=self._execution_engine,
-                provider=self._market_data_provider,
+                scanner=funding_scanner,
                 tracker=self._tracker,
                 metadata=self._instrument_cache,
                 cycles=PostgresFundingArbCycleStore(self._pg_session_factory),
@@ -892,6 +907,7 @@ class HypeEdgeApp:
                     engine=self._execution_engine,
                     event_bus=self.event_bus,
                     account_health=self._account_health,
+                    on_health_failure=self._on_account_health_failure,
                 )
                 if self._tracker is not None and self._account_health is not None and self._rest_client is not None:
                     self._account_state_poller = AccountStatePoller(
@@ -1069,8 +1085,6 @@ class HypeEdgeApp:
                             tasks.append(self._strategy_task)
                         if self._param_watcher:
                             tasks.append(asyncio.create_task(self._param_watcher.run(), name="param_watcher"))
-                    if self._rest_client is not None:
-                        tasks.append(asyncio.create_task(self._poll_action_credits(), name="action_credits_poll"))
                     if self._strategy_supervisor is not None:
                         # This is a one-shot setup task: it polls until
                         # prerequisites are fresh, restores durable instances,
@@ -1088,10 +1102,7 @@ class HypeEdgeApp:
                         reason = "exchange_history_recovery_failed"
                     else:
                         reason = "startup_reconciliation_failed" if not result.success else "action_credits_unavailable"
-                    self._safety_controller.enter_cancel_only(reason)
-                    self._trading_enabled = False
-                    if self._metrics:
-                        self._metrics.set_trading_enabled(False)
+                    await self._enter_automatic_safety_degradation(reason)
                     logger.warning("trading_stay_disabled", reconciliation="failed", errors=result.errors)
 
                 # Account polling and periodic reconciliation start only after
@@ -1099,6 +1110,9 @@ class HypeEdgeApp:
                 # account calls from racing the startup gate.
                 if self._account_state_poller is not None:
                     tasks.append(asyncio.create_task(self._account_state_poller.run(), name="account_state_poller"))
+                if self._rest_client is not None:
+                    tasks.append(asyncio.create_task(self._poll_action_credits(), name="action_credits_poll"))
+                tasks.append(asyncio.create_task(self._monitor_trading_health(), name="trading_health_monitor"))
                 tasks.append(
                     asyncio.create_task(
                         self._reconciler.run_periodic(
@@ -1149,7 +1163,7 @@ class HypeEdgeApp:
         """Keep the shared address quota fresh for every REST/execution consumer."""
         while True:
             if not await self._refresh_action_budget():
-                self._safety_controller.enter_cancel_only("action_credits_unavailable")
+                await self._enter_automatic_safety_degradation("action_credits_unavailable")
             interval = (
                 self._action_budget_controller.next_remote_poll_interval_seconds
                 if self._action_budget_controller is not None
@@ -1303,7 +1317,7 @@ class HypeEdgeApp:
             for task in self._tasks:
                 if task.get_name() == "strategy_runner":
                     task.cancel()
-            await self._pause_all_market_making()
+            await self._suspend_all_strategies_for_safety(f"kill_switch:{reason}")
             if await self._kill_switch.wait_until_halted():
                 await self._persist_system_state("halted", reason, kill_switch_active=True)
 
@@ -1491,13 +1505,198 @@ class HypeEdgeApp:
         return self._strategy_supervisor.runtime_snapshot(strategy_id)
 
     async def _on_account_health_failure(self, reason: str) -> None:
+        await self._enter_automatic_safety_degradation(reason)
+
+    async def _enter_automatic_safety_degradation(self, reason: str) -> None:
+        """Persist a recoverable CANCEL_ONLY state and suspend runtimes without changing desired state."""
+        normalized = reason.strip() or "unspecified_health_failure"
+        async with self._automatic_safety_lock:
+            from hypeedge.core.enums import SafetyMode
+
+            if self._kill_switch.is_active or self._safety_controller.mode in {
+                SafetyMode.HALTING,
+                SafetyMode.HALTED,
+            }:
+                self._trading_enabled = False
+                if self._metrics is not None:
+                    self._metrics.set_trading_enabled(False)
+                return
+            durable_reason = f"{_AUTOMATIC_SAFETY_REASON_PREFIX}{normalized}"
+            already_degraded = (
+                self._safety_controller.mode == SafetyMode.CANCEL_ONLY
+                and self._safety_controller.reason == durable_reason
+            )
+            self._trading_enabled = False
+            if self._metrics is not None:
+                self._metrics.set_trading_enabled(False)
+            if already_degraded:
+                return
+            self._safety_controller.enter_cancel_only(durable_reason)
+            persisted = await self._persist_system_state(
+                "cancel_only",
+                durable_reason,
+                kill_switch_active=False,
+            )
+            await self._suspend_all_strategies_for_safety(normalized)
+            if not persisted:
+                self._safety_controller.enter_cancel_only("system_state_persistence_failed")
+
+    async def _monitor_trading_health(self) -> None:
+        """Continuously enforce freshness and attempt only fully gated automatic recovery."""
+        while not self.is_shutting_down:
+            retry_delay = _HEALTH_MONITOR_INTERVAL_SECONDS
+            try:
+                from hypeedge.core.enums import SafetyMode
+
+                if not self._kill_switch.is_active:
+                    ready, reason = self._placement_prerequisites_fresh(require_reconciliation=True)
+                    if self._safety_controller.mode == SafetyMode.NORMAL and not ready:
+                        await self._enter_automatic_safety_degradation(reason)
+                    elif self._is_automatic_safety_degradation() and not await self._try_recover_automatic_safety():
+                        retry_delay = _RECOVERY_RETRY_INTERVAL_SECONDS
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("trading_health_monitor_failed")
+                await self._enter_automatic_safety_degradation("trading_health_monitor_failed")
+                retry_delay = _RECOVERY_RETRY_INTERVAL_SECONDS
+            await asyncio.sleep(retry_delay)
+
+    def _placement_prerequisites_fresh(self, *, require_reconciliation: bool) -> tuple[bool, str]:
+        if self._account_health is None:
+            return False, "account_health_unavailable"
+        health = self._account_health.get_account_health()
+        dimensions = [health.inventory, health.clearinghouse, health.user_stream]
+        if require_reconciliation:
+            dimensions.append(health.reconciliation)
+        blocked = [
+            f"{item.dimension.value}:{item.reason or item.status.value}" for item in dimensions if not item.is_fresh
+        ]
+        if blocked:
+            return False, "account_health_unavailable:" + ",".join(blocked)
+        if self._action_budget_controller is None:
+            return False, "action_budget_unavailable"
+        budget = self._action_budget_controller.snapshot()
+        if not budget.remote_fresh or not budget.cancel_headroom_fresh:
+            return False, "action_budget_stale"
+        mode = getattr(budget.mode, "value", budget.mode)
+        if mode not in {"normal", "conserve"}:
+            return False, f"action_budget_{mode}"
+        return True, "ready"
+
+    def _is_automatic_safety_degradation(self) -> bool:
+        from hypeedge.core.enums import SafetyMode
+
+        reason = self._safety_controller.reason
+        return (
+            self._safety_controller.mode == SafetyMode.CANCEL_ONLY
+            and reason is not None
+            and reason.startswith(_AUTOMATIC_SAFETY_REASON_PREFIX)
+        )
+
+    async def _try_recover_automatic_safety(self) -> bool:
+        """Recover transient health degradation only after history, budget, and reconciliation gates pass."""
+        async with self._automatic_safety_lock:
+            from hypeedge.core.enums import SafetyMode
+
+            if (
+                not self._is_automatic_safety_degradation()
+                or self._kill_switch.is_active
+                or self.is_shutting_down
+                or not self._trading_prerequisites_ok
+                or self._exchange_ingestor is None
+                or self._reconciler is None
+            ):
+                return False
+            ready, _ = self._placement_prerequisites_fresh(require_reconciliation=False)
+            if not ready:
+                return False
+
+            recovery_reason = self._safety_controller.reason or (f"{_AUTOMATIC_SAFETY_REASON_PREFIX}unknown")
+            self._safety_controller.transition(SafetyMode.RECOVERING, "automatic_safety_recovery")
+            if not await self._persist_system_state(
+                "recovering",
+                "automatic_safety_recovery",
+                kill_switch_active=False,
+            ):
+                self._safety_controller.enter_cancel_only("system_state_persistence_failed")
+                return False
+
+            try:
+                await self._exchange_ingestor.recover_history()
+            except Exception:
+                logger.exception("automatic_recovery_exchange_history_failed")
+                await self._return_to_automatic_cancel_only("exchange_history_recovery_failed")
+                return False
+
+            ready, reason = self._placement_prerequisites_fresh(require_reconciliation=False)
+            if not ready:
+                await self._return_to_automatic_cancel_only(reason)
+                return False
+
+            self._safety_controller.transition(SafetyMode.RECONCILING, "automatic_safety_reconciliation")
+            if not await self._persist_system_state(
+                "reconciling",
+                "automatic_safety_reconciliation",
+                kill_switch_active=False,
+            ):
+                self._safety_controller.enter_cancel_only("system_state_persistence_failed")
+                return False
+
+            result = await self._reconciler.reconcile()
+            credits_ok = await self._refresh_action_budget()
+            ready, reason = self._placement_prerequisites_fresh(require_reconciliation=True)
+            if not result.success or not credits_ok or not ready:
+                if not result.success:
+                    reason = "automatic_reconciliation_failed"
+                elif not credits_ok:
+                    reason = "action_credits_unavailable"
+                await self._return_to_automatic_cancel_only(reason)
+                logger.warning(
+                    "automatic_safety_recovery_blocked",
+                    original_reason=recovery_reason,
+                    reason=reason,
+                    reconciliation_errors=result.errors,
+                )
+                return False
+
+            if not await self._persist_system_state(
+                "normal",
+                "automatic_safety_recovery_passed",
+                kill_switch_active=False,
+            ):
+                self._safety_controller.enter_cancel_only("system_state_persistence_failed")
+                return False
+            self._safety_controller.transition(SafetyMode.NORMAL, "automatic_safety_recovery_passed")
+            self._trading_enabled = True
+            self._ensure_trading_workers_running()
+            if self._metrics is not None:
+                self._metrics.set_trading_enabled(True)
+            await self._resume_system_suspended_strategies()
+            logger.info("automatic_safety_recovery_completed", original_reason=recovery_reason)
+            return True
+
+    async def _return_to_automatic_cancel_only(self, reason: str) -> None:
+        durable_reason = f"{_AUTOMATIC_SAFETY_REASON_PREFIX}{reason}"
         self._trading_enabled = False
-        self._safety_controller.enter_cancel_only(reason)
+        self._safety_controller.enter_cancel_only(durable_reason)
         if self._metrics is not None:
             self._metrics.set_trading_enabled(False)
-        await self._pause_all_market_making()
+        if not await self._persist_system_state(
+            "cancel_only",
+            durable_reason,
+            kill_switch_active=False,
+        ):
+            self._safety_controller.enter_cancel_only("system_state_persistence_failed")
 
-    async def _pause_all_market_making(self) -> None:
+    def _ensure_trading_workers_running(self) -> None:
+        active_names = {task.get_name() for task in self._tasks if not task.done()}
+        if self._signed_action_executor is not None and "signed_action_executor" not in active_names:
+            self._tasks.append(asyncio.create_task(self._signed_action_executor.run(), name="signed_action_executor"))
+        if self._quote_plan_worker is not None and "quote_plan_worker" not in active_names:
+            self._tasks.append(asyncio.create_task(self._quote_plan_worker.run(), name="quote_plan_worker"))
+
+    async def _suspend_all_strategies_for_safety(self, reason: str) -> None:
         if self._strategy_supervisor is None or self._market_making_state_store is None:
             return
         from hypeedge.core.enums import MarketMakerLifecycle
@@ -1508,9 +1707,29 @@ class HypeEdgeApp:
                 MarketMakerLifecycle.WARMING,
                 MarketMakerLifecycle.SHADOW,
                 MarketMakerLifecycle.RUNNING,
+                MarketMakerLifecycle.DRAINING,
             }:
-                with contextlib.suppress(Exception):
-                    await self._strategy_supervisor.pause(instance.strategy_id)
+                try:
+                    await self._strategy_supervisor.suspend_for_safety(instance.strategy_id, reason)
+                except Exception:
+                    logger.exception("strategy_safety_suspend_failed", strategy_id=str(instance.strategy_id))
+
+    async def _resume_system_suspended_strategies(self) -> None:
+        if self._strategy_supervisor is None or self._market_making_state_store is None:
+            return
+        from hypeedge.core.enums import MarketMakerLifecycle
+        from hypeedge.strategy.supervisor import is_system_safety_pause_reason
+
+        for instance in await self._market_making_state_store.list_instances():
+            if instance.desired_state not in {MarketMakerLifecycle.SHADOW, MarketMakerLifecycle.RUNNING}:
+                continue
+            runtime = await self._market_making_state_store.get_runtime(instance.strategy_id)
+            if runtime.actual_state != MarketMakerLifecycle.PAUSED or not is_system_safety_pause_reason(runtime.reason):
+                continue
+            try:
+                await self._strategy_supervisor.resume_from_safety(instance.strategy_id)
+            except Exception:
+                logger.exception("strategy_safety_resume_failed", strategy_id=str(instance.strategy_id))
 
     async def _stop_all_market_making(self) -> None:
         if self._strategy_supervisor is None or self._market_making_state_store is None:
@@ -1609,6 +1828,7 @@ class HypeEdgeApp:
             self._tasks.append(asyncio.create_task(self._signed_action_executor.run(), name="signed_action_executor"))
         if self._metrics:
             self._metrics.set_trading_enabled(True)
+        await self._resume_system_suspended_strategies()
         return True
 
     async def start_strategy(self) -> bool:

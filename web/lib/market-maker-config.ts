@@ -244,14 +244,10 @@ export function validateMmConfig(config: MarketMakerConfig): string | null {
 
 export function validateStrategyIdentity(input: {
   strategy_id: string
-  sub_account: string
   symbol: string
 }): string | null {
   if (!input.strategy_id || input.strategy_id.length > 64 || !STRATEGY_ID_PATTERN.test(input.strategy_id)) {
     return "策略 ID 须为 1–64 位，仅含字母、数字和 _ . : -"
-  }
-  if (!input.sub_account.trim() || input.sub_account.length > 128) {
-    return "子账户不能为空（最长 128 字符）"
   }
   const symbol = input.symbol.trim().toUpperCase()
   if (!symbol || symbol.length > 20 || !SYMBOL_PATTERN.test(symbol)) {

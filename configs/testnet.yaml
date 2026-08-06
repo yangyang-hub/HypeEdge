@@ -5,8 +5,7 @@ log_level: INFO
 exchange:
   api_url: https://api.hyperliquid-testnet.xyz
   ws_url: wss://api.hyperliquid-testnet.xyz/ws
-  # account_address and agent_private_key must be set via environment variables
-  sub_account: null
+  # Routed account address and agent private key must be set via environment variables.
 
 market_data:
   coins:
@@ -123,6 +122,13 @@ funding_arb:
   order_status_poll_interval_seconds: 0.25
   max_leg_attempts: 3
   market_stale_seconds: 5.0
+  universe_refresh_seconds: 30.0
+  book_refresh_seconds: 5.0
+  max_candidate_markets: 8
+  min_spot_24h_volume_usd: "1000"
+  min_perp_24h_volume_usd: "10000"
+  min_top_book_depth_usd: "100"
+  max_combined_spread_bps: "100"
 
 monitor:
   prometheus_port: 9091

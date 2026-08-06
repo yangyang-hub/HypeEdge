@@ -30,6 +30,7 @@ from hypeedge.execution.engine import ExecutionEngine
 logger = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
+    from hypeedge.account.health import HealthFailureCallback
     from hypeedge.risk.safety import SafetyController
     from hypeedge.storage.postgres import PostgresReconciliationStore
 
@@ -71,6 +72,7 @@ class Reconciler:
         safety_controller: SafetyController | None = None,
         reconciliation_store: PostgresReconciliationStore | None = None,
         account_health: Any | None = None,
+        on_health_failure: HealthFailureCallback | None = None,
     ) -> None:
         self._event_bus = event_bus
         self._tracker = tracker
@@ -80,6 +82,8 @@ class Reconciler:
         self._safety = safety_controller
         self._reconciliation_store = reconciliation_store
         self._account_health = account_health
+        self._on_health_failure = on_health_failure
+        self._reconcile_lock = asyncio.Lock()
         self._running = False
 
     def set_info_client(self, info: Any) -> None:
@@ -87,6 +91,11 @@ class Reconciler:
         self._info = info
 
     async def reconcile(self) -> ReconciliationResult:
+        """Serialize full reconciliations so periodic and recovery runs cannot race."""
+        async with self._reconcile_lock:
+            return await self._reconcile_once()
+
+    async def _reconcile_once(self) -> ReconciliationResult:
         """Run a full reconciliation cycle.
 
         Returns ReconciliationResult with counts of corrections and any errors.
@@ -177,6 +186,7 @@ class Reconciler:
 
                 self._account_health.record_success(AccountHealthDimension.RECONCILIATION)
                 self._account_health.record_success(AccountHealthDimension.INVENTORY)
+                self._account_health.record_success(AccountHealthDimension.CLEARINGHOUSE)
             if self._safety is not None:
                 from hypeedge.core.enums import SafetyMode
 
@@ -195,8 +205,24 @@ class Reconciler:
 
                 self._account_health.record_failure(AccountHealthDimension.RECONCILIATION, "reconciliation_failed")
             logger.error("reconciliation_failed", errors=result.errors)
-            if self._safety is not None:
-                self._safety.enter_cancel_only("reconciliation_failed")
+            failure_delegated = False
+            if self._on_health_failure is not None:
+                from hypeedge.core.enums import SafetyMode
+
+                if self._safety is None or self._safety.mode not in {
+                    SafetyMode.RECONCILING,
+                    SafetyMode.RECOVERING,
+                }:
+                    try:
+                        await self._on_health_failure("reconciliation_failed")
+                        failure_delegated = True
+                    except Exception:
+                        logger.exception("reconciliation_health_callback_failed")
+            if self._safety is not None and not failure_delegated:
+                from hypeedge.core.enums import SafetyMode
+
+                if self._safety.mode not in {SafetyMode.RECONCILING, SafetyMode.RECOVERING}:
+                    self._safety.enter_cancel_only("reconciliation_failed")
 
         return result
 

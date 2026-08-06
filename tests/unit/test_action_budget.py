@@ -120,6 +120,32 @@ class TestActionBudgetController:
 
         assert controller.snapshot().address_remaining == 9_998
 
+    def test_remote_refresh_advances_conservative_cancel_headroom_freshness(self) -> None:
+        now = datetime(2026, 1, 1, tzinfo=UTC)
+        settings = ActionBudgetSettings(remote_snapshot_max_age_seconds=5)
+        clock = MutableClock(now)
+        controller = ActionBudgetController(OWNER, settings, clock=clock)
+        controller.reconcile_cancel_headroom(CancelHeadroomSnapshot(10_000, 0, now))
+
+        clock.now += timedelta(seconds=4)
+        controller.reconcile_remote(RemoteActionSnapshot(OWNER, 10_000, 19, clock.now))
+        view = controller.snapshot()
+
+        assert view.cancel_headroom_remaining == 9_981
+        assert view.cancel_headroom_fresh is True
+        assert view.mode == ActionBudgetMode.NORMAL
+
+        clock.now += timedelta(seconds=4)
+        assert controller.snapshot().cancel_headroom_fresh is True
+
+    def test_remote_refresh_never_increases_configured_cancel_headroom(self) -> None:
+        controller, clock = make_controller(cap=10_000, used=100, cancel_cap=500, cancel_used=10)
+        clock.now += timedelta(seconds=1)
+
+        controller.reconcile_remote(RemoteActionSnapshot(OWNER, 20_000, 110, clock.now))
+
+        assert controller.snapshot().cancel_headroom_remaining == 480
+
     def test_dynamic_cancel_reserve_is_scope_level_not_per_allocation(self) -> None:
         controller, _ = make_controller()
         controller.update_possible_live_orders(7)

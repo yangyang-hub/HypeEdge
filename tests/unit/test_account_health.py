@@ -142,7 +142,7 @@ class TestLayeredAccountHealthProvider:
 
 
 class TestAccountStatePoller:
-    async def test_poll_updates_clearinghouse_without_masking_stream_freshness(self) -> None:
+    async def test_poll_updates_clearinghouse_and_authoritative_inventory(self) -> None:
         now = datetime.now(UTC)
         tracker = AccountTracker()
         tracker.update_position_from_exchange(Symbol("ETH"), Position(Symbol("ETH"), Size(2.0)))
@@ -163,7 +163,8 @@ class TestAccountStatePoller:
         assert tracker.get_position(Symbol("ETH")) is None
         health = provider.get_account_health(now=now)
         assert health.clearinghouse.status == FreshnessStatus.FRESH
-        assert health.inventory.status == FreshnessStatus.UNKNOWN
+        assert health.inventory.status == FreshnessStatus.FRESH
+        assert health.user_stream.status == FreshnessStatus.UNKNOWN
         assert health.allows_risk_increase is False
 
     async def test_poll_accelerates_near_margin_risk(self) -> None:

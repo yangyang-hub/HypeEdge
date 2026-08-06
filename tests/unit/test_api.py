@@ -17,12 +17,14 @@ from hypeedge.api.app import create_api
 from hypeedge.api.routes.market_ws import MarketMessageBudget, MarketWsGuard
 from hypeedge.app import HypeEdgeApp
 from hypeedge.core.enums import MarketMakerLifecycle, OrderStatus, StrategyStatus
-from hypeedge.core.exceptions import ExecutionError
+from hypeedge.core.exceptions import ExecutionError, StrategyRegistrationError
 from hypeedge.core.models import AccountState, Candle, FundingRate, L2BookSnapshot, L2Level, Order, Position
 from hypeedge.core.types import Cloid, Price, Size, StrategyId, SubAccount, Symbol, Timestamp, Usd
 from hypeedge.market_data.instrument_cache import InstrumentInfo
 from hypeedge.risk.checker import RiskChecker, RiskLimits
 from hypeedge.risk.kill_switch import KillSwitch
+
+ROUTING_ACCOUNT = "0x" + "a" * 40
 
 
 def _make_mock_app():
@@ -143,6 +145,8 @@ def _make_mock_app():
     app_mock.safety_mode = "normal"
     app_mock.settings = MagicMock()
     app_mock.settings.environment = "testnet"
+    app_mock.settings.exchange = MagicMock()
+    app_mock.settings.exchange.account_address = ROUTING_ACCOUNT
     app_mock.settings.api = MagicMock()
     app_mock.settings.api.auth_token = ""
     app_mock.settings.api.host = "127.0.0.1"
@@ -252,7 +256,12 @@ class TestMarketMakingControlPlane:
                 )
             ]
         )
-        repository.get_runtime = AsyncMock(return_value=SimpleNamespace(actual_state=MarketMakerLifecycle.SHADOW))
+        repository.get_runtime = AsyncMock(
+            return_value=SimpleNamespace(
+                actual_state=MarketMakerLifecycle.PAUSED,
+                reason="system_safety_pause:user_stream_disconnected",
+            )
+        )
         app_mock.market_making_repository = repository
         api_app = create_api(app_mock)
         async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
@@ -261,20 +270,22 @@ class TestMarketMakingControlPlane:
         assert response.status_code == 200
         item = response.json()["data"][0]
         assert item["strategy_type"] == "market_maker"
-        assert item["actual_state"] == "shadow"
+        assert item["actual_state"] == "paused"
         assert item["desired_state"] == "shadow"
+        assert item["runtime_reason"] == "system_safety_pause:user_stream_disconnected"
 
     @pytest.mark.asyncio
     async def test_creates_trend_follow_strategy_via_discriminated_union(self):
         from hypeedge.storage.market_making import default_trend_follow_config
 
         app_mock = _make_mock_app()
+        app_mock.settings.exchange.account_address = f"  {ROUTING_ACCOUNT.upper()}  "
         repository = MagicMock()
         created = SimpleNamespace(
             definition=SimpleNamespace(
                 strategy_id=StrategyId("trend-btc-1"),
                 strategy_type="trend_follow",
-                sub_account=SubAccount("trend_btc"),
+                sub_account=SubAccount(ROUTING_ACCOUNT),
                 symbol=Symbol("BTC"),
                 desired_state=MarketMakerLifecycle.STOPPED,
                 desired_config_revision=1,
@@ -292,7 +303,6 @@ class TestMarketMakingControlPlane:
         body = {
             "strategy_id": "trend-btc-1",
             "strategy_type": "trend_follow",
-            "sub_account": "trend_btc",
             "symbol": "BTC",
             "initial_config": {
                 key: (format(value, "f") if isinstance(value, Decimal) else value) for key, value in raw.items()
@@ -310,7 +320,135 @@ class TestMarketMakingControlPlane:
         assert data["strategy_type"] == "trend_follow"
         assert data["strategy_id"] == "trend-btc-1"
         repository.create_strategy_instance.assert_awaited()
-        assert repository.create_strategy_instance.await_args.kwargs["strategy_type"] == "trend_follow"
+        kwargs = repository.create_strategy_instance.await_args.kwargs
+        assert kwargs["strategy_type"] == "trend_follow"
+        assert kwargs["sub_account"] == SubAccount(ROUTING_ACCOUNT)
+
+    @pytest.mark.asyncio
+    async def test_creates_auto_market_funding_arb_without_pair_fields(self):
+        from hypeedge.storage.market_making import default_funding_arb_config
+
+        app_mock = _make_mock_app()
+        repository = MagicMock()
+        created = SimpleNamespace(
+            definition=SimpleNamespace(
+                strategy_id=StrategyId("fa-auto-1"),
+                strategy_type="funding_arb",
+                sub_account=SubAccount(ROUTING_ACCOUNT),
+                symbol=Symbol("AUTO"),
+                desired_state=MarketMakerLifecycle.STOPPED,
+                desired_config_revision=1,
+                revision=0,
+            ),
+            metadata={},
+            archived_at=None,
+            created_at=datetime(2026, 8, 3, tzinfo=UTC),
+            updated_at=datetime(2026, 8, 3, tzinfo=UTC),
+        )
+        repository.create_strategy_instance = AsyncMock(return_value=created)
+        app_mock.market_making_repository = repository
+        api_app = create_api(app_mock)
+        raw = default_funding_arb_config()
+        raw.pop("spot_coin")
+        body = {
+            "strategy_id": "fa-auto-1",
+            "strategy_type": "funding_arb",
+            "initial_config": {
+                key: (format(value, "f") if isinstance(value, Decimal) else value) for key, value in raw.items()
+            },
+        }
+
+        async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/strategies",
+                json=body,
+                headers={"Idempotency-Key": "create-fa-auto-1"},
+            )
+            legacy_pair = await client.post(
+                "/api/v1/strategies",
+                json={**body, "strategy_id": "fa-bad-1", "symbol": "HYPE"},
+                headers={"Idempotency-Key": "create-fa-bad-symbol"},
+            )
+            legacy_spot = await client.post(
+                "/api/v1/strategies",
+                json={
+                    **body,
+                    "strategy_id": "fa-bad-2",
+                    "initial_config": {**body["initial_config"], "spot_coin": "HYPE/USDC"},
+                },
+                headers={"Idempotency-Key": "create-fa-bad-spot"},
+            )
+            client_routing_override = await client.post(
+                "/api/v1/strategies",
+                json={**body, "strategy_id": "fa-bad-3", "sub_account": "0x" + "b" * 40},
+                headers={"Idempotency-Key": "create-fa-bad-routing-account"},
+            )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["data"]["symbol"] == "AUTO"
+        kwargs = repository.create_strategy_instance.await_args.kwargs
+        assert kwargs["symbol"] == Symbol("AUTO")
+        assert kwargs["sub_account"] == SubAccount(ROUTING_ACCOUNT)
+        assert "spot_coin" not in kwargs["initial_config"]
+        assert legacy_pair.status_code == 422
+        assert legacy_spot.status_code == 422
+        assert client_routing_override.status_code == 422
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("configured_account", ["", "not-an-address"])
+    async def test_strategy_create_fails_closed_when_routing_account_is_unavailable(self, configured_account: str):
+        app_mock = _make_mock_app()
+        app_mock.settings.exchange.account_address = configured_account
+        repository = MagicMock()
+        repository.create_strategy_instance = AsyncMock()
+        app_mock.market_making_repository = repository
+        api_app = create_api(app_mock)
+
+        async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/strategies",
+                json={
+                    "strategy_id": "fa-no-route",
+                    "strategy_type": "funding_arb",
+                    "initial_config": {},
+                },
+                headers={"Idempotency-Key": f"create-fa-no-route-{configured_account or 'missing'}"},
+            )
+
+        assert response.status_code == 503
+        assert response.json()["code"] == "STRATEGY_ROUTING_ACCOUNT_UNAVAILABLE"
+        if configured_account:
+            assert configured_account not in response.text
+        repository.create_strategy_instance.assert_not_awaited()
+        assert api_app.state.api_command_service.store.audits[-1].reason == "STRATEGY_ROUTING_ACCOUNT_UNAVAILABLE"
+
+    @pytest.mark.asyncio
+    async def test_strategy_create_returns_conflict_when_id_is_reserved_by_archived_instance(self):
+        app_mock = _make_mock_app()
+        repository = MagicMock()
+        repository.create_strategy_instance = AsyncMock(
+            side_effect=StrategyRegistrationError(
+                "Strategy ID is already reserved by an existing or archived strategy; use a new strategy ID: t1"
+            )
+        )
+        app_mock.market_making_repository = repository
+        api_app = create_api(app_mock)
+
+        async with AsyncClient(transport=ASGITransport(app=api_app), base_url="http://test") as client:
+            response = await client.post(
+                "/api/v1/strategies",
+                json={
+                    "strategy_id": "t1",
+                    "strategy_type": "funding_arb",
+                    "initial_config": {},
+                },
+                headers={"Idempotency-Key": "create-archived-t1"},
+            )
+
+        assert response.status_code == 409
+        assert response.json()["code"] == "STRATEGY_CREATE_CONFLICT"
+        assert "existing or archived strategy" in response.json()["detail"]
+        assert api_app.state.api_command_service.store.audits[-1].reason == "STRATEGY_CREATE_CONFLICT"
 
     @pytest.mark.asyncio
     async def test_lists_legacy_trend_strategy_with_actual_state(self):

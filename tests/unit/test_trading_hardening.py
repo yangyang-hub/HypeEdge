@@ -607,6 +607,34 @@ class TestReconciliationFailures:
         assert safety.mode == SafetyMode.CANCEL_ONLY
 
     @pytest.mark.asyncio
+    async def test_periodic_reconciliation_delegates_system_degradation_to_application(self) -> None:
+        failures: list[str] = []
+
+        async def on_failure(reason: str) -> None:
+            failures.append(reason)
+
+        info = MagicMock()
+        info.open_orders.return_value = []
+        info.user_state.side_effect = OSError("user state unavailable")
+        safety = SafetyController(SafetyMode.NORMAL)
+        engine = MagicMock(get_open_orders=AsyncMock(return_value=[]))
+        reconciler = Reconciler(
+            EventBus(),
+            AccountTracker(),
+            engine,
+            info_client=info,
+            account_address="0xabc",
+            safety_controller=safety,
+            on_health_failure=on_failure,
+        )
+
+        result = await reconciler.reconcile()
+
+        assert result.success is False
+        assert failures == ["reconciliation_failed"]
+        assert safety.mode == SafetyMode.NORMAL
+
+    @pytest.mark.asyncio
     async def test_unknown_local_order_fails_without_guessing_terminal_status(self) -> None:
         bus = EventBus()
         local = _order("local")

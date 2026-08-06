@@ -1,5 +1,6 @@
 """Single-venue, testnet-gated funding-rate arbitrage strategy."""
 
+from hypeedge.core.constants import AUTO_MARKET_SYMBOL, AUTO_SPOT_MARKET
 from hypeedge.strategy.funding_arb.models import FundingArbParams
 from hypeedge.strategy.funding_arb.runtime import (
     FundingArbRuntimeDependencies,
@@ -9,6 +10,8 @@ from hypeedge.strategy.funding_arb.runtime import (
 )
 
 __all__ = [
+    "AUTO_MARKET_SYMBOL",
+    "AUTO_SPOT_MARKET",
     "FundingArbParams",
     "FundingArbRuntimeDependencies",
     "FundingArbRuntimeHandle",

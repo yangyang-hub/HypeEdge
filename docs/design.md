@@ -241,8 +241,14 @@ Postgres 关键表：
 - 为何不再「移除」：早期设计否定的是「单腿收 funding = 裸方向暴露」；加现货对冲腿后即 delta-neutral，且在同一交易所内完成，不依赖跨所基建（§7.4 跨所项另行保留）。
 - 执行范围：本阶段只允许 `HYPE_ENV=testnet` 且显式开启 `funding_arb_execution_enabled`；`dev` 保持观察模式，
   `mainnet` 在代码层硬拒绝。测试网验证通过不代表主网收益成立。
-- 现货标识必须经 `spotMeta` 解析为交易所 coin（如 `HYPE/USDC -> @1035`），并验证现货 base token 与永续
-  `strategy_instances.symbol` 完全一致、quote 为 USDC；禁止只凭字符串相似推断对冲关系。
+- 操作员不再指定固定永续/现货交易对。`funding_arb` 实例使用 `AUTO` 市场作用域，运行时按限频缓存的
+  `metaAndAssetCtxs` / `spotMetaAndAssetCtxs` 交集发现所有 USDC 现货及同名永续，再对 24h 名义成交量、双边
+  可成交深度、组合点差、基差、funding 和预期净 edge 做硬过滤；无合格市场时保持观察，不下单。
+- 自动选择仍必须经 `spotMeta` 把现货 display name 解析为交易所 coin（如 `HYPE/USDC -> @1035`），并验证
+  spot base token 与永续风险单位完全一致、quote 为 USDC；禁止只凭字符串相似推断对冲关系。扫描可跨市场切换，
+  但单策略同一时刻最多一个活跃 cycle；cycle 建立后锁定实际两腿标的直到完全平仓，实际标的写入 Postgres。
+- 自动扫描使用普通 info 权重的 universe/context 慢刷新，只对成交量排名靠前的有限候选请求轻量 `l2Book`；
+  候选上限与刷新间隔是部署级硬限制，不允许策略实例绕过 IP 权重预算或订阅全部现货 WS。
 - 入场固定为 **先买现货、后空永续**：第一腿失败则不产生永续风险；第二腿失败/部分成交时，按权威成交量卖出现货
   剩余，保留的两腿只能是共同可对冲的最小规模。退出固定为 **先 reduce-only 平永续、后卖现货**，优先消除杠杆风险。
 - 每个套利 cycle 及其 cloid、目标/成交数量、配置版本、状态转换和失败原因持久化到 Postgres。ACK 不代表成交；
@@ -619,6 +625,13 @@ NORMAL/CANCEL_ONLY/HALTED -> STOPPING
 - `HALTING/HALTED`：禁止普通 placement，始终允许撤单；紧急平仓走独立受控通道。
 - Kill Switch 不直接终止进程。触发后停止策略、查询交易所权威挂单、撤全单、可选平仓、对账，
   最终进入 `HALTED`。重置必须经过人工确认和完整成功对账。
+- `strategy_instances.desired_state` 只表达操作员意图，`strategy_runtime_state.actual_state` 表达进程实际状态。
+  操作员调用 pause 才能把两者同时改为 `paused` 并记录 `operator_pause`；账户、user stream、动作额度或对账故障只能
+  以 `system_safety_pause:<cause>` 暂停 runtime，必须保留原 desired state，禁止把系统降级伪装成人工暂停。
+- 自动恢复只适用于本进程触发的可恢复 `CANCEL_ONLY`。恢复前必须重新取得新鲜 inventory/clearinghouse/user stream、
+  新鲜且允许 placement 的远端动作额度与保守 cancel headroom，完成 authenticated history 补缺及一次新的完整对账，
+  并先持久化 `NORMAL`。Kill Switch、HALTING/HALTED、FAULTED 或非自动降级不得被该流程覆盖；降级期间操作员 stop/pause
+  后，Supervisor 不得自动恢复该实例。
 
 ### 17.4 订单、执行与恢复
 
@@ -628,6 +641,11 @@ NORMAL/CANCEL_ONLY/HALTED -> STOPPING
 - 成交通过 authenticated user stream 接收，并以 REST 增量查询补缺；重复、乱序事件必须幂等。
 - 启动对账任一必要查询失败即失败，不能用空列表代替失败。只有无关键未解决差异且数据新鲜时才能进入
   `NORMAL` 并启动策略。
+- 成功的 clearinghouse/spot 账户快照同时刷新 `CLEARINGHOUSE` 与 `INVENTORY`；安静账户的 `USER_STREAM` 新鲜度由
+  SDK WebSocket socket/thread 的实际连接存活监控维持，而不是要求账户必须持续产生成交或订单事件。socket 断开、线程退出、
+  队列溢出或补缺失败都立即触发系统安全暂停。
+- `userRateLimit` 每次权威刷新都必须同步推进 cancel-headroom 的保守本地投影：只扣除 durable 网络动作和无法解释的
+  远端 used 增量，不凭空增加未知撤单额度。仅在进程初始化写一次时间戳、随后因 freshness 超时永久锁死是无效实现。
 
 ### 17.5 Postgres 数据模型
 
@@ -776,8 +794,15 @@ Alembic 管理，应用启动禁止 `create_all`。
   校验、typed 配置子表、Runtime factory、生命周期能力与前端 ConfigFields。
 - 前端与 API 通过唯一入口 `POST /api/v1/strategies` 创建实例；请求体为 `strategy_type` 判别联合
   （首期 `market_maker` | `trend_follow` | `funding_arb`）。禁止按类型永久平行 create API；禁止无约束 JSONB 作为交易关键配置主存。
+- 创建请求不接受 `sub_account` / 路由账户地址。单路由账户部署由后端把已校验的
+  `HYPE_EXCHANGE__ACCOUNT_ADDRESS` 注入 `strategy_instances.sub_account` 和幂等审计载荷；未配置或格式非法时
+  fail closed。浏览器永远不能覆盖账户路由，也不得读取 Agent Wallet 私钥。未来多账户必须由后端返回授权账户
+  allowlist 供选择，不能恢复任意字符串输入。
 - 生命周期共用 Supervisor，按类型声明能力子集：`market_maker` 支持 shadow/running/paused/drain；
   `trend_follow` 支持 stopped/running/paused（不强制对外 shadow）。不支持的 action 由 CapabilityGate 拒绝。
+- 托管实例的前端“删除”统一映射为带 revision fence 的 archive：仅 desired/actual 均已停止时允许，默认列表隐藏归档实例，
+  配置、订单、成交和审计事实不做物理删除；故障态和暂停态必须先显式 stop。`strategy_id` 是历史事实的永久标识，
+  归档后也不得复用；重复创建必须原子地返回 `409 STRATEGY_CREATE_CONFLICT`，不能泄露数据库唯一约束异常。
 - 统一策略控制面随完整 V2 `strategy_runner_v2` 链初始化；`market_making_enabled` 只启用做市专用实时执行组件，
   不得成为 trend-follow / funding-arb 控制面的总开关。
 - 实例参数以 Postgres 不可变配置版本为主；YAML 仅环境默认与上限。目标态删除 `app.py` 硬编码单一

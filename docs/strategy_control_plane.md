@@ -103,13 +103,23 @@ CapabilityGate 规则：
 - 对不支持的 `/actions/{name}` 返回 `409` 或 `422`（problem+json），文案标明类型能力。
 - 列表与详情返回的 `actual_state` 仍使用统一枚举字符串；前端按 capabilities 隐藏不可用按钮。
 
+生命周期状态分为操作员目标与系统实际两层：
+
+- `pause()` 是操作员命令，原子推进 desired/actual 为 `paused`，runtime reason 为 `operator_pause`。
+- `suspend_for_safety(reason)` 是系统命令，只把 actual 推进为 `paused`，保留 desired，并记录
+  `system_safety_pause:<reason>`；账户、user stream、动作额度、对账或 Kill Switch 路径禁止复用 `pause()`。
+- `resume_from_safety()` 只接受 actual 为 paused、reason 仍是系统暂停、desired 仍为 running/shadow 的实例；系统恢复门禁
+  由 App 在新鲜度、history gap recovery、完整对账与持久化 `NORMAL` 全部成功后调用。若操作员在降级期间 pause/stop，
+  desired/reason 已改变，恢复必须 no-op。
+- 策略列表和详情返回可空 `runtime_reason`；前端在系统暂停时展示该原因，不能只显示无法解释的“已暂停”。
+
 ## 6. 存储
 
 ### 6.1 复用共享表
 
 - `strategy_instances`（CHECK 已含 `trend_follow`）
 - `strategy_config_versions`（version、config_hash、created_by）
-- `strategy_allocations`（活跃 `(sub_account, symbol)` 排他）
+- `strategy_allocations`（活跃 `(sub_account, symbol)` 排他；资金费套利的 `AUTO` 为账户级通配租约）
 - `strategy_runtime_state` / `strategy_state_events`
 
 有交易历史的实例只允许 archive，不硬删除（与做市设计一致）。
@@ -143,6 +153,10 @@ CapabilityGate 规则：
 3. 设置 `desired_config_version_id`，初始化 `strategy_runtime_state`。
 4. 不自动 acquire allocation（启动时再占租约），避免「创建即占坑却从未运行」。
 
+`strategy_id` 在实例归档后仍永久保留，禁止复用，以免历史订单、成交与审计归因到新的逻辑实例。创建必须使用
+Postgres 原子冲突检测覆盖并发请求；命中现存或已归档 ID 时返回 `409 STRATEGY_CREATE_CONFLICT`，不得向 API 暴露
+数据库 `IntegrityError`。
+
 ## 7. API
 
 ### 7.1 创建（判别联合）
@@ -151,18 +165,25 @@ CapabilityGate 规则：
 StrategyCreateRequest =
   | {
       strategy_id, strategy_type: "market_maker",
-      sub_account, symbol, metadata?,
+      symbol, metadata?,
       initial_config: MarketMakerConfig
     }
   | {
       strategy_id, strategy_type: "trend_follow",
-      sub_account, symbol, metadata?,
+      symbol, metadata?,
       initial_config: TrendFollowConfig
+    }
+  | {
+      strategy_id, strategy_type: "funding_arb",
+      metadata?, initial_config: FundingArbConfig
     }
 ```
 
 - 唯一入口：`POST /api/v1/strategies`
 - 继续强制：Operator+ 角色、CSRF、`Idempotency-Key`、`application/problem+json`
+- `sub_account` 不是客户端字段：后端必须校验并规范化 `HYPE_EXCHANGE__ACCOUNT_ADDRESS`，将其注入实例写入和
+  幂等命令载荷；缺失/非法返回稳定 `STRATEGY_ROUTING_ACCOUNT_UNAVAILABLE`，不得回退到策略 ID、空值或
+  Agent Wallet 地址。旧客户端继续发送该字段时由 strict schema 返回 422，防止静默忽略路由覆盖尝试。
 - `GET /api/v1/strategies` 以 Postgres 实例列表为权威；过渡期可合并尚未 backfill 的 legacy 单例，但目标态删除该 fallback
 
 ### 7.2 配置版本
@@ -173,6 +194,9 @@ StrategyCreateRequest =
 ### 7.3 生命周期
 
 - 统一：`POST /api/v1/strategies/{id}/actions/{start|pause|resume|drain|stop}`
+- 逻辑删除：`POST /api/v1/strategies/{id}/archive`，仅允许 `desired_state=stopped` 且
+  `actual_state=stopped` 的托管实例；继续要求 `Idempotency-Key` 与 `If-Match`。归档后默认列表不再返回该实例，
+  但配置、订单、成交和审计事实全部保留。
 - 过渡期保留 legacy `POST .../start` 与 `.../stop`（仅 trend 旧路径），文档与代码标记 deprecated；P2 删除
 
 ## 8. Runtime 与应用接线
@@ -203,10 +227,12 @@ P1/P2 完成后：
 将「新建做市策略」升级为「新建策略」：
 
 1. 选择 `strategy_type`（只展示 `capabilities.creatable === true` 的已注册类型；首期可由前端常量与后端注册表对齐）。
-2. 公共字段：`strategy_id`、`symbol`、`sub_account`。
+2. 公共字段只有 `strategy_id`；`market_maker` / `trend_follow` 额外要求固定 `symbol`，`funding_arb`
+   不接受交易对并由服务端持久化 `symbol=AUTO`。表单不展示或提交路由账户，后端从部署环境注入。
 3. 类型字段组件注册表：
    - `market_maker` → 现有 `MarketMakerConfigFields`
    - `trend_follow` → 新增 `TrendFollowConfigFields`
+   - `funding_arb` → 仅展示 funding、成本、对冲与风险参数；不展示 `symbol` / `spot_coin`
 4. `web/lib/types.ts` 中 `StrategyCreateRequest` 改为判别联合，与后端 schema 同步。
 
 ### 9.2 列表与导航
@@ -215,6 +241,8 @@ P1/P2 完成后：
 - `market_maker` → `/strategy/[id]/market-making`
 - `trend_follow` → `/strategy/[id]`（参数、信号、启停；后续可扩展趋势工作台）
 - 启停：一律调用 `/actions/*` + `If-Match` revision（P1 起）；过渡期 hook 可按 type 分支 legacy 路径
+- 托管实例提供“删除”入口，但产品语义为安全归档：仅在 desired/actual 均为 `stopped` 时可确认执行；
+  `paused`、`faulted` 等非停止状态必须先调用 stop。确认文案明确交易与审计历史不会删除，成功后立即从当前列表移除。
 
 ## 10. 分期落地
 
@@ -252,6 +280,9 @@ P1/P2 完成后：
 - 对 `trend_follow` 调用 `drain` 或 `start` 目标为 `shadow` 时被 CapabilityGate 拒绝。
 - 新增第三种策略时，不必再改通用 create Dialog 壳与 Supervisor 核心状态机。
 - `funding_arb` 实例可经 `POST /api/v1/strategies` 创建，配置落 `funding_arb_config_versions`；对它调用 `drain` 或目标为 `shadow` 时被 CapabilityGate 拒绝；只有满足 testnet、V2、安全门禁和账户对账条件时 runtime 才获得真实下单依赖。
+- 三种 create 请求均不含 `sub_account`；服务端持久化的路由账户严格来自已校验环境配置，客户端覆盖尝试返回 422，
+  环境缺失/非法时不创建任何实例且响应不包含私钥或原始配置值。
+- 前端可停止并归档托管实例；`faulted` / `paused` 实例显示“停止”而不是“启动”，归档后默认列表不再显示且历史事实仍可追溯。
 
 ## 12. 刻意不做
 

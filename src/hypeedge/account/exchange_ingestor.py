@@ -42,7 +42,7 @@ from hypeedge.storage.postgres import (
 logger = structlog.get_logger(__name__)
 
 if TYPE_CHECKING:
-    from hypeedge.account.health import MutableAccountHealthProvider
+    from hypeedge.account.health import HealthFailureCallback, MutableAccountHealthProvider
     from hypeedge.account.tracker import AccountTracker
     from hypeedge.execution.engine import ExecutionEngine
 
@@ -635,7 +635,11 @@ class ExchangeEventIngestor:
         engine: ExecutionEngine | None = None,
         event_bus: EventBus | None = None,
         account_health: MutableAccountHealthProvider | None = None,
+        on_health_failure: HealthFailureCallback | None = None,
+        stream_health_interval_seconds: float = 1.0,
     ) -> None:
+        if stream_health_interval_seconds <= 0:
+            raise ValueError("stream health interval must be positive")
         self._info = info_client
         self._account = account_address
         self._projector = ExchangeFactProjector(session_factory, account_address)
@@ -644,10 +648,16 @@ class ExchangeEventIngestor:
         self._engine = engine
         self._event_bus = event_bus
         self._account_health = account_health
+        self._on_health_failure = on_health_failure
+        self._stream_health_interval = stream_health_interval_seconds
         self._queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=10_000)
         self._running = False
         self._history_recovered = False
+        self._history_recovery_lock = asyncio.Lock()
         self._subscriptions: list[tuple[dict[str, str], int]] = []
+        self._stream_integrity_failed = False
+        self._stream_failure_reason: str | None = None
+        self._health_failure_notified = False
 
     async def run(self) -> None:
         self._running = True
@@ -660,13 +670,10 @@ class ExchangeEventIngestor:
             subscription = {"type": kind, "user": self._account}
             subscription_id = await asyncio.to_thread(self._info.subscribe, subscription, callback)
             self._subscriptions.append((subscription, subscription_id))
-        if self._account_health is not None:
-            from hypeedge.account.health import AccountHealthDimension
-
-            self._account_health.record_success(AccountHealthDimension.USER_STREAM)
         if not self._history_recovered:
             await self.recover_history()
         poll_task = asyncio.create_task(self._poll_history(), name="exchange-history-recovery")
+        health_task = asyncio.create_task(self._monitor_user_stream(), name="authenticated-stream-health")
         try:
             while self._running:
                 kind, payload = await self._queue.get()
@@ -675,17 +682,16 @@ class ExchangeEventIngestor:
                         await self._ingest_fill(payload)
                     else:
                         await self._projector.ingest_order_update(payload)
-                    if self._account_health is not None:
-                        from hypeedge.account.health import AccountHealthDimension
-
-                        self._account_health.record_success(AccountHealthDimension.USER_STREAM)
+                    if not self._stream_integrity_failed:
+                        self._record_stream_success()
                 finally:
                     self._queue.task_done()
         except asyncio.CancelledError:
             raise
         finally:
             poll_task.cancel()
-            await asyncio.gather(poll_task, return_exceptions=True)
+            health_task.cancel()
+            await asyncio.gather(poll_task, health_task, return_exceptions=True)
             for subscription, subscription_id in self._subscriptions:
                 await asyncio.to_thread(self._info.unsubscribe, subscription, subscription_id)
             self._subscriptions.clear()
@@ -710,6 +716,11 @@ class ExchangeEventIngestor:
                     self._record_stream_failure("order_update_queue_overflow")
 
     async def recover_history(self) -> None:
+        """Serialize history recovery so periodic and safety recovery cannot overlap."""
+        async with self._history_recovery_lock:
+            await self._recover_history_once()
+
+    async def _recover_history_once(self) -> None:
         end_ms = int(_utcnow().timestamp() * 1000)
         # Establish oid/cloid ownership before replaying fills. Hyperliquid fill
         # payloads do not always include cloid, so fill-first recovery can create
@@ -771,6 +782,7 @@ class ExchangeEventIngestor:
                 if result.processed and result.funding_amount is not None and self._tracker is not None:
                     self._tracker.apply_funding(Usd(result.funding_amount))
         self._history_recovered = True
+        self._stream_integrity_failed = False
 
     async def _ingest_fill(self, fill_payload: dict[str, Any]) -> IngestResult:
         """Commit a fill, then update process projections and publish its domain event."""
@@ -854,14 +866,70 @@ class ExchangeEventIngestor:
             try:
                 await self.recover_history()
             except Exception:
+                reason = "exchange_history_recovery_failed"
+                self._record_stream_failure(reason)
+                await self._notify_health_failure(reason)
                 logger.exception("exchange_history_recovery_failed")
 
     async def stop(self) -> None:
         self._running = False
 
     def _record_stream_failure(self, reason: str) -> None:
-        if self._account_health is None:
-            return
-        from hypeedge.account.health import AccountHealthDimension
+        self._stream_integrity_failed = True
+        self._stream_failure_reason = reason
+        if self._account_health is not None:
+            from hypeedge.account.health import AccountHealthDimension
 
-        self._account_health.record_failure(AccountHealthDimension.USER_STREAM, reason)
+            self._account_health.record_failure(AccountHealthDimension.USER_STREAM, reason)
+
+    def _record_stream_success(self) -> None:
+        if self._account_health is not None:
+            from hypeedge.account.health import AccountHealthDimension
+
+            self._account_health.record_success(AccountHealthDimension.USER_STREAM)
+        self._stream_failure_reason = None
+        self._health_failure_notified = False
+
+    async def _check_user_stream_health(self) -> bool:
+        """Refresh liveness for quiet accounts using the SDK's real socket/thread state."""
+        connected = self._websocket_connected()
+        if connected and not self._stream_integrity_failed:
+            self._record_stream_success()
+            return True
+        reason = (
+            self._stream_failure_reason
+            if connected and self._stream_integrity_failed and self._stream_failure_reason is not None
+            else "authenticated_stream_disconnected"
+        )
+        self._record_stream_failure(reason)
+        await self._notify_health_failure(reason)
+        return False
+
+    async def _monitor_user_stream(self) -> None:
+        while self._running:
+            await self._check_user_stream_health()
+            await asyncio.sleep(self._stream_health_interval)
+
+    async def _notify_health_failure(self, reason: str) -> None:
+        if self._on_health_failure is None or self._health_failure_notified:
+            return
+        self._health_failure_notified = True
+        try:
+            await self._on_health_failure(reason)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("authenticated_stream_health_callback_failed", reason=reason)
+
+    def _websocket_connected(self) -> bool:
+        manager = getattr(self._info, "ws_manager", None)
+        if manager is None or not bool(getattr(manager, "ws_ready", False)):
+            return False
+        try:
+            if not bool(manager.is_alive()):
+                return False
+        except Exception:
+            return False
+        websocket = getattr(manager, "ws", None)
+        socket = getattr(websocket, "sock", None)
+        return bool(socket is not None and getattr(socket, "connected", False))

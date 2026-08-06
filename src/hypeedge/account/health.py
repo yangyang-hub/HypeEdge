@@ -310,6 +310,7 @@ class AccountStatePoller:
             received_at = _require_aware(snapshot.received_at)
             self._apply_snapshot(snapshot)
             self._health.record_success(AccountHealthDimension.CLEARINGHOUSE, observed_at=received_at)
+            self._health.record_success(AccountHealthDimension.INVENTORY, observed_at=received_at)
             near_risk = self._risk_proximity_evaluator(snapshot)
             interval = self._near_risk_interval if near_risk else self._normal_interval
             logger.debug(

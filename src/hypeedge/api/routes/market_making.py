@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from decimal import Decimal
@@ -21,11 +23,14 @@ from hypeedge.api.schemas import (
     StrategyMetadataPatchRequest,
     decimal_string,
 )
+from hypeedge.core.constants import AUTO_MARKET_SYMBOL
 from hypeedge.core.enums import MarketMakerLifecycle
 from hypeedge.core.exceptions import StrategyLifecycleError, StrategyRegistrationError
 from hypeedge.core.types import StrategyId, SubAccount, Symbol
 
 router = APIRouter(tags=["market-making"], dependencies=[Depends(require_viewer)])
+
+_ROUTING_ACCOUNT_PATTERN = re.compile(r"^0x[0-9a-f]{40}$")
 
 
 class MarketMakingRepository(Protocol):
@@ -50,6 +55,16 @@ def _supervisor(app: Any) -> Any:  # noqa: ANN401
     return supervisor
 
 
+def _configured_routing_account(app: Any) -> str | None:  # noqa: ANN401
+    """Return the canonical public routing address without exposing credentials."""
+    exchange = getattr(getattr(app, "settings", None), "exchange", None)
+    raw = getattr(exchange, "account_address", "")
+    if not isinstance(raw, str):
+        return None
+    normalized = raw.strip().lower()
+    return normalized if _ROUTING_ACCOUNT_PATTERN.fullmatch(normalized) else None
+
+
 def _expected_revision(raw: str | None) -> int:
     if raw is None:
         raise ApiProblem(428, "IF_MATCH_REQUIRED", "If-Match revision is required")
@@ -72,14 +87,19 @@ def _safe(value: Any) -> Any:  # noqa: ANN401
         return value.value
     if is_dataclass(value) and not isinstance(value, type):
         return _safe(asdict(value))
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         return {str(key): _safe(item) for key, item in value.items()}
     if isinstance(value, (tuple, list)):
         return [_safe(item) for item in value]
     return value
 
 
-def _strategy_payload(value: Any, *, actual_state: str | None = None) -> Any:  # noqa: ANN401
+def _strategy_payload(
+    value: Any,
+    *,
+    actual_state: str | None = None,
+    runtime_reason: str | None = None,
+) -> Any:  # noqa: ANN401
     definition = getattr(value, "definition", None)
     if definition is None:
         payload = _safe(value)
@@ -95,6 +115,7 @@ def _strategy_payload(value: Any, *, actual_state: str | None = None) -> Any:  #
         "symbol": str(definition.symbol),
         "desired_state": desired,
         "actual_state": actual_state or desired,
+        "runtime_reason": runtime_reason,
         "desired_config_version": definition.desired_config_revision,
         "desired_config_version_id": definition.desired_config_revision,
         "effective_config_version_id": None,
@@ -113,6 +134,7 @@ def _legacy_trend_payload(legacy: Any) -> dict[str, Any]:
         "strategy_type": "trend_follow",
         "status": status,
         "actual_state": status,
+        "runtime_reason": None,
         "desired_state": status if status in {"running", "shadow", "paused"} else "stopped",
         "symbol": legacy.params.symbol,
         "sub_account": None,
@@ -144,12 +166,14 @@ def _config_payload(value: Any) -> Any:  # noqa: ANN401
     else:
         config_hash = market_maker_config_hash(values)
 
+    public_values = dict(values)
+    public_values.pop("spot_coin", None)
     return {
         "id": revision,
         "strategy_id": str(strategy_id),
         "version": revision,
         "config_hash": config_hash,
-        "config": _safe(values),
+        "config": _safe(public_values),
         "created_by": None,
         "created_at": None,
         "approved_by": None,
@@ -198,14 +222,23 @@ async def list_strategies(app: AppDep) -> dict[str, Any]:
             payloads.append(record)
             continue
         actual_state: str | None = None
+        runtime_reason: str | None = None
         if get_runtime is not None:
             try:
                 runtime = await get_runtime(StrategyId(str(record.definition.strategy_id)))
                 actual = getattr(runtime, "actual_state", None)
                 actual_state = actual.value if isinstance(actual, Enum) else (str(actual) if actual else None)
+                reason = getattr(runtime, "reason", None)
+                runtime_reason = str(reason) if reason is not None else None
             except StrategyRegistrationError:
                 actual_state = None
-        payloads.append(_strategy_payload(record, actual_state=actual_state))
+        payloads.append(
+            _strategy_payload(
+                record,
+                actual_state=actual_state,
+                runtime_reason=runtime_reason,
+            )
+        )
     return {"ok": True, "data": payloads}
 
 
@@ -219,16 +252,24 @@ async def create_strategy(
     idempotency_key: str | None = Header(default=None, alias="Idempotency-Key", max_length=128),
 ) -> dict[str, Any]:
     repository = _repository(app)
+    routing_account = _configured_routing_account(app)
 
     async def execute(_command_id: str) -> dict[str, Any]:
+        if routing_account is None:
+            raise ApiProblem(
+                503,
+                "STRATEGY_ROUTING_ACCOUNT_UNAVAILABLE",
+                "The configured strategy routing account is unavailable",
+            )
         create = getattr(repository, "create_strategy_instance", None)
         if create is None:
             raise ApiProblem(503, "MARKET_MAKING_STORE_UNAVAILABLE", "Strategy creation is unavailable", retryable=True)
         try:
+            symbol = AUTO_MARKET_SYMBOL if body.strategy_type == "funding_arb" else body.symbol
             record = await create(
                 strategy_id=StrategyId(body.strategy_id),
-                sub_account=SubAccount(body.sub_account),
-                symbol=Symbol(body.symbol),
+                sub_account=SubAccount(routing_account),
+                symbol=Symbol(symbol),
                 initial_config=body.initial_config.model_dump(),
                 created_by=str(request.state.actor_id),
                 metadata=body.metadata,
@@ -244,7 +285,7 @@ async def create_strategy(
         idempotency_key,
         action="create_strategy",
         resource_id=body.strategy_id,
-        payload=body.model_dump(mode="json"),
+        payload={**body.model_dump(mode="json"), "routing_account": routing_account},
         handler=execute,
     )
 

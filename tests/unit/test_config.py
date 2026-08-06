@@ -10,6 +10,7 @@ from hypeedge.config.settings import (
     AppSettings,
     ExchangeSettings,
     FeatureFlagsSettings,
+    FundingArbSettings,
     MarketMakingSettings,
     RiskSettings,
 )
@@ -98,6 +99,18 @@ class TestSettings:
         assert mainnet.exchange.api_url == "https://api.hyperliquid.xyz"
         assert mainnet.exchange.ws_url == "wss://api.hyperliquid.xyz/ws"
 
+    def test_hype_env_is_loaded_from_dotenv_before_selecting_yaml(self, monkeypatch, tmp_path):
+        monkeypatch.delenv("HYPE_ENV", raising=False)
+        monkeypatch.delenv("HYPE_ENVIRONMENT", raising=False)
+        (tmp_path / ".env").write_text("HYPE_ENV=testnet\n")
+        monkeypatch.chdir(tmp_path)
+
+        settings = load_settings()
+
+        assert settings.environment == "testnet"
+        assert settings.features.funding_arb_execution_enabled is True
+        assert settings.exchange.api_url == "https://api.hyperliquid-testnet.xyz"
+
     def test_all_yaml_sections_are_loaded(self):
         settings = load_settings("testnet")
 
@@ -113,6 +126,11 @@ class TestSettings:
         assert settings.features.market_making_enabled is False
         assert settings.features.funding_arb_execution_enabled is True
         assert settings.funding_arb.max_notional_usd == 25
+        assert settings.funding_arb.max_candidate_markets == 8
+        assert settings.funding_arb.min_spot_24h_volume_usd == 1000
+        assert settings.funding_arb.min_perp_24h_volume_usd == 10000
+        assert settings.funding_arb.min_top_book_depth_usd == 100
+        assert settings.funding_arb.max_combined_spread_bps == 100
         assert "HYPE/USDC" in settings.market_data.spot_coins
 
     def test_v2_execution_requires_durable_ledger(self):
@@ -225,6 +243,12 @@ class TestSettings:
         )
         with pytest.raises(pydantic.ValidationError, match="restricted to HYPE_ENV=testnet"):
             AppSettings(environment="mainnet", features=full_v2)
+
+    def test_funding_arb_scan_cadence_preserves_freshness(self):
+        with pytest.raises(pydantic.ValidationError, match="book refresh"):
+            FundingArbSettings(book_refresh_seconds=6, market_stale_seconds=5)
+        with pytest.raises(pydantic.ValidationError, match="universe refresh"):
+            FundingArbSettings(universe_refresh_seconds=10, book_refresh_seconds=11, market_stale_seconds=11)
 
     def test_dev_and_testnet_force_testnet_urls_even_if_mainnet_overridden(self, monkeypatch):
         monkeypatch.setenv("HYPE_EXCHANGE__ACCOUNT_ADDRESS", "0x1234")

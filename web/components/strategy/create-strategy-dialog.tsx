@@ -65,7 +65,6 @@ export function CreateStrategyDialog({
   const [step, setStep] = useState<Step>(1)
   const [strategyType, setStrategyType] = useState<CreatableStrategyType>("market_maker")
   const [strategyId, setStrategyId] = useState("")
-  const [subAccount, setSubAccount] = useState("")
   const [symbol, setSymbol] = useState<string>(TRADE_SYMBOLS[0])
   const [metadataNote, setMetadataNote] = useState("")
   const [mmConfig, setMmConfig] = useState<MarketMakerConfig>(() => cloneDefaultMmConfig())
@@ -75,6 +74,7 @@ export function CreateStrategyDialog({
   const [error, setError] = useState<string | null>(null)
   const [submitting, setSubmitting] = useState(false)
   const idempotencyKeyRef = useRef(createIdempotencyKey())
+  const usesAutomaticMarket = strategyType === "funding_arb"
   const needsInstrumentMeta = strategyType === "market_maker"
   const { meta, error: metaError } = useInstrumentMeta(open && needsInstrumentMeta ? symbol : undefined)
 
@@ -83,7 +83,6 @@ export function CreateStrategyDialog({
     setStep(1)
     setStrategyType("market_maker")
     setStrategyId("")
-    setSubAccount("")
     setSymbol(TRADE_SYMBOLS[0])
     setMetadataNote("")
     setShowAdvanced(false)
@@ -106,31 +105,31 @@ export function CreateStrategyDialog({
 
   const conflictHint = useMemo(() => {
     const id = strategyId.trim()
-    const sub = subAccount.trim()
-    const sym = symbol.trim().toUpperCase()
+    const sym = usesAutomaticMarket ? "AUTO" : symbol.trim().toUpperCase()
     if (id && existing.some((item) => item.strategy_id === id)) {
       return `strategy_id「${id}」已存在`
     }
     if (
-      sub &&
       sym &&
-      existing.some(
-        (item) =>
-          (item.strategy_type === "market_maker" || item.strategy_type === "trend_follow" || item.strategy_type === "funding_arb") &&
-          item.sub_account?.toLowerCase() === sub.toLowerCase() &&
-          item.symbol.toUpperCase() === sym,
-      )
+      existing.some((item) => {
+        if (
+          item.strategy_type === "legacy" ||
+          (item.actual_state === "stopped" && item.desired_state === "stopped")
+        )
+          return false
+        const allocated = item.symbol.toUpperCase()
+        return sym === "AUTO" || allocated === "AUTO" || allocated === sym
+      })
     ) {
-      return `子账户「${sub}」已占用 ${sym}`
+      return sym === "AUTO" ? "后端路由账户已有活跃市场 allocation" : `后端路由账户已占用 ${sym}`
     }
     return null
-  }, [existing, strategyId, subAccount, symbol])
+  }, [existing, strategyId, symbol, usesAutomaticMarket])
 
   function goNext() {
     const identityError = validateStrategyIdentity({
       strategy_id: strategyId.trim(),
-      sub_account: subAccount.trim(),
-      symbol: symbol.trim().toUpperCase(),
+      symbol: usesAutomaticMarket ? "AUTO" : symbol.trim().toUpperCase(),
     })
     if (identityError) {
       setError(identityError)
@@ -170,7 +169,6 @@ export function CreateStrategyDialog({
         body = {
           strategy_id: strategyId.trim(),
           strategy_type: "market_maker",
-          sub_account: subAccount.trim(),
           symbol: symbol.trim().toUpperCase(),
           initial_config: mmConfig,
           metadata,
@@ -179,8 +177,6 @@ export function CreateStrategyDialog({
         body = {
           strategy_id: strategyId.trim(),
           strategy_type: "funding_arb",
-          sub_account: subAccount.trim(),
-          symbol: symbol.trim().toUpperCase(),
           initial_config: faConfig,
           metadata,
         }
@@ -188,7 +184,6 @@ export function CreateStrategyDialog({
         body = {
           strategy_id: strategyId.trim(),
           strategy_type: "trend_follow",
-          sub_account: subAccount.trim(),
           symbol: symbol.trim().toUpperCase(),
           initial_config: tfConfig,
           metadata,
@@ -206,7 +201,9 @@ export function CreateStrategyDialog({
       const message =
         err instanceof ApiError
           ? err.code === "STRATEGY_CREATE_CONFLICT"
-            ? "创建冲突：策略 ID 或子账户+品种已占用"
+            ? "创建冲突：策略 ID 或账户市场 allocation 已占用"
+            : err.code === "STRATEGY_ROUTING_ACCOUNT_UNAVAILABLE"
+              ? "后端未配置有效的 HYPE_EXCHANGE__ACCOUNT_ADDRESS，请配置并重启后端后再创建策略。"
             : err.code === "INSUFFICIENT_ROLE"
               ? "当前开启了 Dashboard 鉴权且账号权限不足。内网单人请去掉 HYPEEDGE_DASHBOARD_AUTH=on，并清空 API token 后重启前后端。"
               : err.message
@@ -247,7 +244,7 @@ export function CreateStrategyDialog({
             <label className="text-xs text-text-secondary sm:col-span-2" htmlFor="create-strategy-type">
               <span className="font-medium text-text-primary">策略类型</span>
               <p className="mt-0.5 text-2xs leading-snug text-text-tertiary">
-                做市适合库存型双边报价；趋势跟随适合中频方向信号；资金费套利靠永续+现货对冲收取 funding（当前为骨架占位，运行时尚未实盘下单）。
+                做市适合库存型双边报价；趋势跟随适合中频方向信号；资金费套利会自动扫描高流动性现货+永续共有市场并执行对冲。
               </p>
               <select
                 id="create-strategy-type"
@@ -265,7 +262,7 @@ export function CreateStrategyDialog({
             <label className="text-xs text-text-secondary sm:col-span-2" htmlFor="create-strategy-id">
               <span className="font-medium text-text-primary">策略 ID</span>
               <p className="mt-0.5 text-2xs leading-snug text-text-tertiary">
-                实例唯一标识，创建后不可改；建议用 mm-btc-1 / trend-btc-1 这类可读命名。
+                实例唯一标识，创建后不可改；建议用 mm-btc-1 / trend-btc-1 / fa-auto-1 这类可读命名。
               </p>
               <Input
                 id="create-strategy-id"
@@ -273,41 +270,31 @@ export function CreateStrategyDialog({
                 value={strategyId}
                 onChange={(event) => setStrategyId(event.target.value)}
                 placeholder={
-                  strategyType === "market_maker" ? "mm-btc-1" : strategyType === "funding_arb" ? "fa-btc-1" : "trend-btc-1"
+                  strategyType === "market_maker" ? "mm-btc-1" : strategyType === "funding_arb" ? "fa-auto-1" : "trend-btc-1"
                 }
               />
             </label>
-            <label className="text-xs text-text-secondary" htmlFor="create-sub-account">
-              <span className="font-medium text-text-primary">子账户</span>
-              <p className="mt-0.5 text-2xs leading-snug text-text-tertiary">
-                Hyperliquid 子账户名；同一子账户 + 品种同一时间只能跑一个活跃实例。
-              </p>
-              <Input
-                id="create-sub-account"
-                className="mt-1.5 font-mono"
-                value={subAccount}
-                onChange={(event) => setSubAccount(event.target.value)}
-                placeholder={
-                  strategyType === "market_maker" ? "mm_btc" : strategyType === "funding_arb" ? "fa_btc" : "trend_btc"
-                }
-              />
-            </label>
-            <label className="text-xs text-text-secondary" htmlFor="create-symbol">
-              <span className="font-medium text-text-primary">交易品种</span>
-              <p className="mt-0.5 text-2xs leading-snug text-text-tertiary">永续合约标的，例如 BTC / ETH / SOL。</p>
-              <select
-                id="create-symbol"
-                className="mt-1.5 flex h-9 w-full rounded-md border border-border bg-bg-primary px-3 font-mono text-sm"
-                value={symbol}
-                onChange={(event) => setSymbol(event.target.value)}
-              >
-                {TRADE_SYMBOLS.map((item) => (
-                  <option key={item} value={item}>
-                    {item}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <p className="rounded-md border border-border bg-bg-secondary px-3 py-2 text-xs leading-relaxed text-text-secondary sm:col-span-2">
+              路由账户由后端安全配置自动绑定，前端不会读取或提交账户地址。
+            </p>
+            {!usesAutomaticMarket ? (
+              <label className="text-xs text-text-secondary" htmlFor="create-symbol">
+                <span className="font-medium text-text-primary">交易品种</span>
+                <p className="mt-0.5 text-2xs leading-snug text-text-tertiary">永续合约标的，例如 BTC / ETH / SOL。</p>
+                <select
+                  id="create-symbol"
+                  className="mt-1.5 flex h-9 w-full rounded-md border border-border bg-bg-primary px-3 font-mono text-sm"
+                  value={symbol}
+                  onChange={(event) => setSymbol(event.target.value)}
+                >
+                  {TRADE_SYMBOLS.map((item) => (
+                    <option key={item} value={item}>
+                      {item}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            ) : null}
             <label className="text-xs text-text-secondary sm:col-span-2" htmlFor="create-note">
               <span className="font-medium text-text-primary">备注（可选）</span>
               <p className="mt-0.5 text-2xs leading-snug text-text-tertiary">仅用于列表展示，不影响交易逻辑。</p>

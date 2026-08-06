@@ -138,3 +138,18 @@ export async function stopStrategy(
     { ifMatch: strategy.revision },
   )
 }
+
+/** Archive a fully stopped managed strategy while retaining its trading and audit history. */
+export async function archiveStrategy(
+  strategy: Pick<StrategyInstance, "strategy_id" | "strategy_type" | "revision">,
+): Promise<StrategyInstance> {
+  if (strategy.strategy_type === "legacy") {
+    throw new Error("兼容策略不能从统一控制面删除")
+  }
+  const data = await poster<StrategyListItem>(
+    `/api/v1/strategies/${encodeURIComponent(strategy.strategy_id)}/archive`,
+    {},
+    { ifMatch: strategy.revision },
+  )
+  return normalizeStrategy(data)
+}

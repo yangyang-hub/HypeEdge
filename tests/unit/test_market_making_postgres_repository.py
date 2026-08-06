@@ -10,6 +10,7 @@ import pytest
 from sqlalchemy.dialects import postgresql
 
 from hypeedge.api.schemas import MarketMakerConfigCreateRequest
+from hypeedge.core.enums import MarketMakerLifecycle
 from hypeedge.core.exceptions import StrategyLifecycleError, StrategyRegistrationError
 from hypeedge.core.types import StrategyId, SubAccount, Symbol
 from hypeedge.storage.market_making import (
@@ -21,6 +22,7 @@ from hypeedge.storage.market_making import (
     normalize_market_maker_config,
 )
 from hypeedge.storage.postgres import Base, ExecutionActionRecord
+from hypeedge.strategy.registry import StrategyInstanceDefinition
 from hypeedge.strategy.supervisor import InMemoryStrategyAllocationManager
 
 SID = StrategyId("mm_btc")
@@ -106,15 +108,41 @@ def test_strategy_instance_schema_has_real_optimistic_revision_and_metadata() ->
     assert "ck_strategy_instances_revision" in {constraint.name for constraint in table.constraints}
 
 
+async def test_create_strategy_instance_reserves_archived_ids_with_atomic_conflict_detection() -> None:
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=_result(None))
+    store = PostgresStrategyStateStore(_session_factory(session))
+    instance = StrategyInstanceDefinition(
+        strategy_id=SID,
+        strategy_type="market_maker",
+        sub_account=SUB,
+        symbol=BTC,
+        desired_state=MarketMakerLifecycle.STOPPED,
+        desired_config_revision=1,
+        revision=0,
+    )
+
+    with pytest.raises(StrategyRegistrationError, match="existing or archived strategy"):
+        await store.create_strategy_instance(instance, _config(), created_by="operator")
+
+    statement = session.execute.await_args.args[0]
+    sql = str(statement.compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
+    assert "ON CONFLICT (strategy_id) DO NOTHING" in sql
+    assert "RETURNING strategy_instances.strategy_id" in sql
+    session.add.assert_not_called()
+
+
 async def test_allocation_insert_is_idempotent_and_returns_identity_fence() -> None:
     session = MagicMock()
-    session.execute = AsyncMock(return_value=_result(41))
+    session.execute = AsyncMock(side_effect=[_result(None), _result(None), _result(None), _result(41)])
     manager = PostgresStrategyAllocationManager(_session_factory(session))
 
     allocation = await manager.acquire(SID, SUB, BTC)
 
     assert allocation.fence == 41
-    statement = session.execute.await_args.args[0]
+    advisory = str(session.execute.await_args_list[0].args[0])
+    assert "pg_advisory_xact_lock" in advisory
+    statement = session.execute.await_args_list[-1].args[0]
     sql = str(statement.compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
     assert "ON CONFLICT DO NOTHING" in sql
     assert "RETURNING strategy_allocations.id" in sql
@@ -123,13 +151,13 @@ async def test_allocation_insert_is_idempotent_and_returns_identity_fence() -> N
 async def test_allocation_retry_returns_existing_fence_without_reallocation() -> None:
     existing = MagicMock(id=42, strategy_id=str(SID), sub_account=str(SUB), symbol=str(BTC))
     session = MagicMock()
-    session.execute = AsyncMock(side_effect=[_result(None), _result(existing)])
+    session.execute = AsyncMock(side_effect=[_result(None), _result(existing), _result(None)])
     manager = PostgresStrategyAllocationManager(_session_factory(session))
 
     allocation = await manager.acquire(SID, SUB, BTC)
 
     assert allocation.fence == 42
-    assert session.execute.await_count == 2
+    assert session.execute.await_count == 3
 
 
 async def test_allocation_conflict_reports_authoritative_owner() -> None:
@@ -141,6 +169,48 @@ async def test_allocation_conflict_reports_authoritative_owner() -> None:
         await manager.acquire(SID, SUB, BTC)
 
 
+async def test_postgres_auto_allocation_conflicts_with_any_symbol_in_account() -> None:
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=[_result(None), _result(None), _result("mm_eth")])
+    manager = PostgresStrategyAllocationManager(_session_factory(session))
+
+    with pytest.raises(StrategyLifecycleError, match="owner=mm_eth"):
+        await manager.acquire(StrategyId("fa_auto"), SUB, Symbol("AUTO"))
+
+    conflict_statement = session.execute.await_args_list[2].args[0]
+    sql = str(conflict_statement.compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
+    assert "strategy_allocations.sub_account" in sql
+    assert "strategy_allocations.symbol IN" not in sql
+
+
+async def test_postgres_fixed_allocation_conflicts_with_existing_auto_scope() -> None:
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=[_result(None), _result(None), _result("fa_auto")])
+    manager = PostgresStrategyAllocationManager(_session_factory(session))
+
+    with pytest.raises(StrategyLifecycleError, match="owner=fa_auto"):
+        await manager.acquire(SID, SUB, Symbol("ETH"))
+
+    conflict_statement = session.execute.await_args_list[2].args[0]
+    sql = str(conflict_statement.compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
+    assert "strategy_allocations.symbol IN" in sql
+
+
+async def test_postgres_legacy_funding_scope_upgrades_to_auto_with_same_fence() -> None:
+    existing = MagicMock(id=42, strategy_id="fa_auto", sub_account=str(SUB), symbol="HYPE")
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=[_result(None), _result(existing), _result(None), _result(42)])
+    manager = PostgresStrategyAllocationManager(_session_factory(session))
+
+    allocation = await manager.acquire(StrategyId("fa_auto"), SUB, Symbol("AUTO"))
+
+    assert allocation.symbol == Symbol("AUTO")
+    assert allocation.fence == 42
+    update_statement = session.execute.await_args_list[-1].args[0]
+    sql = str(update_statement.compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
+    assert sql.startswith("UPDATE strategy_allocations")
+
+
 async def test_in_memory_protocol_concurrency_has_single_scope_owner() -> None:
     manager = InMemoryStrategyAllocationManager()
 
@@ -150,6 +220,18 @@ async def test_in_memory_protocol_concurrency_has_single_scope_owner() -> None:
     results = await __import__("asyncio").gather(acquire("mm_one"), acquire("mm_two"), return_exceptions=True)
     assert sum(not isinstance(result, Exception) for result in results) == 1
     assert sum(isinstance(result, StrategyLifecycleError) for result in results) == 1
+
+
+async def test_in_memory_auto_scope_conflicts_with_fixed_symbols_in_both_directions() -> None:
+    fixed_first = InMemoryStrategyAllocationManager()
+    await fixed_first.acquire(StrategyId("mm_eth"), SUB, Symbol("ETH"))
+    with pytest.raises(StrategyLifecycleError, match="already owned"):
+        await fixed_first.acquire(StrategyId("fa_auto"), SUB, Symbol("AUTO"))
+
+    auto_first = InMemoryStrategyAllocationManager()
+    await auto_first.acquire(StrategyId("fa_auto"), SUB, Symbol("AUTO"))
+    with pytest.raises(StrategyLifecycleError, match="already owned"):
+        await auto_first.acquire(StrategyId("mm_eth"), SUB, Symbol("ETH"))
 
 
 async def test_metadata_update_uses_compare_and_swap_and_reports_actual_revision() -> None:
@@ -165,6 +247,96 @@ async def test_metadata_update_uses_compare_and_swap_and_reports_actual_revision
     sql = str(statement.compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
     assert "strategy_instances.revision" in sql
     assert "RETURNING strategy_instances" in sql
+
+
+async def test_archive_requires_desired_and_actual_state_to_be_stopped() -> None:
+    record = MagicMock(
+        strategy_id=str(SID),
+        archived_at=None,
+        desired_state=MarketMakerLifecycle.RUNNING.value,
+        revision=4,
+    )
+    runtime = MagicMock(actual_state=MarketMakerLifecycle.STOPPED.value)
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=[_result(record), _result(runtime)])
+    session.flush = AsyncMock()
+    store = PostgresStrategyStateStore(_session_factory(session))
+
+    with pytest.raises(
+        StrategyLifecycleError,
+        match="desired=running actual=stopped",
+    ):
+        await store.archive_strategy_instance(SID, expected_revision=4)
+
+    session.flush.assert_not_awaited()
+
+
+async def test_archive_locks_state_and_retains_instance_history() -> None:
+    created_at = datetime(2026, 8, 1, tzinfo=UTC)
+    record = MagicMock(
+        strategy_id=str(SID),
+        strategy_type="market_maker",
+        sub_account=str(SUB),
+        symbol=str(BTC),
+        desired_state=MarketMakerLifecycle.STOPPED.value,
+        desired_config_version_id=11,
+        revision=4,
+        metadata_={"label": "BTC maker"},
+        archived_at=None,
+        created_at=created_at,
+        updated_at=created_at,
+    )
+    runtime = MagicMock(actual_state=MarketMakerLifecycle.STOPPED.value)
+    session = MagicMock()
+    session.execute = AsyncMock(side_effect=[_result(record), _result(runtime), MagicMock()])
+    session.scalar = AsyncMock(return_value=1)
+    session.flush = AsyncMock()
+    store = PostgresStrategyStateStore(_session_factory(session))
+
+    archived = await store.archive_strategy_instance(SID, expected_revision=4)
+
+    assert archived.definition.strategy_id == SID
+    assert archived.definition.revision == 5
+    assert archived.archived_at is not None
+    assert record.archived_at == archived.archived_at
+    session.flush.assert_awaited_once()
+    for call in session.execute.await_args_list[:2]:
+        sql = str(call.args[0].compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
+        assert "FOR UPDATE" in sql
+    delete_sql = str(
+        session.execute.await_args_list[2].args[0].compile(dialect=postgresql.dialect())  # type: ignore[no-untyped-call]
+    )
+    assert "DELETE FROM strategy_allocations" in delete_sql
+
+
+async def test_set_desired_locks_only_strategy_instance_in_outer_join() -> None:
+    record = MagicMock(
+        strategy_id=str(SID),
+        strategy_type="market_maker",
+        sub_account=str(SUB),
+        symbol=str(BTC),
+        desired_state=MarketMakerLifecycle.STOPPED.value,
+        archived_at=None,
+        revision=0,
+    )
+    current = MagicMock()
+    current.one_or_none.return_value = (record, 1)
+    session = MagicMock()
+    session.execute = AsyncMock(return_value=current)
+    session.scalar = AsyncMock(return_value=17)
+    session.flush = AsyncMock()
+    store = PostgresStrategyStateStore(_session_factory(session))
+
+    await store.set_desired(
+        SID,
+        state=MarketMakerLifecycle.RUNNING,
+        expected_revision=0,
+    )
+
+    statement = session.execute.await_args_list[0].args[0]
+    sql = str(statement.compile(dialect=postgresql.dialect()))  # type: ignore[no-untyped-call]
+    assert "LEFT OUTER JOIN strategy_config_versions" in sql
+    assert "FOR UPDATE OF strategy_instances" in sql
 
 
 async def test_execution_attempt_append_is_database_idempotent() -> None:

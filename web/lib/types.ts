@@ -146,6 +146,7 @@ export interface StrategyInstanceBase {
   sub_account: string | null
   desired_state: StrategyDesiredState
   actual_state: StrategyLifecycleState
+  runtime_reason?: string | null
   desired_config_version_id: number | null
   effective_config_version_id: number | null
   revision: number
@@ -223,6 +224,7 @@ export interface MarketMakingStateSnapshot {
   environment: SystemStatus["environment"]
   desired_state: StrategyDesiredState
   actual_state: StrategyLifecycleState
+  runtime_reason?: string | null
   runtime_revision: number
   market_revision: number
   config_version: number
@@ -416,7 +418,6 @@ export interface TrendFollowConfig {
 }
 
 export interface FundingArbConfig {
-  spot_coin: string
   entry_funding_rate: DecimalString
   exit_funding_rate: DecimalString
   max_notional_usd: DecimalString
@@ -436,7 +437,6 @@ export type StrategyCreateRequest =
   | {
       strategy_id: string
       strategy_type: "market_maker"
-      sub_account: string
       symbol: string
       initial_config: MarketMakerConfig
       metadata?: Record<string, string>
@@ -444,7 +444,6 @@ export type StrategyCreateRequest =
   | {
       strategy_id: string
       strategy_type: "trend_follow"
-      sub_account: string
       symbol: string
       initial_config: TrendFollowConfig
       metadata?: Record<string, string>
@@ -452,8 +451,6 @@ export type StrategyCreateRequest =
   | {
       strategy_id: string
       strategy_type: "funding_arb"
-      sub_account: string
-      symbol: string
       initial_config: FundingArbConfig
       metadata?: Record<string, string>
     }

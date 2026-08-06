@@ -7,8 +7,8 @@ import {
 import { asDecimalString } from "@/lib/utils"
 
 describe("funding-arb-config helpers", () => {
-  it("uses an unambiguous full spot market identifier", () => {
-    expect(DEFAULT_FA_CONFIG.spot_coin).toBe("PURR/USDC")
+  it("validates automatic-market defaults without pair fields", () => {
+    expect(DEFAULT_FA_CONFIG).not.toHaveProperty("spot_coin")
     expect(validateFaConfig(cloneDefaultFaConfig())).toBeNull()
   })
 
@@ -19,10 +19,6 @@ describe("funding-arb-config helpers", () => {
         exit_funding_rate: DEFAULT_FA_CONFIG.entry_funding_rate,
       }),
     ).toMatch(/平仓资金费阈值必须低于入场阈值/)
-  })
-
-  it("rejects invalid spot market identifiers", () => {
-    expect(validateFaConfig({ ...DEFAULT_FA_CONFIG, spot_coin: "PURR USDC" })).toMatch(/现货市场标识/)
   })
 
   it("rejects non-positive entry funding", () => {

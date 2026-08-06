@@ -9,6 +9,8 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 import structlog
 import yaml
+from pydantic import AliasChoices, Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from hypeedge.config.settings import AppSettings
 
@@ -35,6 +37,29 @@ _TESTNET_WS_URL = "wss://api.hyperliquid-testnet.xyz/ws"
 _SUPPORTED_ENVIRONMENTS = frozenset({"dev", "testnet", "mainnet"})
 
 
+class _EnvironmentSelection(BaseSettings):
+    """Read the environment selector without constructing all application settings."""
+
+    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+
+    environment: str = Field(
+        default="dev",
+        validation_alias=AliasChoices("HYPE_ENV", "HYPE_ENVIRONMENT"),
+    )
+
+
+def _select_environment(environment: str | None) -> str:
+    """Select the YAML environment before the full settings model is loaded."""
+    if environment is not None:
+        return environment
+
+    process_environment = os.getenv("HYPE_ENV") or os.getenv("HYPE_ENVIRONMENT")
+    if process_environment:
+        return process_environment
+
+    return _EnvironmentSelection().environment
+
+
 def exchange_urls_for_environment(environment: str) -> tuple[str, str]:
     """Return the official Hyperliquid REST/WS URLs for ``HYPE_ENV``.
 
@@ -51,9 +76,9 @@ def exchange_urls_for_environment(environment: str) -> tuple[str, str]:
 def load_yaml_config(environment: str | None = None) -> dict[str, Any]:
     """Load YAML config file for the given environment.
 
-    Falls back to 'dev' if environment is not specified.
+    Uses the same process environment / ``.env`` selector as :func:`load_settings`.
     """
-    env = environment or os.getenv("HYPE_ENV", "dev")
+    env = _select_environment(environment)
     config_path = CONFIGS_DIR / f"{env}.yaml"
 
     if not config_path.exists():
@@ -79,7 +104,7 @@ def load_settings(environment: str | None = None) -> AppSettings:
     Exchange ``api_url`` / ``ws_url`` are always derived from ``HYPE_ENV``
     (``dev``/``testnet`` → testnet, ``mainnet`` → mainnet) and ignore manual overrides.
     """
-    selected_environment: str = environment if environment is not None else os.environ.get("HYPE_ENV", "dev")
+    selected_environment = _select_environment(environment)
     if selected_environment not in _SUPPORTED_ENVIRONMENTS:
         raise RuntimeError(
             f"unsupported HYPE_ENV={selected_environment!r}; expected one of {sorted(_SUPPORTED_ENVIRONMENTS)}"

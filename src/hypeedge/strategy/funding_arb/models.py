@@ -7,15 +7,13 @@ venue; see ``docs/funding_arb_design.md`` and ``docs/design.md`` §7.
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
 from uuid import UUID
 
+from hypeedge.core.constants import AUTO_MARKET_SYMBOL, AUTO_SPOT_MARKET
 from hypeedge.core.enums import FundingArbCycleState
-
-_SPOT_MARKET_PATTERN = re.compile(r"^(?:@[0-9]+|[A-Za-z0-9_.:-]+/[A-Za-z0-9_.:-]+)$")
 
 
 @dataclass(frozen=True)
@@ -26,7 +24,6 @@ class FundingArbParams:
     testnet-only fill-aware two-leg runtime.
     """
 
-    spot_coin: str = "PURR/USDC"
     entry_funding_rate: Decimal = Decimal("0.0001")
     exit_funding_rate: Decimal = Decimal("0")
     max_notional_usd: Decimal = Decimal("1000")
@@ -43,8 +40,6 @@ class FundingArbParams:
     def __post_init__(self) -> None:
         """Validate parameter constraints (mirror Postgres CHECKs)."""
         errors: list[str] = []
-        if not self.spot_coin.strip() or not _SPOT_MARKET_PATTERN.fullmatch(self.spot_coin.strip()):
-            errors.append("spot_coin must be a valid Hyperliquid spot market identifier")
         if self.entry_funding_rate <= 0:
             errors.append(f"entry_funding_rate must be > 0, got {self.entry_funding_rate}")
         if self.exit_funding_rate < 0:
@@ -113,3 +108,6 @@ class FundingArbCycle:
     closed_at: datetime | None = None
     created_at: datetime | None = None
     updated_at: datetime | None = None
+
+
+__all__ = ["AUTO_MARKET_SYMBOL", "AUTO_SPOT_MARKET", "FundingArbCycle", "FundingArbParams"]

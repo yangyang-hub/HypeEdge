@@ -230,8 +230,9 @@
 
 **创建交互：**
 
-- 「新建策略」打开通用创建壳：先选 `strategy_type`，再填公共字段（`strategy_id` / `symbol` / `sub_account`）
-  与类型强类型 ConfigFields（做市复用 `MarketMakerConfigFields`，趋势使用 `TrendFollowConfigFields`）。
+- 「新建策略」打开通用创建壳：先选 `strategy_type`，再填 `strategy_id`（做市/趋势另填 `symbol`）与类型强类型
+  ConfigFields（做市复用 `MarketMakerConfigFields`，趋势使用 `TrendFollowConfigFields`）。路由账户不展示、不提交，
+  由后端从部署环境校验并注入。
 - 请求体为 `strategy_type` 判别联合；禁止无约束 `Record` 表示交易关键配置。
 - 权威细节见 `docs/strategy_control_plane.md` 与 `docs/design.md` §19。
 

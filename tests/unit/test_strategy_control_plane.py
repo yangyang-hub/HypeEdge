@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from decimal import Decimal
 
 import pytest
@@ -144,7 +145,13 @@ def test_funding_arb_config_requires_rate_hysteresis() -> None:
         normalize_funding_arb_config(config)
 
 
-def test_funding_arb_config_accepts_full_spot_market_identifier() -> None:
+def test_funding_arb_public_config_injects_internal_auto_sentinel() -> None:
+    config = default_funding_arb_config()
+    config.pop("spot_coin")
+    assert normalize_funding_arb_config(config)["spot_coin"] == "AUTO/USDC"
+
+
+def test_funding_arb_legacy_config_remains_readable_for_recovery() -> None:
     config = default_funding_arb_config()
     config["spot_coin"] = "PURR/USDC"
     assert normalize_funding_arb_config(config)["spot_coin"] == "PURR/USDC"
@@ -164,6 +171,9 @@ def test_funding_arb_config_payload_uses_type_specific_hash() -> None:
     snapshot = StrategyConfigSnapshot(StrategyId("fa-1"), 1, config)
     payload = _config_payload(snapshot)
     assert payload["config_hash"] == funding_arb_config_hash(config)
+    assert isinstance(payload["config"], dict)
+    assert "spot_coin" not in payload["config"]
+    json.dumps(payload)
 
 
 def test_funding_arb_capabilities_exclude_shadow_and_drain() -> None:
@@ -199,7 +209,7 @@ async def test_live_capability_supervisor_rejects_funding_arb_drain() -> None:
                 strategy_id,
                 "funding_arb",
                 SubAccount("fa_btc"),
-                Symbol("BTC"),
+                Symbol("AUTO"),
             )
 
     registry = StrategyRegistry()

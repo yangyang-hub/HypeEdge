@@ -9,6 +9,7 @@ from typing import Any, Protocol
 
 import structlog
 
+from hypeedge.core.constants import AUTO_MARKET_SYMBOL
 from hypeedge.core.enums import MarketMakerLifecycle
 from hypeedge.core.exceptions import StrategyLifecycleError, StrategyRegistrationError
 from hypeedge.core.types import StrategyId, SubAccount, Symbol
@@ -21,6 +22,21 @@ from hypeedge.strategy.registry import (
 )
 
 logger = structlog.get_logger(__name__)
+
+SYSTEM_SAFETY_PAUSE_PREFIX = "system_safety_pause:"
+SYSTEM_SAFETY_RECOVERED_REASON = "system_safety_recovered"
+
+
+def is_system_safety_pause_reason(reason: str | None) -> bool:
+    """Return whether a runtime pause was imposed by the system safety layer."""
+    return reason is not None and reason.startswith(SYSTEM_SAFETY_PAUSE_PREFIX)
+
+
+def _allocation_symbol(instance: StrategyInstanceDefinition) -> Symbol:
+    """Return the durable lease scope, including account-wide AUTO leases."""
+    if instance.strategy_type == "funding_arb":
+        return Symbol(AUTO_MARKET_SYMBOL)
+    return instance.symbol
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,7 +170,13 @@ class StrategySupervisor:
             instance = await self._store.set_desired(strategy_id, state=MarketMakerLifecycle.PAUSED)
             runtime = await self._store.get_runtime(strategy_id)
             if runtime.actual_state == MarketMakerLifecycle.PAUSED:
-                return runtime
+                if runtime.reason == "operator_pause":
+                    return runtime
+                return await self._store.set_runtime(
+                    strategy_id,
+                    reason="operator_pause",
+                    expected_revision=runtime.revision,
+                )
             handle = self._require_handle(strategy_id)
             try:
                 await handle.set_mode(MarketMakerLifecycle.PAUSED)
@@ -162,6 +184,66 @@ class StrategySupervisor:
             except Exception as exc:
                 await self._fault_locked(instance, exc)
                 raise StrategyLifecycleError(f"Failed to pause strategy {strategy_id}") from exc
+
+    async def suspend_for_safety(self, strategy_id: StrategyId, reason: str) -> StrategyRuntimeState:
+        """Pause only the runtime while preserving the operator's desired state."""
+        normalized_reason = reason.strip()
+        if not normalized_reason:
+            raise StrategyLifecycleError("System safety pause reason cannot be empty")
+        async with self._locks[strategy_id]:
+            instance = await self._store.get_instance(strategy_id)
+            runtime = await self._store.get_runtime(strategy_id)
+            if runtime.actual_state in {MarketMakerLifecycle.STOPPED, MarketMakerLifecycle.FAULTED}:
+                return runtime
+            if runtime.actual_state == MarketMakerLifecycle.PAUSED:
+                # Never relabel an operator pause as a system pause.
+                return runtime
+            handle = self._handles.get(strategy_id)
+            try:
+                if handle is not None:
+                    await handle.set_mode(MarketMakerLifecycle.PAUSED)
+                return await self._transition(
+                    instance,
+                    runtime,
+                    MarketMakerLifecycle.PAUSED,
+                    f"{SYSTEM_SAFETY_PAUSE_PREFIX}{normalized_reason}",
+                )
+            except Exception as exc:
+                await self._fault_locked(instance, exc)
+                raise StrategyLifecycleError(f"Failed to safety-suspend strategy {strategy_id}") from exc
+
+    async def resume_from_safety(self, strategy_id: StrategyId) -> StrategyRuntimeState:
+        """Resume a system-suspended runtime only while its operator intent is still active."""
+        async with self._locks[strategy_id]:
+            instance = await self._store.get_instance(strategy_id)
+            runtime = await self._store.get_runtime(strategy_id)
+            if runtime.actual_state != MarketMakerLifecycle.PAUSED or not is_system_safety_pause_reason(runtime.reason):
+                return runtime
+            if instance.desired_state not in {MarketMakerLifecycle.SHADOW, MarketMakerLifecycle.RUNNING}:
+                return runtime
+            handle = self._handles.get(strategy_id)
+            if handle is None:
+                # A persisted active state can be safety-suspended before its
+                # process handle is rebuilt after startup. Market makers retain
+                # their restart-through-SHADOW policy; other strategy types can
+                # rebuild directly into their supported desired mode.
+                desired = instance.desired_state
+                target = MarketMakerLifecycle.SHADOW if instance.strategy_type == "market_maker" else desired
+                recovered = await self._start_locked(strategy_id, target, recovering=True)
+                if target != desired:
+                    await self._store.set_desired(strategy_id, state=desired)
+                return recovered
+            try:
+                await handle.set_mode(instance.desired_state)
+                return await self._transition(
+                    instance,
+                    runtime,
+                    instance.desired_state,
+                    SYSTEM_SAFETY_RECOVERED_REASON,
+                )
+            except Exception as exc:
+                await self._fault_locked(instance, exc)
+                raise StrategyLifecycleError(f"Failed to resume safety-suspended strategy {strategy_id}") from exc
 
     async def resume(
         self,
@@ -290,7 +372,7 @@ class StrategySupervisor:
                         await self._allocations.acquire(
                             instance.strategy_id,
                             instance.sub_account,
-                            instance.symbol,
+                            _allocation_symbol(instance),
                         )
                     if runtime.actual_state != MarketMakerLifecycle.FAULTED:
                         runtime = await self._transition(
@@ -361,7 +443,7 @@ class StrategySupervisor:
         if not supports_shadow and target != MarketMakerLifecycle.RUNNING:
             raise StrategyLifecycleError(f"Strategy type {instance.strategy_type} start target must be running")
 
-        await self._allocations.acquire(strategy_id, instance.sub_account, instance.symbol)
+        await self._allocations.acquire(strategy_id, instance.sub_account, _allocation_symbol(instance))
         config = await self._store.get_config(strategy_id, instance.desired_config_revision)
         try:
             runtime = await self._transition(
@@ -614,10 +696,24 @@ class InMemoryStrategyAllocationManager:
                     return existing
                 raise StrategyLifecycleError(f"Strategy {strategy_id} already owns a different allocation")
             scope = (sub_account, symbol)
-            owner = self._by_scope.get(scope)
-            if owner is not None and owner != strategy_id:
+            conflicting = next(
+                (
+                    (allocated_symbol, owner)
+                    for (allocated_account, allocated_symbol), owner in self._by_scope.items()
+                    if allocated_account == sub_account
+                    and owner != strategy_id
+                    and (
+                        str(symbol) == AUTO_MARKET_SYMBOL
+                        or str(allocated_symbol) == AUTO_MARKET_SYMBOL
+                        or allocated_symbol == symbol
+                    )
+                ),
+                None,
+            )
+            if conflicting is not None:
+                allocated_symbol, owner = conflicting
                 raise StrategyLifecycleError(
-                    f"Allocation is already owned: sub_account={sub_account} symbol={symbol} owner={owner}"
+                    f"Allocation is already owned: sub_account={sub_account} symbol={allocated_symbol} owner={owner}"
                 )
             allocation = StrategyAllocation(strategy_id, sub_account, symbol, self._next_fence)
             self._next_fence += 1

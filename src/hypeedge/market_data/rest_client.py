@@ -95,13 +95,17 @@ class RestClient:
         """Get exchange metadata (asset info, etc.)."""
         return cast(dict[str, Any], await self.post_info("meta"))
 
+    async def get_meta_and_asset_ctxs(self) -> list[Any]:
+        """Get perpetual metadata plus realtime funding and volume contexts."""
+        return cast(list[Any], await self.post_info("metaAndAssetCtxs"))
+
     async def get_spot_meta(self) -> dict[str, Any]:
         """Get spot market metadata (HIP-1/HIP-2 universe + tokens)."""
         return cast(dict[str, Any], await self.post_info("spotMeta"))
 
-    async def get_spot_meta_and_asset_ctxs(self) -> dict[str, Any]:
+    async def get_spot_meta_and_asset_ctxs(self) -> list[Any]:
         """Get spot universe plus realtime asset contexts (mark/mid/dayNtlVlm)."""
-        return cast(dict[str, Any], await self.post_info("spotMetaAndAssetCtxs"))
+        return cast(list[Any], await self.post_info("spotMetaAndAssetCtxs"))
 
     async def get_spot_user_state(self, user: str) -> dict[str, Any]:
         """Get spot balances (spotClearinghouseState)."""

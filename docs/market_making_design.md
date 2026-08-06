@@ -355,6 +355,11 @@ STOPPED -> WARMING -> SHADOW -> RUNNING -> DRAINING -> STOPPED
 - `FAULTED`：需要人工或完整恢复流程，不自动回到 RUNNING。
 
 系统 `SafetyController` 状态高于策略生命周期，任何系统级 `CANCEL_ONLY/HALTING/HALTED` 都覆盖策略状态。
+`desired_state` 是操作员意图，不能被健康检查改写：人工 pause 同时写 desired/actual 并记录 `operator_pause`；系统安全暂停
+只把 actual 改为 `PAUSED`，reason 使用 `system_safety_pause:<cause>`。同一进程仅在账户与 user stream 新鲜、远端动作额度和
+保守 cancel headroom 新鲜且允许 placement、authenticated history 补缺成功、随后一次完整对账成功并持久化 `NORMAL` 后，
+才可恢复仍保持 RUNNING/SHADOW desired 且仍带系统暂停 reason 的 runtime。Kill Switch/FAULTED 不走自动恢复，操作员在降级
+期间执行 pause/stop 后也不得被恢复任务反向覆盖。
 
 ### 8.2 风控维度
 

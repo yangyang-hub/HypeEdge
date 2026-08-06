@@ -33,7 +33,7 @@ describe("PnLText", () => {
   })
 })
 
-describe("Button disabled title", () => {
+describe("Button", () => {
   it("exposes disabled reason via title", () => {
     render(
       <Button type="button" disabled title="生命周期切换中">
@@ -41,6 +41,19 @@ describe("Button disabled title", () => {
       </Button>,
     )
     expect(screen.getByRole("button", { name: "启动" })).toHaveAttribute("title", "生命周期切换中")
+  })
+
+  it("renders a single link child when using asChild", () => {
+    render(
+      <Button asChild variant="ghost" size="sm">
+        <a href="/strategy/mm-btc-1/market-making">工作台</a>
+      </Button>,
+    )
+
+    expect(screen.getByRole("link", { name: "工作台" })).toHaveAttribute(
+      "href",
+      "/strategy/mm-btc-1/market-making",
+    )
   })
 })
 

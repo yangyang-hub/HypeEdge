@@ -30,8 +30,8 @@ describe("market-maker-config helpers", () => {
   })
 
   it("validates strategy identity", () => {
-    expect(validateStrategyIdentity({ strategy_id: "bad id", sub_account: "a", symbol: "BTC" })).not.toBeNull()
-    expect(validateStrategyIdentity({ strategy_id: "mm-btc-1", sub_account: "mm-btc-1", symbol: "BTC" })).toBeNull()
+    expect(validateStrategyIdentity({ strategy_id: "bad id", symbol: "BTC" })).not.toBeNull()
+    expect(validateStrategyIdentity({ strategy_id: "mm-btc-1", symbol: "BTC" })).toBeNull()
   })
 
   it("suggests quote size from instrument meta", () => {

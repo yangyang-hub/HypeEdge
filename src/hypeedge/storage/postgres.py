@@ -581,9 +581,9 @@ class TrendFollowConfigVersionRecord(Base):
 class FundingArbConfigVersionRecord(Base):
     """Typed, immutable funding-rate-arbitrage parameters for one config version.
 
-    Captures the single-venue delta-neutral shape (HL perpetual short + HL spot long).
-    The spot leg coin name is versioned as ``spot_coin``; the perpetual leg uses
-    ``strategy_instances.symbol``. See ``docs/funding_arb_design.md``.
+    ``spot_coin`` is retained for schema compatibility. New automatic-market
+    configs persist ``AUTO/USDC``; actual instruments are stored on each cycle.
+    See ``docs/funding_arb_design.md``.
     """
 
     __tablename__ = "funding_arb_config_versions"

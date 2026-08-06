@@ -127,6 +127,16 @@ class BookManager:
         book = self._books.get(symbol)
         return book.get_snapshot() if book else None
 
+    def apply_snapshot(self, snapshot: L2BookSnapshot) -> L2BookSnapshot:
+        """Apply a normalized REST/WS snapshot to the shared in-memory book."""
+        return self.get_book(snapshot.symbol).update(
+            [(float(level.price), float(level.size)) for level in snapshot.bids],
+            [(float(level.price), float(level.size)) for level in snapshot.asks],
+            snapshot.timestamp,
+            received_at=snapshot.received_at,
+            connection_generation=snapshot.connection_generation,
+        )
+
     def get_mid_price(self, symbol: Symbol) -> float | None:
         """Get mid price for a symbol."""
         book = self._books.get(symbol)

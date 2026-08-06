@@ -4,7 +4,6 @@ import { asDecimalString } from "@/lib/utils"
 import { STRATEGY_ID_PATTERN, SYMBOL_PATTERN } from "@/lib/market-maker-config"
 
 export type FundingArbConfigFieldKey = keyof FundingArbConfig
-const SPOT_MARKET_PATTERN = /^(?:@[0-9]+|[A-Za-z0-9_.:-]+\/[A-Za-z0-9_.:-]+)$/
 const DECIMAL_STRING_PATTERN = /^-?(?:0|[1-9]\d*)(?:\.\d+)?$/
 
 export interface FundingArbFieldMeta {
@@ -79,17 +78,8 @@ export const FA_DECIMAL_FIELDS: FundingArbFieldMeta[] = [
   },
 ]
 
-export const FA_STRING_FIELDS: FundingArbFieldMeta[] = [
-  {
-    key: "spot_coin",
-    label: "现货标的",
-    description: "完整 Hyperliquid 现货市场标识，例如 PURR/USDC 或 @1；不要填写可能指向永续的裸 token 名。",
-  },
-]
-
 /** Safe defaults aligned with FundingArbParams / backend default_funding_arb_config. */
 export const DEFAULT_FA_CONFIG: FundingArbConfig = {
-  spot_coin: "PURR/USDC",
   entry_funding_rate: "0.0001" as DecimalString,
   exit_funding_rate: "0" as DecimalString,
   max_notional_usd: "1000" as DecimalString,
@@ -119,12 +109,6 @@ function parseDecimalString(value: DecimalString): Decimal | null {
 }
 
 export function validateFaConfig(config: FundingArbConfig): string | null {
-  if (!config.spot_coin.trim()) {
-    return "现货标的不能为空"
-  }
-  if (config.spot_coin.trim().length > 64 || !SPOT_MARKET_PATTERN.test(config.spot_coin.trim())) {
-    return "现货标的必须是合法的 Hyperliquid 现货市场标识"
-  }
   const entryFunding = parseDecimalString(config.entry_funding_rate)
   const exitFunding = parseDecimalString(config.exit_funding_rate)
   const maxNotional = parseDecimalString(config.max_notional_usd)

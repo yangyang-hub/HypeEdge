@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 from datetime import UTC, datetime
 from decimal import Decimal
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -19,6 +20,11 @@ from hypeedge.account.exchange_ingestor import (
     fill_external_id,
     fill_position_after,
     projected_entry_price,
+)
+from hypeedge.account.health import (
+    AccountHealthDimension,
+    FreshnessStatus,
+    LayeredAccountHealthProvider,
 )
 from hypeedge.account.tracker import AccountTracker
 from hypeedge.core.enums import OrderStatus, OrderType, Side, TimeInForce
@@ -112,6 +118,56 @@ def test_fact_chain_schema_has_dedup_and_restart_constraints() -> None:
 
     assert "uq_ledger_entries_fill_type" in ledger_constraints
     assert "uq_exchange_sync_cursor_scope" in cursor_constraints
+
+
+async def test_quiet_connected_user_stream_refreshes_liveness_without_account_events() -> None:
+    health = LayeredAccountHealthProvider()
+    manager = SimpleNamespace(
+        ws_ready=True,
+        ws=SimpleNamespace(sock=SimpleNamespace(connected=True)),
+        is_alive=lambda: True,
+    )
+    ingestor = ExchangeEventIngestor(
+        SimpleNamespace(ws_manager=manager),
+        "0xAccount",
+        MagicMock(),
+        account_health=health,
+    )
+
+    assert await ingestor._check_user_stream_health() is True
+
+    observed = health.get_account_health()
+    assert observed.user_stream.status == FreshnessStatus.FRESH
+    assert observed.user_stream.reason is None
+
+
+async def test_disconnected_user_stream_marks_health_and_requests_safety_degradation() -> None:
+    health = LayeredAccountHealthProvider()
+    failures: list[str] = []
+
+    async def on_failure(reason: str) -> None:
+        failures.append(reason)
+
+    manager = SimpleNamespace(
+        ws_ready=True,
+        ws=SimpleNamespace(sock=SimpleNamespace(connected=False)),
+        is_alive=lambda: True,
+    )
+    ingestor = ExchangeEventIngestor(
+        SimpleNamespace(ws_manager=manager),
+        "0xAccount",
+        MagicMock(),
+        account_health=health,
+        on_health_failure=on_failure,
+    )
+
+    assert await ingestor._check_user_stream_health() is False
+
+    observed = health.get_account_health()
+    assert observed.user_stream.status == FreshnessStatus.UNHEALTHY
+    assert observed.user_stream.reason == "authenticated_stream_disconnected"
+    assert failures == ["authenticated_stream_disconnected"]
+    assert observed.dimensions[2].dimension == AccountHealthDimension.USER_STREAM
 
 
 async def test_restart_recovery_replays_cursor_overlap_for_inbox_dedup() -> None:

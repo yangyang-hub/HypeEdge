@@ -5,23 +5,46 @@ import { useState } from "react"
 import { AppShell } from "@/components/layout/app-shell"
 import { PageHeader } from "@/components/layout/page-header"
 import { CreateStrategyDialog } from "@/components/strategy/create-strategy-dialog"
+import { AlertConfirmDialog } from "@/components/ui/alert-confirm-dialog"
 import { Button } from "@/components/ui/button"
 import { EmptyState, Panel } from "@/components/ui/data-display"
 import { StrategyStatusChip } from "@/components/ui/strategy-status-chip"
-import { useStrategies, startStrategy, stopStrategy } from "@/hooks/use-strategies"
+import { archiveStrategy, startStrategy, stopStrategy, useStrategies } from "@/hooks/use-strategies"
 import { ApiError } from "@/lib/api"
 import { formatDateTime } from "@/lib/utils"
 import type { StrategyInstance } from "@/lib/types"
+
+const RUNTIME_REASON_LABELS: Record<string, string> = {
+  action_credits_unavailable: "动作额度不可用",
+  action_budget_stale: "动作额度数据已过期",
+  authenticated_stream_disconnected: "认证数据流已断开",
+  clearinghouse_poll_failed: "账户状态刷新失败",
+  exchange_history_recovery_failed: "交易历史补缺失败",
+  operator_pause: "操作员已暂停",
+  reconciliation_failed: "账户对账失败",
+  user_fill_queue_overflow: "成交事件队列溢出",
+}
+
+function formatRuntimeReason(reason: string): string {
+  const systemPausePrefix = "system_safety_pause:"
+  const isSystemPause = reason.startsWith(systemPausePrefix)
+  const detail = isSystemPause ? reason.slice(systemPausePrefix.length) : reason
+  const code = detail.split(":", 1)[0]
+  const label = RUNTIME_REASON_LABELS[code] ?? detail
+  return isSystemPause ? `系统安全暂停：${label}` : `运行状态：${label}`
+}
 
 export default function StrategyPage() {
   const { strategies, refresh, error, isLoading } = useStrategies()
   const [createOpen, setCreateOpen] = useState(false)
   const [actionError, setActionError] = useState<string | null>(null)
+  const [archiveTarget, setArchiveTarget] = useState<StrategyInstance | null>(null)
+  const [archiving, setArchiving] = useState(false)
 
   async function handleToggle(strategy: StrategyInstance) {
     setActionError(null)
     try {
-      if (strategy.actual_state === "running" || strategy.actual_state === "shadow") {
+      if (strategy.desired_state !== "stopped" || strategy.actual_state !== "stopped") {
         await stopStrategy(strategy)
       } else {
         await startStrategy(strategy, strategy.strategy_type === "market_maker" ? "shadow" : "running")
@@ -29,6 +52,26 @@ export default function StrategyPage() {
       await refresh()
     } catch (e) {
       setActionError(e instanceof ApiError ? e.message : e instanceof Error ? e.message : "策略启停失败")
+    }
+  }
+
+  async function handleArchive() {
+    if (!archiveTarget) return
+    setActionError(null)
+    setArchiving(true)
+    try {
+      const archivedId = archiveTarget.strategy_id
+      await archiveStrategy(archiveTarget)
+      setArchiveTarget(null)
+      await refresh(
+        (current) => current?.filter((strategy) => strategy.strategy_id !== archivedId),
+        { revalidate: false },
+      )
+      void refresh()
+    } catch (e) {
+      setActionError(e instanceof ApiError ? e.message : e instanceof Error ? e.message : "策略删除失败")
+    } finally {
+      setArchiving(false)
     }
   }
 
@@ -69,7 +112,12 @@ export default function StrategyPage() {
         ) : (
           <div className="space-y-3">
             {strategies.map((strategy) => (
-              <StrategyRow key={strategy.strategy_id} strategy={strategy} onToggle={handleToggle} />
+              <StrategyRow
+                key={strategy.strategy_id}
+                strategy={strategy}
+                onToggle={handleToggle}
+                onArchive={setArchiveTarget}
+              />
             ))}
           </div>
         )}
@@ -81,6 +129,18 @@ export default function StrategyPage() {
         existing={strategies}
         onCreated={() => void refresh()}
       />
+      <AlertConfirmDialog
+        open={archiveTarget !== null}
+        onOpenChange={(open) => {
+          if (!open && !archiving) setArchiveTarget(null)
+        }}
+        title="删除策略"
+        description={`确认删除策略 ${archiveTarget?.strategy_id ?? ""}？该策略会从当前列表移除，但配置、订单、成交与审计历史仍会保留。`}
+        confirmLabel="确认删除"
+        danger
+        loading={archiving}
+        onConfirm={handleArchive}
+      />
     </AppShell>
   )
 }
@@ -88,12 +148,19 @@ export default function StrategyPage() {
 function StrategyRow({
   strategy: s,
   onToggle,
+  onArchive,
 }: {
   strategy: StrategyInstance
   onToggle: (strategy: StrategyInstance) => Promise<void>
+  onArchive: (strategy: StrategyInstance) => void
 }) {
-  const running = s.actual_state === "running" || s.actual_state === "shadow"
+  const shouldStop = s.desired_state !== "stopped" || s.actual_state !== "stopped"
   const busy = s.actual_state === "draining" || s.actual_state === "warming"
+  const canArchive = s.desired_state === "stopped" && s.actual_state === "stopped"
+  const runtimeReason =
+    s.runtime_reason && (s.actual_state === "paused" || s.actual_state === "faulted")
+      ? formatRuntimeReason(s.runtime_reason)
+      : null
 
   return (
     <Panel>
@@ -105,7 +172,7 @@ function StrategyRow({
             <span className="rounded-sm bg-bg-active px-1.5 py-0.5 text-2xs text-text-tertiary">{s.strategy_type}</span>
           </div>
           <div className="flex flex-wrap gap-x-4 gap-y-1 font-mono text-xs text-text-secondary">
-            <span>symbol {s.symbol}</span>
+            <span>{s.strategy_type === "funding_arb" ? "market 自动选择" : `symbol ${s.symbol}`}</span>
             <span>sub {s.sub_account ?? "—"}</span>
             <span>updated {formatDateTime(s.updated_at)}</span>
           </div>
@@ -113,6 +180,11 @@ function StrategyRow({
             Desired {s.desired_state} · Runtime revision {s.revision}
             {s.metadata?.note ? ` · ${s.metadata.note}` : ""}
           </div>
+          {runtimeReason ? (
+            <p className="text-xs text-warning" title={s.runtime_reason ?? undefined}>
+              {runtimeReason}
+            </p>
+          ) : null}
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -125,21 +197,33 @@ function StrategyRow({
               <Link href={`/strategy/${encodeURIComponent(s.strategy_id)}/funding-arb`}>工作台</Link>
             </Button>
           ) : null}
+          {s.strategy_type !== "legacy" ? (
+            <Button
+              type="button"
+              variant="danger-soft"
+              size="sm"
+              disabled={!canArchive}
+              title={canArchive ? undefined : "请先停止策略再删除"}
+              onClick={() => onArchive(s)}
+            >
+              删除
+            </Button>
+          ) : null}
           <Button
             type="button"
-            variant={running ? "secondary" : "primary"}
+            variant={shouldStop ? "secondary" : "primary"}
             size="sm"
             disabled={busy}
             title={
               busy
                 ? "生命周期切换中"
-                : s.strategy_type === "market_maker" && !running
+                : s.strategy_type === "market_maker" && !shouldStop
                   ? "启动为 Shadow"
                   : undefined
             }
             onClick={() => void onToggle(s)}
           >
-            {running ? "停止" : "启动"}
+            {shouldStop ? "停止" : "启动"}
           </Button>
         </div>
       </div>

@@ -32,7 +32,6 @@ class ExchangeSettings(HypeSettings):
     ws_url: str = "wss://api.hyperliquid-testnet.xyz/ws"
     account_address: str = ""
     agent_private_key: str = ""
-    sub_account: str | None = None
 
     @field_validator("account_address", "agent_private_key")
     @classmethod
@@ -250,6 +249,25 @@ class FundingArbSettings(HypeSettings):
     order_status_poll_interval_seconds: float = Field(default=0.25, ge=0.05, le=5.0)
     max_leg_attempts: int = Field(default=3, ge=1, le=5)
     market_stale_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
+    universe_refresh_seconds: float = Field(default=30.0, ge=10.0, le=300.0)
+    book_refresh_seconds: float = Field(default=5.0, ge=1.0, le=30.0)
+    max_candidate_markets: int = Field(default=8, ge=1, le=20)
+    min_spot_24h_volume_usd: Decimal = Field(default=Decimal("1000"), ge=Decimal("0"))
+    min_perp_24h_volume_usd: Decimal = Field(default=Decimal("10000"), ge=Decimal("0"))
+    min_top_book_depth_usd: Decimal = Field(default=Decimal("100"), gt=Decimal("0"))
+    max_combined_spread_bps: Decimal = Field(
+        default=Decimal("100"),
+        gt=Decimal("0"),
+        le=Decimal("10000"),
+    )
+
+    @model_validator(mode="after")
+    def validate_market_scan_cadence(self) -> FundingArbSettings:
+        if self.book_refresh_seconds > self.market_stale_seconds:
+            raise ValueError("funding-arb book refresh must not exceed the market stale threshold")
+        if self.universe_refresh_seconds < self.book_refresh_seconds:
+            raise ValueError("funding-arb universe refresh cannot be faster than book refresh")
+        return self
 
 
 class MonitorSettings(HypeSettings):

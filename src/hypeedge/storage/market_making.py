@@ -17,10 +17,11 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any, NoReturn
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from hypeedge.core.constants import AUTO_MARKET_SYMBOL, AUTO_SPOT_MARKET
 from hypeedge.core.enums import MarketMakerLifecycle, OrderStatus, QuoteAction, Side
 from hypeedge.core.exceptions import StrategyLifecycleError, StrategyRegistrationError
 from hypeedge.core.types import Cloid, OrderId, Price, Size, StrategyId, SubAccount, Symbol
@@ -286,13 +287,14 @@ _FA_SPOT_MARKET_PATTERN = re.compile(r"^(?:@[0-9]+|[A-Za-z0-9_.:-]+/[A-Za-z0-9_.
 def normalize_funding_arb_config(values: Mapping[str, Any]) -> dict[str, Decimal | int | str]:
     """Validate and normalize typed funding-rate-arbitrage Postgres config.
 
-    Single-venue delta-neutral shape: HL perpetual short funded by funding income,
-    delta-hedged long spot on the same venue. ``spot_coin`` names the spot leg
-    (HIP-1/HIP-2); the perpetual leg uses ``strategy_instances.symbol``.
+    The public contract omits market fields. ``spot_coin`` remains an internal
+    compatibility column and is filled with a non-tradable AUTO sentinel when
+    absent; legacy persisted market identifiers remain readable for recovery.
     """
 
     supplied = dict(values)
     supplied.pop("symbol", None)
+    supplied.setdefault("spot_coin", AUTO_SPOT_MARKET)
     keys = frozenset(supplied)
     if keys != _FA_CONFIG_FIELDS:
         missing = sorted(_FA_CONFIG_FIELDS - keys)
@@ -370,10 +372,10 @@ def funding_arb_config_hash(values: Mapping[str, Any]) -> str:
 
 
 def default_funding_arb_config() -> dict[str, Decimal | int | str]:
-    """Safe create defaults aligned with ``FundingArbParams``."""
+    """Safe create defaults; the spot column is a non-tradable auto-selection sentinel."""
 
     return {
-        "spot_coin": "PURR/USDC",
+        "spot_coin": AUTO_SPOT_MARKET,
         "entry_funding_rate": Decimal("0.0001"),
         "exit_funding_rate": Decimal("0"),
         "max_notional_usd": Decimal("1000"),
@@ -560,19 +562,35 @@ class PostgresStrategyStateStore:
             normalized = normalize_trend_follow_config(initial_config)
             config_hash = trend_follow_config_hash(normalized)
         async with self._session_factory() as session, session.begin():
-            record = StrategyInstanceRecord(
-                strategy_id=str(instance.strategy_id),
-                strategy_type=strategy_type,
-                sub_account=str(instance.sub_account),
-                symbol=str(instance.symbol),
-                desired_state=instance.desired_state.value,
-                revision=instance.revision,
-                metadata_=dict(metadata or {}),
-            )
-            session.add(record)
-            await session.flush()
+            strategy_id = str(instance.strategy_id)
+            inserted_strategy_id = (
+                await session.execute(
+                    pg_insert(StrategyInstanceRecord)
+                    .values(
+                        strategy_id=strategy_id,
+                        strategy_type=strategy_type,
+                        sub_account=str(instance.sub_account),
+                        symbol=AUTO_MARKET_SYMBOL if strategy_type == "funding_arb" else str(instance.symbol),
+                        desired_state=instance.desired_state.value,
+                        revision=instance.revision,
+                        metadata_=dict(metadata or {}),
+                    )
+                    .on_conflict_do_nothing(index_elements=[StrategyInstanceRecord.strategy_id])
+                    .returning(StrategyInstanceRecord.strategy_id)
+                )
+            ).scalar_one_or_none()
+            if inserted_strategy_id is None:
+                raise StrategyRegistrationError(
+                    "Strategy ID is already reserved by an existing or archived strategy; "
+                    f"use a new strategy ID: {instance.strategy_id}"
+                )
+            record = (
+                await session.execute(
+                    select(StrategyInstanceRecord).where(StrategyInstanceRecord.strategy_id == strategy_id)
+                )
+            ).scalar_one()
             config_record = StrategyConfigVersionRecord(
-                strategy_id=str(instance.strategy_id), version=1, config_hash=config_hash, created_by=created_by
+                strategy_id=strategy_id, version=1, config_hash=config_hash, created_by=created_by
             )
             session.add(config_record)
             await session.flush()
@@ -583,7 +601,7 @@ class PostgresStrategyStateStore:
             else:
                 session.add(TrendFollowConfigVersionRecord(config_version_id=config_record.id, **normalized))
             record.desired_config_version_id = config_record.id
-            session.add(StrategyRuntimeStateRecord(strategy_id=str(instance.strategy_id)))
+            session.add(StrategyRuntimeStateRecord(strategy_id=strategy_id))
             await session.flush()
             view = _instance_view(record, 1)
         return view
@@ -620,29 +638,40 @@ class PostgresStrategyStateStore:
     ) -> StrategyInstanceView:
         now = _utcnow()
         async with self._session_factory() as session, session.begin():
-            runtime = await session.get(StrategyRuntimeStateRecord, str(strategy_id))
+            record = (
+                await session.execute(
+                    select(StrategyInstanceRecord)
+                    .where(StrategyInstanceRecord.strategy_id == str(strategy_id))
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
+            if record is None or record.archived_at is not None:
+                raise StrategyRegistrationError(f"Unknown active strategy instance: {strategy_id}")
+            runtime = (
+                await session.execute(
+                    select(StrategyRuntimeStateRecord)
+                    .where(StrategyRuntimeStateRecord.strategy_id == str(strategy_id))
+                    .with_for_update()
+                )
+            ).scalar_one_or_none()
             if runtime is None:
                 raise StrategyRegistrationError(f"Unknown strategy instance: {strategy_id}")
-            if runtime.actual_state != MarketMakerLifecycle.STOPPED.value:
-                raise StrategyLifecycleError("Only a stopped strategy can be archived")
-            result = await session.execute(
-                update(StrategyInstanceRecord)
-                .where(
-                    StrategyInstanceRecord.strategy_id == str(strategy_id),
-                    StrategyInstanceRecord.revision == expected_revision,
-                    StrategyInstanceRecord.archived_at.is_(None),
+            if record.revision != expected_revision:
+                raise StrategyLifecycleError(
+                    f"Strategy revision conflict: expected={expected_revision} actual={record.revision}"
                 )
-                .values(
-                    archived_at=now,
-                    desired_state=MarketMakerLifecycle.STOPPED.value,
-                    revision=StrategyInstanceRecord.revision + 1,
-                    updated_at=now,
+            if (
+                record.desired_state != MarketMakerLifecycle.STOPPED.value
+                or runtime.actual_state != MarketMakerLifecycle.STOPPED.value
+            ):
+                raise StrategyLifecycleError(
+                    "Only a fully stopped strategy can be archived: "
+                    f"desired={record.desired_state} actual={runtime.actual_state}"
                 )
-                .returning(StrategyInstanceRecord)
-            )
-            record = result.scalar_one_or_none()
-            if record is None:
-                await self._raise_instance_conflict(session, strategy_id, expected_revision)
+            record.archived_at = now
+            record.revision += 1
+            record.updated_at = now
+            await session.flush()
             await session.execute(
                 delete(StrategyAllocationRecord).where(StrategyAllocationRecord.strategy_id == str(strategy_id))
             )
@@ -966,7 +995,7 @@ class PostgresStrategyStateStore:
                 await session.execute(
                     self._instance_statement()
                     .where(StrategyInstanceRecord.strategy_id == str(strategy_id))
-                    .with_for_update()
+                    .with_for_update(of=StrategyInstanceRecord)
                 )
             ).one_or_none()
             if current_row is None or current_row[0].archived_at is not None:
@@ -1142,7 +1171,11 @@ class PostgresStrategyStateStore:
 
 
 class PostgresStrategyAllocationManager:
-    """Exclusive allocation manager whose identity key is the fencing token."""
+    """Exclusive allocation manager whose identity key is the fencing token.
+
+    ``AUTO`` is an account-wide wildcard. An advisory transaction lock closes
+    the race that an exact ``(sub_account, symbol)`` unique index cannot cover.
+    """
 
     def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
         self._session_factory = session_factory
@@ -1154,6 +1187,53 @@ class PostgresStrategyAllocationManager:
             "symbol": str(symbol),
         }
         async with self._session_factory() as session, session.begin():
+            await session.execute(
+                text("SELECT pg_advisory_xact_lock(hashtextextended(:allocation_scope, 0))"),
+                {"allocation_scope": f"strategy_allocation:{sub_account}"},
+            )
+            existing = (
+                await session.execute(
+                    select(StrategyAllocationRecord).where(StrategyAllocationRecord.strategy_id == str(strategy_id))
+                )
+            ).scalar_one_or_none()
+            exact_existing = False
+            if existing is not None:
+                if existing.sub_account == str(sub_account) and existing.symbol == str(symbol):
+                    exact_existing = True
+                elif existing.sub_account != str(sub_account) or str(symbol) != AUTO_MARKET_SYMBOL:
+                    raise StrategyLifecycleError(f"Strategy {strategy_id} already owns a different allocation")
+
+            conflict_scope = StrategyAllocationRecord.sub_account == str(sub_account)
+            if str(symbol) != AUTO_MARKET_SYMBOL:
+                conflict_scope = conflict_scope & StrategyAllocationRecord.symbol.in_((str(symbol), AUTO_MARKET_SYMBOL))
+            owner = (
+                await session.execute(
+                    select(StrategyAllocationRecord.strategy_id).where(
+                        conflict_scope,
+                        StrategyAllocationRecord.strategy_id != str(strategy_id),
+                    )
+                )
+            ).scalar_one_or_none()
+            if owner is not None:
+                raise StrategyLifecycleError(
+                    f"Allocation is already owned: sub_account={sub_account} symbol={symbol} owner={owner}"
+                )
+
+            if exact_existing:
+                assert existing is not None
+                return StrategyAllocation(strategy_id, sub_account, symbol, int(existing.id))
+            if existing is not None:
+                upgraded = await session.execute(
+                    update(StrategyAllocationRecord)
+                    .where(StrategyAllocationRecord.strategy_id == str(strategy_id))
+                    .values(symbol=AUTO_MARKET_SYMBOL)
+                    .returning(StrategyAllocationRecord.id)
+                )
+                fence = upgraded.scalar_one_or_none()
+                if fence is None:
+                    raise StrategyLifecycleError(f"Failed to upgrade AUTO allocation for strategy {strategy_id}")
+                return StrategyAllocation(strategy_id, sub_account, Symbol(AUTO_MARKET_SYMBOL), int(fence))
+
             inserted = await session.execute(
                 pg_insert(StrategyAllocationRecord)
                 .values(**values)
@@ -1163,26 +1243,7 @@ class PostgresStrategyAllocationManager:
             fence = inserted.scalar_one_or_none()
             if fence is not None:
                 return StrategyAllocation(strategy_id, sub_account, symbol, int(fence))
-            existing = (
-                await session.execute(
-                    select(StrategyAllocationRecord).where(StrategyAllocationRecord.strategy_id == str(strategy_id))
-                )
-            ).scalar_one_or_none()
-            if existing is not None:
-                if existing.sub_account == str(sub_account) and existing.symbol == str(symbol):
-                    return StrategyAllocation(strategy_id, sub_account, symbol, int(existing.id))
-                raise StrategyLifecycleError(f"Strategy {strategy_id} already owns a different allocation")
-            owner = (
-                await session.execute(
-                    select(StrategyAllocationRecord.strategy_id).where(
-                        StrategyAllocationRecord.sub_account == str(sub_account),
-                        StrategyAllocationRecord.symbol == str(symbol),
-                    )
-                )
-            ).scalar_one_or_none()
-            raise StrategyLifecycleError(
-                f"Allocation is already owned: sub_account={sub_account} symbol={symbol} owner={owner}"
-            )
+            raise StrategyLifecycleError(f"Allocation changed concurrently: sub_account={sub_account} symbol={symbol}")
 
     async def release(self, strategy_id: StrategyId) -> None:
         async with self._session_factory() as session, session.begin():

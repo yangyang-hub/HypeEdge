@@ -6,13 +6,13 @@ from dataclasses import replace
 from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from hypeedge.app import HypeEdgeApp
 from hypeedge.config.settings import AppSettings, FeatureFlagsSettings
-from hypeedge.core.enums import MarketMakerLifecycle
+from hypeedge.core.enums import ActionBudgetMode, MarketMakerLifecycle, SafetyMode
 from hypeedge.core.exceptions import StrategyLifecycleError, TradingCommandPersistenceError
 from hypeedge.core.types import StrategyId, SubAccount, Symbol
 from hypeedge.strategy.market_maker.adapters import (
@@ -148,6 +148,31 @@ class _Supervisor:
         return SimpleNamespace(actual_state=MarketMakerLifecycle.PAUSED)
 
 
+class _SafetyStateStore:
+    def __init__(self, instance: StrategyInstanceDefinition, runtime: SimpleNamespace) -> None:
+        self.instance = instance
+        self.runtime = runtime
+
+    async def list_instances(self) -> list[StrategyInstanceDefinition]:
+        return [self.instance]
+
+    async def get_runtime(self, strategy_id: StrategyId) -> SimpleNamespace:
+        assert strategy_id == self.instance.strategy_id
+        return self.runtime
+
+
+class _SafetySupervisor:
+    def __init__(self) -> None:
+        self.suspensions: list[tuple[StrategyId, str]] = []
+        self.resumes: list[StrategyId] = []
+
+    async def suspend_for_safety(self, strategy_id: StrategyId, reason: str) -> None:
+        self.suspensions.append((strategy_id, reason))
+
+    async def resume_from_safety(self, strategy_id: StrategyId) -> None:
+        self.resumes.append(strategy_id)
+
+
 @pytest.mark.asyncio
 async def test_restart_preserves_running_intent_but_restores_runtime_to_shadow() -> None:
     app = HypeEdgeApp(AppSettings(features=_v2_features(market_making=True)))
@@ -189,6 +214,127 @@ async def test_funding_arb_restore_starts_running_without_shadow() -> None:
 
     assert supervisor.starts == [MarketMakerLifecycle.RUNNING]
     assert MarketMakerLifecycle.SHADOW not in store.desired_updates
+
+
+@pytest.mark.asyncio
+async def test_account_health_failure_safety_suspends_without_overwriting_desired_state() -> None:
+    app = HypeEdgeApp(AppSettings())
+    app._safety_controller.transition(SafetyMode.NORMAL, "test_ready")
+    app._trading_enabled = True
+    app._metrics = MagicMock()
+    instance = StrategyInstanceDefinition(
+        strategy_id=StrategyId("fa-auto"),
+        strategy_type="funding_arb",
+        sub_account=SubAccount("0x1111111111111111111111111111111111111111"),
+        symbol=Symbol("AUTO"),
+        desired_state=MarketMakerLifecycle.RUNNING,
+    )
+    store = _SafetyStateStore(
+        instance,
+        SimpleNamespace(actual_state=MarketMakerLifecycle.RUNNING, reason="runtime_running"),
+    )
+    supervisor = _SafetySupervisor()
+    app._market_making_state_store = store
+    app._strategy_supervisor = supervisor
+
+    await app._on_account_health_failure("clearinghouse_poll_failed:OSError")
+
+    assert app.trading_enabled is False
+    assert app.safety_mode == SafetyMode.CANCEL_ONLY.value
+    assert app._safety_controller.reason == ("automatic_safety_degradation:clearinghouse_poll_failed:OSError")
+    assert instance.desired_state == MarketMakerLifecycle.RUNNING
+    assert supervisor.suspensions == [(instance.strategy_id, "clearinghouse_poll_failed:OSError")]
+    app._metrics.set_trading_enabled.assert_called_once_with(False)
+
+
+@pytest.mark.asyncio
+async def test_automatic_safety_recovery_requires_history_budget_and_full_reconciliation() -> None:
+    app = HypeEdgeApp(AppSettings())
+    app._safety_controller.transition(
+        SafetyMode.CANCEL_ONLY,
+        "automatic_safety_degradation:action_credits_unavailable",
+    )
+    app._trading_prerequisites_ok = True
+    fresh = SimpleNamespace(is_fresh=True)
+    health = SimpleNamespace(
+        inventory=fresh,
+        clearinghouse=fresh,
+        user_stream=fresh,
+        reconciliation=fresh,
+        allows_risk_increase=True,
+        blocking_reasons=(),
+    )
+    budget = SimpleNamespace(
+        remote_fresh=True,
+        cancel_headroom_fresh=True,
+        mode=ActionBudgetMode.NORMAL,
+    )
+    app._account_health = SimpleNamespace(get_account_health=lambda: health)
+    app._action_budget_controller = SimpleNamespace(snapshot=lambda: budget)
+    app._exchange_ingestor = SimpleNamespace(recover_history=AsyncMock(), is_running=True)
+    app._reconciler = SimpleNamespace(
+        reconcile=AsyncMock(return_value=SimpleNamespace(success=True, errors=[])),
+    )
+    app._refresh_action_budget = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    app._persist_system_state = AsyncMock(return_value=True)  # type: ignore[method-assign]
+    app._metrics = MagicMock()
+    instance = StrategyInstanceDefinition(
+        strategy_id=StrategyId("fa-auto"),
+        strategy_type="funding_arb",
+        sub_account=SubAccount("0x1111111111111111111111111111111111111111"),
+        symbol=Symbol("AUTO"),
+        desired_state=MarketMakerLifecycle.RUNNING,
+    )
+    store = _SafetyStateStore(
+        instance,
+        SimpleNamespace(
+            actual_state=MarketMakerLifecycle.PAUSED,
+            reason="system_safety_pause:action_credits_unavailable",
+        ),
+    )
+    supervisor = _SafetySupervisor()
+    app._market_making_state_store = store
+    app._strategy_supervisor = supervisor
+
+    assert await app._try_recover_automatic_safety() is True
+
+    app._exchange_ingestor.recover_history.assert_awaited_once()
+    app._reconciler.reconcile.assert_awaited_once()
+    app._refresh_action_budget.assert_awaited_once()
+    assert [call.args[0] for call in app._persist_system_state.await_args_list] == [
+        "recovering",
+        "reconciling",
+        "normal",
+    ]
+    assert app.trading_enabled is True
+    assert app.safety_mode == SafetyMode.NORMAL.value
+    assert supervisor.resumes == [instance.strategy_id]
+
+
+@pytest.mark.asyncio
+async def test_system_recovery_does_not_resume_operator_paused_instance() -> None:
+    app = HypeEdgeApp(AppSettings())
+    instance = StrategyInstanceDefinition(
+        strategy_id=StrategyId("fa-paused"),
+        strategy_type="funding_arb",
+        sub_account=SubAccount("0x1111111111111111111111111111111111111111"),
+        symbol=Symbol("AUTO"),
+        desired_state=MarketMakerLifecycle.PAUSED,
+    )
+    store = _SafetyStateStore(
+        instance,
+        SimpleNamespace(
+            actual_state=MarketMakerLifecycle.PAUSED,
+            reason="system_safety_pause:user_stream_disconnected",
+        ),
+    )
+    supervisor = _SafetySupervisor()
+    app._market_making_state_store = store
+    app._strategy_supervisor = supervisor
+
+    await app._resume_system_suspended_strategies()
+
+    assert supervisor.resumes == []
 
 
 def test_mainnet_keeps_market_making_disabled_by_default() -> None:
