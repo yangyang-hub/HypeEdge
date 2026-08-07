@@ -114,7 +114,9 @@ market_making:
   canary_observation_min_days: 30
 
 funding_arb:
-  max_notional_usd: "25"
+  # Testnet/dev funding-arbitrage ceilings. Live execution only when
+  # features.funding_arb_execution_enabled and HYPE_ENV=testnet.
+  max_notional_usd: "500"
   poll_interval_seconds: 5.0
   order_status_poll_interval_seconds: 0.25
   max_leg_attempts: 3
@@ -122,8 +124,10 @@ funding_arb:
   universe_refresh_seconds: 30.0
   book_refresh_seconds: 5.0
   max_candidate_markets: 8
-  min_spot_24h_volume_usd: "1000"
-  min_perp_24h_volume_usd: "10000"
+  # Testnet spot/perp markets are barely traded; keep the floor low so the
+  # scanner still considers a market once real books appear.
+  min_spot_24h_volume_usd: "100"
+  min_perp_24h_volume_usd: "1000"
   min_top_book_depth_usd: "100"
   max_combined_spread_bps: "100"
 

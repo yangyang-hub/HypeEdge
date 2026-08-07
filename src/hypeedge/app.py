@@ -464,7 +464,7 @@ class HypeEdgeApp:
             durable_kill_trigger=self.trigger_kill_switch,
             order_normalizer=OrderNormalizer(self._instrument_cache) if self._instrument_cache is not None else None,
             instrument_cache=self._instrument_cache,
-            spot_execution_enabled=(self.settings.is_testnet and self.settings.features.funding_arb_execution_enabled),
+            spot_execution_enabled=self.settings.features.funding_arb_execution_enabled,
         )
 
         # Reconciler
@@ -582,8 +582,7 @@ class HypeEdgeApp:
         )
         funding_dependencies = None
         if (
-            self.settings.is_testnet
-            and self.settings.features.funding_arb_execution_enabled
+            self.settings.features.funding_arb_execution_enabled
             and self._execution_engine is not None
             and self._market_data_provider is not None
             and self._instrument_cache is not None

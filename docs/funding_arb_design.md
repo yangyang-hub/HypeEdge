@@ -69,9 +69,10 @@ Hyperliquid funding **每小时结算**（非币安 8h）。
 
 ### 5.1 环境与账户门禁
 
-- 只有 `HYPE_ENV=testnet`、完整 V2 交易链、`funding_arb_execution_enabled=true`、启动对账成功、Kill Switch 未触发、
-  账户健康与动作额度新鲜时可启动真实 runtime。
-- `dev` 只运行观察/控制面；`mainnet` 即使误开环境变量也必须拒绝构造真实 runtime。
+- 只有 `HYPE_ENV=testnet` 或 `mainnet`、完整 V2 交易链、`funding_arb_execution_enabled=true`、启动对账成功、
+  Kill Switch 未触发、账户健康与动作额度新鲜时可启动真实 runtime。
+- `dev` 只运行观察/控制面；`mainnet` 额外要求 loader 的 mainnet 门禁全部通过（Agent Wallet、强 Postgres、
+  API admin token ≥32 字符、TLS），缺任一则配置加载失败。
 - Agent wallet 只负责交易签名，不执行资金转账。现货 USDC 必须由操作员事先在 Hyperliquid UI/受控流程中划入；
   运行时禁止持有主钱包私钥或自动调用 `usdClassTransfer`。
 - 每策略仍要求明确账户范围；实例 `sub_account` 只能由后端当前配置账户注入，客户端不能指定或伪装为未实际路由的子账户。

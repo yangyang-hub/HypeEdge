@@ -244,7 +244,7 @@ class FundingArbSettings(HypeSettings):
 
     model_config = SettingsConfigDict(env_prefix="HYPE_FUNDING_ARB__", env_file=".env", extra="ignore")
 
-    max_notional_usd: Decimal = Field(default=Decimal("25"), gt=Decimal("0"), le=Decimal("25"))
+    max_notional_usd: Decimal = Field(default=Decimal("500"), gt=Decimal("0"), le=Decimal("1000"))
     poll_interval_seconds: float = Field(default=5.0, ge=0.5, le=60.0)
     order_status_poll_interval_seconds: float = Field(default=0.25, ge=0.05, le=5.0)
     max_leg_attempts: int = Field(default=3, ge=1, le=5)
@@ -417,8 +417,11 @@ class AppSettings(HypeSettings):
 
     @model_validator(mode="after")
     def validate_live_strategy_environments(self) -> AppSettings:
-        if self.features.funding_arb_execution_enabled and self.environment != "testnet":
-            raise ValueError("funding-arbitrage live execution is restricted to HYPE_ENV=testnet")
+        if self.features.funding_arb_execution_enabled and self.environment not in {"testnet", "mainnet"}:
+            raise ValueError(
+                "funding-arbitrage live execution is restricted to HYPE_ENV=testnet or mainnet "
+                "(mainnet additionally requires the mainnet.yaml V2 feature set and mainnet secrets)"
+            )
         return self
 
     @property

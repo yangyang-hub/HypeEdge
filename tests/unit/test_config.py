@@ -125,10 +125,10 @@ class TestSettings:
         assert settings.market_making.max_quote_levels_per_side == 1
         assert settings.features.market_making_enabled is False
         assert settings.features.funding_arb_execution_enabled is True
-        assert settings.funding_arb.max_notional_usd == 25
+        assert settings.funding_arb.max_notional_usd == 500
         assert settings.funding_arb.max_candidate_markets == 8
-        assert settings.funding_arb.min_spot_24h_volume_usd == 1000
-        assert settings.funding_arb.min_perp_24h_volume_usd == 10000
+        assert settings.funding_arb.min_spot_24h_volume_usd == 100
+        assert settings.funding_arb.min_perp_24h_volume_usd == 1000
         assert settings.funding_arb.min_top_book_depth_usd == 100
         assert settings.funding_arb.max_combined_spread_bps == 100
         assert "HYPE/USDC" in settings.market_data.spot_coins
@@ -186,6 +186,10 @@ class TestSettings:
 
         assert settings.postgres.url == postgres_url
         assert settings.api.auth_token == api_token
+        # mainnet funding-arb live execution is unlocked (full V2 chain enabled).
+        assert settings.features.funding_arb_execution_enabled is True
+        assert settings.features.v2_trading_enabled is True
+        assert settings.funding_arb.max_notional_usd == 500
 
     def test_mainnet_rejects_postgres_without_tls(self, monkeypatch):
         monkeypatch.setenv("HYPE_EXCHANGE__ACCOUNT_ADDRESS", "0x1234")
@@ -229,7 +233,7 @@ class TestSettings:
         with pytest.raises(pydantic.ValidationError, match="complete V2 trading chain"):
             FeatureFlagsSettings(market_making_enabled=True)
 
-    def test_funding_arb_execution_requires_full_v2_and_testnet(self):
+    def test_funding_arb_execution_requires_full_v2_and_tradable_environment(self):
         with pytest.raises(pydantic.ValidationError, match="complete V2 trading chain"):
             FeatureFlagsSettings(funding_arb_execution_enabled=True)
 
@@ -241,8 +245,11 @@ class TestSettings:
             strategy_runner_v2=True,
             funding_arb_execution_enabled=True,
         )
-        with pytest.raises(pydantic.ValidationError, match="restricted to HYPE_ENV=testnet"):
-            AppSettings(environment="mainnet", features=full_v2)
+        # testnet and mainnet are the only live-trading environments allowed.
+        AppSettings(environment="testnet", features=full_v2)
+        AppSettings(environment="mainnet", features=full_v2)
+        with pytest.raises(pydantic.ValidationError, match="restricted to HYPE_ENV=testnet or mainnet"):
+            AppSettings(environment="dev", features=full_v2)
 
     def test_funding_arb_scan_cadence_preserves_freshness(self):
         with pytest.raises(pydantic.ValidationError, match="book refresh"):
