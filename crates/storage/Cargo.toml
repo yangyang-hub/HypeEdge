@@ -1,0 +1,29 @@
+[package]
+name = "hypeedge_storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+sqlx = { workspace = true }
+bigdecimal = { workspace = true }
+clickhouse = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+hypeedge_domain = { path = "../domain" }
+hypeedge_config = { path = "../config" }
+hypeedge_infra = { path = "../infra" }
+hypeedge_trading = { path = "../trading" }
+sha2 = { workspace = true }
+hex = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+chrono = { workspace = true }

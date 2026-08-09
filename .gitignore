@@ -58,3 +58,6 @@ out/
 # Runtime data
 data/
 *.sqlite3
+
+# Rust
+/target/

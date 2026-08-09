@@ -1,4 +1,5 @@
-.PHONY: install sync lint typecheck test test-unit test-integration run clean
+.PHONY: install sync lint typecheck test test-unit test-integration run clean \
+	rust-lint rust-typecheck rust-test rust-parity rust-integration rust-run
 
 # Install dependencies
 install:
@@ -51,3 +52,28 @@ clean:
 	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
 	rm -rf build/ dist/ *.egg-info/
+	@cargo clean 2>/dev/null || true
+
+# --- Rust rewrite targets ---
+
+# Lint with cargo fmt + clippy
+rust-lint:
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets -- -D warnings
+
+# Type/compile check
+rust-typecheck:
+	cargo check --workspace
+
+# Run all Rust tests (unit + corpus parity)
+rust-test:
+	cargo test --workspace
+
+# Run the golden-corpus parity suite only
+rust-parity:
+	cargo test -p hypeedge_domain --test decimal_corpus
+	cargo test -p hypeedge_config --test config_parity
+
+# Run storage integration tests (requires the Postgres test container)
+rust-integration:
+	cargo test -p hypeedge_storage --test durable_store_integration

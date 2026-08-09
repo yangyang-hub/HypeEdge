@@ -1,0 +1,79 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/domain",
+    "crates/config",
+    "crates/infra",
+    "crates/storage",
+    "crates/trading",
+    "crates/api",
+    "crates/app",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+# Shared dependency versions, pinned here so all crates resolve identically.
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+thiserror = "2"
+proptest = "1"
+
+# domain
+ethnum = { version = "1.5", features = ["serde"] }
+async-trait = "0.1"
+
+# infra
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "net", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+futures = "0.3"
+
+# config
+serde_yaml = "0.9"
+dotenvy = "0.15"
+
+# storage
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "chrono",
+    "uuid",
+    "migrate",
+    "macros",
+    "bigdecimal",
+] }
+bigdecimal = "0.4"
+clickhouse = { version = "0.12", features = ["time"] }
+duckdb = { version = "1", features = ["bundled"] }
+time = "0.3"
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# trading
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = "0.26"
+k256 = { version = "0.13", features = ["ecdsa"] }
+sha3 = "0.10"
+hex = "0.4"
+rmp-serde = "1"
+sha2 = "0.10"
+md-5 = "0.10"
+
+# api
+axum = { version = "0.8", features = ["ws"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "request-id", "trace"] }
+
+# app
+clap = { version = "4", features = ["derive", "env"] }
+prometheus = "0.13"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+
+[profile.release]
+lto = "thin"
