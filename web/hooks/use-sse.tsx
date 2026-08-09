@@ -36,6 +36,31 @@ const EVENT_KEYS: Record<string, string[]> = {
     "/api/v1/orders",
     "/api/v1/risk/status",
   ],
+  // The Rust backend emits snake_case event names (the Phase-6 contract
+  // cleanup). Map them to the same revalidation endpoints.
+  order_submitted: ["/api/v1/orders"],
+  order_acknowledged: ["/api/v1/orders"],
+  order_filled: ["/api/v1/orders", "/api/v1/positions", "/api/v1/account"],
+  order_partial_fill: ["/api/v1/orders", "/api/v1/positions", "/api/v1/account"],
+  order_cancelled: ["/api/v1/orders"],
+  order_rejected: ["/api/v1/orders"],
+  position_changed: ["/api/v1/positions", "/api/v1/account"],
+  balance_changed: ["/api/v1/account"],
+  account_state_update: ["/api/v1/account", "/api/v1/risk/status"],
+  kill_switch_triggered: ["/api/v1/system/status", "/api/v1/risk/status"],
+  signal_generated: ["/api/v1/strategies"],
+  risk_check_passed: ["/api/v1/risk/status"],
+  risk_check_failed: ["/api/v1/risk/status"],
+  action_credits_low: ["/api/v1/risk/status"],
+  reconciliation_complete: [
+    "/api/v1/system/status",
+    "/api/v1/account",
+    "/api/v1/positions",
+    "/api/v1/orders",
+    "/api/v1/risk/status",
+  ],
+  ws_connected: [],
+  ws_disconnected: [],
 }
 
 const RESYNC_KEYS = [

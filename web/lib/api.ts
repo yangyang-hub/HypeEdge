@@ -26,8 +26,10 @@ async function readResponse<T>(res: Response): Promise<T> {
       problem?.retryable ?? false,
     )
   }
+  // The backend always returns the `{ ok: true, data }` envelope on success.
+  // RFC-9457 `application/problem+json` is the sole error shape, so the legacy
+  // `{ ok: false, error }` branch is no longer needed.
   const json = (await res.json()) as ApiResponse<T>
-  if (!json.ok) throw new ApiError(json.error ?? "Unknown API error", 400, "LEGACY_API_ERROR", false)
   return json.data
 }
 
