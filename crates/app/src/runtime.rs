@@ -199,54 +199,65 @@ pub async fn build_runtime(
         });
     }
 
-    // Ingestor + reconciler require Postgres (durable projector).
-    let (_pg, config_versions, sse_outbox, sse_pool, durable_order_store) = match &settings.postgres
-    {
-        _ if settings.postgres.url.trim().is_empty() => (None, None, None, None, None),
-        _ => {
-            let storage = hypeedge_storage::Postgres::connect(
+    // Ingestor + reconciler require Postgres (durable projector). A Postgres
+    // failure degrades to a no-DB wiring (trading still possible without the
+    // durable ledger, matching the Python-era fallback) rather than killing the
+    // whole runtime build.
+    let (_pg, config_versions, sse_outbox, sse_pool, durable_order_store) =
+        if settings.postgres.url.trim().is_empty() {
+            (None, None, None, None, None)
+        } else {
+            match hypeedge_storage::Postgres::connect(
                 &settings.postgres.url,
                 settings.postgres.pool_size,
             )
             .await
-            .map_err(|e| format!("postgres connect: {e}"))?;
-            let pool = storage.pool.clone();
-            let projector = Arc::new(PostgresExchangeFactProjector::new(pool.clone(), &account));
-            let info: Arc<dyn InfoClient> = rest.clone();
-            let mut ingestor = ExchangeEventIngestor::new(
-                &account,
-                projector.clone(),
-                info,
-                Some(account_tracker.clone()),
-                settings.market_making.account_poll_interval_seconds,
-            );
-            if let Err(e) = ingestor.recover_history().await {
-                tracing::warn!(error = %e, "ingestor_history_recovery_failed");
+            {
+                Ok(storage) => {
+                    let pool = storage.pool.clone();
+                    let projector =
+                        Arc::new(PostgresExchangeFactProjector::new(pool.clone(), &account));
+                    let info: Arc<dyn InfoClient> = rest.clone();
+                    let mut ingestor = ExchangeEventIngestor::new(
+                        &account,
+                        projector.clone(),
+                        info,
+                        Some(account_tracker.clone()),
+                        settings.market_making.account_poll_interval_seconds,
+                    );
+                    if let Err(e) = ingestor.recover_history().await {
+                        tracing::warn!(error = %e, "ingestor_history_recovery_failed");
+                    }
+                    tokio::spawn(async move {
+                        ingestor.run_until_closed().await;
+                    });
+                    let cfg_versions = Arc::new(hypeedge_storage::PostgresConfigVersionStore::new(
+                        pool.clone(),
+                    ))
+                        as Arc<dyn hypeedge_storage::ConfigVersionStore>;
+                    let outbox = Arc::new(hypeedge_storage::outbox::PostgresOutboxStore::new(
+                        settings.postgres.command_lease_seconds as i64,
+                    ));
+                    let order_store = Arc::new(PooledDurableOrderStore::new(
+                        pool.clone(),
+                        None,
+                        30.0,
+                        settings.postgres.risk_reservation_ttl_seconds as i64,
+                    )) as Arc<dyn DurableOrderStore>;
+                    (
+                        Some(storage),
+                        Some(cfg_versions),
+                        Some(outbox),
+                        Some(pool),
+                        Some(order_store),
+                    )
+                }
+                Err(e) => {
+                    tracing::error!(error = %e, "postgres_connect_failed_degrading_no_db");
+                    (None, None, None, None, None)
+                }
             }
-            tokio::spawn(async move {
-                ingestor.run_until_closed().await;
-            });
-            let cfg_versions = Arc::new(hypeedge_storage::PostgresConfigVersionStore::new(
-                pool.clone(),
-            )) as Arc<dyn hypeedge_storage::ConfigVersionStore>;
-            let outbox = Arc::new(hypeedge_storage::outbox::PostgresOutboxStore::new(
-                settings.postgres.command_lease_seconds as i64,
-            ));
-            let order_store = Arc::new(PooledDurableOrderStore::new(
-                pool.clone(),
-                None,
-                30.0,
-                settings.postgres.risk_reservation_ttl_seconds as i64,
-            )) as Arc<dyn DurableOrderStore>;
-            (
-                Some(storage),
-                Some(cfg_versions),
-                Some(outbox),
-                Some(pool),
-                Some(order_store),
-            )
-        }
-    };
+        };
 
     // ---------- Risk (6e) ----------
     let risk_limits = RiskLimits {
