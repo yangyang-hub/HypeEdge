@@ -433,6 +433,70 @@ impl ClearinghouseRestClient for RestClient {
     }
 }
 
+/// The account ingestor's authenticated-info boundary (6d wiring): historical
+/// orders, fills-by-time, funding history, and single-order status, all built on
+/// the shared `RestClient::post_info` engine.
+#[async_trait]
+impl crate::account::InfoClient for RestClient {
+    async fn historical_orders(&self, account: &str) -> Result<Vec<Value>, String> {
+        let resp = self
+            .post_info("historicalOrders", Some(&json!({ "user": account })), 1)
+            .await
+            .map_err(|e| e.to_string())?;
+        resp.as_array().cloned().ok_or_else(|| "historicalOrders: expected array".into())
+    }
+
+    async fn user_fills_by_time(
+        &self,
+        account: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Value>, String> {
+        let resp = self
+            .post_info(
+                "userFillsByTime",
+                Some(&json!({ "user": account, "startTime": start_ms, "endTime": end_ms })),
+                1,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        resp.as_array().cloned().ok_or_else(|| "userFillsByTime: expected array".into())
+    }
+
+    async fn user_funding_history(
+        &self,
+        account: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Value>, String> {
+        let resp = self
+            .post_info(
+                "userFunding",
+                Some(&json!({ "user": account, "startTime": start_ms, "endTime": end_ms })),
+                1,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        resp.as_array().cloned().ok_or_else(|| "userFunding: expected array".into())
+    }
+
+    async fn query_order_by_oid(&self, account: &str, exchange_oid: i64) -> Result<Option<Value>, String> {
+        let resp = self
+            .post_info(
+                "orderStatus",
+                Some(&json!({ "user": account, "oid": exchange_oid })),
+                1,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        if resp.is_null() {
+            Ok(None)
+        } else {
+            Ok(Some(resp))
+        }
+    }
+}
+
 #[async_trait]
 impl InstrumentMetaSource for RestClient {
     async fn get_meta(&self) -> Result<Value, HypeEdgeError> {

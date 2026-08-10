@@ -58,6 +58,10 @@ pub struct AppState {
     /// Durable config-version repository (Postgres-backed). `None` when the
     /// app runs without a database → config-version routes return 503.
     pub config_versions: Option<Arc<dyn hypeedge_storage::ConfigVersionStore>>,
+    /// The wired execution engine (6e). `None` in control-plane-only mode.
+    pub execution: Option<Arc<hypeedge_trading::execution::ExecutionEngine>>,
+    /// The wired live market-data provider (6c). `None` in control-plane-only mode.
+    pub market_data: Option<Arc<hypeedge_trading::market_data::LiveMarketDataProvider>>,
     pub request_limiter: SlidingWindowLimiter,
     pub mutation_limiter: SlidingWindowLimiter,
     pub auth_failure_limiter: SlidingWindowLimiter,
@@ -120,6 +124,8 @@ impl AppState {
             account_tracker,
             canary_gate: Arc::new(hypeedge_trading::risk::CanaryGateEvaluator::new()),
             config_versions: None,
+            execution: None,
+            market_data: None,
             request_limiter: SlidingWindowLimiter::new(),
             mutation_limiter: SlidingWindowLimiter::new(),
             auth_failure_limiter: SlidingWindowLimiter::new(),
@@ -132,6 +138,37 @@ impl AppState {
 
     pub fn is_mainnet(&self) -> bool {
         self.settings.is_mainnet()
+    }
+
+    /// Build `AppState` from a wired runtime (6d/6e/6f): execution engine,
+    /// market-data provider, account tracker, durable config versions, and the
+    /// durable SSE outbox. The app crate calls this with the pieces it built.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_wiring(
+        mut state: Self,
+        execution: Option<Arc<hypeedge_trading::execution::ExecutionEngine>>,
+        market_data: Option<Arc<hypeedge_trading::market_data::LiveMarketDataProvider>>,
+        config_versions: Option<Arc<dyn hypeedge_storage::ConfigVersionStore>>,
+        trading_enabled: Arc<tokio::sync::RwLock<bool>>,
+        safety_mode: Arc<tokio::sync::RwLock<String>>,
+        sse_outbox: Option<Arc<hypeedge_storage::outbox::PostgresOutboxStore>>,
+        sse_pool: Option<sqlx::PgPool>,
+    ) -> Self {
+        state.execution = execution;
+        state.market_data = market_data;
+        state.config_versions = config_versions;
+        state.trading_enabled = trading_enabled;
+        state.safety_mode = safety_mode;
+        if let (Some(outbox), Some(pool)) = (&sse_outbox, &sse_pool) {
+            state.sse_broker = Arc::new(crate::sse_broker::SseBroker::new(
+                state.event_bus.clone(),
+                Some(outbox.clone()),
+                Some(pool.clone()),
+                1000,
+                256,
+            ));
+        }
+        state
     }
 }
 

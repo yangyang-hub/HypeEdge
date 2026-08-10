@@ -10,40 +10,77 @@ use hypeedge_infra::event_bus::EventBus;
 use hypeedge_trading::market_data::BookManager;
 use hypeedge_trading::risk::KillSwitch;
 
+pub mod runtime;
+
 /// The running application components.
 pub struct HypeEdgeApp {
     pub settings: Arc<AppSettings>,
     pub event_bus: Arc<EventBus>,
     pub kill_switch: Arc<KillSwitch>,
     pub books: Arc<tokio::sync::Mutex<BookManager>>,
+    /// The wired trading runtime (execution, account, market data, strategies).
+    pub runtime: runtime::RuntimeWiring,
 }
 
 impl HypeEdgeApp {
-    pub fn new(settings: AppSettings) -> Self {
+    /// Build the full trading runtime (6d/6e/6f) asynchronously. When the V2
+    /// chain is disabled or the runtime build fails, falls back to the
+    /// control-plane-only wiring.
+    pub async fn build(settings: AppSettings) -> Self {
         let settings = Arc::new(settings);
         let event_bus = Arc::new(EventBus::new(10_000));
-        let kill_switch = Arc::new(KillSwitch::new(
-            event_bus.clone(),
-            settings.risk.kill_switch_enabled,
-        ));
-        let books = Arc::new(tokio::sync::Mutex::new(BookManager::new(
-            settings.market_data.l2_book_depth as usize,
-        )));
+        let runtime = match runtime::build_runtime(&settings, event_bus.clone()).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::error!(error = %e, "runtime_build_failed_falling_back_to_control_plane");
+                runtime::build_control_plane(&settings, event_bus.clone())
+            }
+        };
+        let kill_switch = runtime.kill_switch.clone();
+        let books = runtime.books.clone();
         Self {
             settings,
             event_bus,
             kill_switch,
             books,
+            runtime,
+        }
+    }
+
+    /// Synchronous constructor: always the control-plane wiring (used by tests
+    /// and the pre-connect path). Use [`HypeEdgeApp::build`] for the full runtime.
+    pub fn new(settings: AppSettings) -> Self {
+        let settings = Arc::new(settings);
+        let event_bus = Arc::new(EventBus::new(10_000));
+        let runtime = runtime::build_control_plane(&settings, event_bus.clone());
+        let kill_switch = runtime.kill_switch.clone();
+        let books = runtime.books.clone();
+        Self {
+            settings,
+            event_bus,
+            kill_switch,
+            books,
+            runtime,
         }
     }
 
     /// Build the API state and axum router.
     pub fn router(&self) -> axum::Router {
-        let api_state = AppState::new(
+        let base_state = AppState::new(
             self.settings.clone(),
             self.kill_switch.clone(),
             self.event_bus.clone(),
             self.books.clone(),
+        );
+        let api_state = AppState::from_wiring(
+            base_state,
+            self.runtime.execution.clone(),
+            self.runtime.market_data.clone(),
+            self.runtime.config_versions.clone(),
+            self.runtime.trading_enabled.clone(),
+            self.runtime.safety_mode.clone(),
+            self.runtime.sse_outbox.clone(),
+            self.runtime.sse_pool.clone(),
         );
         hypeedge_api::build_router(api_state)
     }

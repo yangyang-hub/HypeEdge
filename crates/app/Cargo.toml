@@ -21,6 +21,8 @@ hypeedge_trading = { path = "../trading" }
 hypeedge_api = { path = "../api" }
 clickhouse = { workspace = true }
 chrono = { workspace = true }
+hex = { workspace = true }
+sqlx = { workspace = true }
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -438,6 +438,38 @@ impl AccountView for AccountTracker {
     }
 }
 
+/// The trend-follow strategy facade (6f wiring).
+impl crate::strategy::trend_follow::StrategyAccountView for AccountTracker {
+    fn get_position(&self, symbol: &str) -> Option<Position> {
+        AccountTracker::get_position(self, symbol)
+    }
+    fn current_equity(&self) -> f64 {
+        AccountTracker::current_equity(self)
+            .inner()
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(0.0)
+    }
+}
+
+/// The funding-arb account facade (6f wiring): maps the tracker's spot balance
+/// to the runtime's `SpotBalanceView` and exposes the account's available
+/// balance.
+impl crate::funding_arb::runtime::FundingArbAccountView for AccountTracker {
+    fn get_position(&self, symbol: &str) -> Option<Position> {
+        AccountTracker::get_position(self, symbol)
+    }
+    fn get_spot_balance(&self, token: &str) -> Option<crate::funding_arb::runtime::SpotBalanceView> {
+        AccountTracker::get_spot_balance(self, token).map(|b| crate::funding_arb::runtime::SpotBalanceView {
+            total: b.total.inner(),
+            hold: b.hold.inner(),
+        })
+    }
+    fn get_account_available_balance(&self) -> Option<Decimal> {
+        AccountTracker::get_account_state(self).map(|s| s.available_balance.inner())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

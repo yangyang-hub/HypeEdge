@@ -90,7 +90,7 @@ async fn main() {
             }
         }
         None => {
-            let app = HypeEdgeApp::new(settings);
+            let app = HypeEdgeApp::build(settings).await;
             if let Err(e) = app.serve().await {
                 tracing::error!(error = %e, "api server exited");
                 std::process::exit(1);

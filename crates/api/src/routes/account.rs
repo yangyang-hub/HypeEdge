@@ -11,8 +11,10 @@ use axum::response::Response;
 
 use crate::auth::{authorize, ApiRole};
 use crate::middleware::RoleGuard;
-use crate::errors::ok;
+use crate::errors::{ApiProblem, ok};
 use crate::state::AppState;
+use axum::response::IntoResponse;
+use hypeedge_domain::traits::ExecutionClient;
 
 /// `GET /api/v1/account`.
 pub async fn account(State(state): State<AppState>) -> Response {
@@ -95,46 +97,224 @@ pub async fn positions(State(state): State<AppState>) -> Response {
 
 /// `POST /api/v1/positions/{symbol}/close` — 202 Accepted.
 pub async fn close_position(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(guard): Extension<RoleGuard>,
-    axum::extract::Path(_symbol): axum::extract::Path<String>,
+    axum::extract::Path(symbol): axum::extract::Path<String>,
 ) -> Response {
     // A23: trading mutations require Operator.
     if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
         return *resp;
     }
-    ok(serde_json::json!({ "accepted": true }))
+    // 6e: close the position via the execution engine (reduce-only market order
+    // sized to the current position).
+    let Some(execution) = &state.execution else {
+        return ApiProblem::new(
+            503,
+            "EXECUTION_UNAVAILABLE",
+            "Execution engine is not wired",
+        )
+        .into_response();
+    };
+    let position = state.account_tracker.get_position(&symbol);
+    let Some(position) = position else {
+        return ApiProblem::new(404, "POSITION_NOT_FOUND", "Position was not found")
+            .into_response();
+    };
+    let intent = hypeedge_domain::models::OrderIntent {
+        symbol: position.symbol.clone(),
+        side: if position.is_long() {
+            hypeedge_domain::enums::Side::Sell
+        } else {
+            hypeedge_domain::enums::Side::Buy
+        },
+        size: hypeedge_domain::decimal::Size::new(position.size.inner().abs()),
+        price: None,
+        order_type: hypeedge_domain::enums::OrderType::Market,
+        time_in_force: hypeedge_domain::enums::TimeInForce::Ioc,
+        strategy_id: None,
+        sub_account: None,
+        reduce_only: true,
+        cloid: None,
+        client_id: None,
+        is_spot: false,
+        risk_reducing: false,
+        max_slippage_bps: 50,
+    };
+    match execution.submit_order(intent, None).await {
+        Ok(order) => ok(serde_json::json!({
+            "accepted": true,
+            "cloid": order.cloid,
+            "status": order.status.as_str(),
+        })),
+        Err(e) => ApiProblem::new(
+            502,
+            "ORDER_SUBMIT_FAILED",
+            format!("close failed: {e}"),
+        )
+        .into_response(),
+    }
 }
 
 /// `GET /api/v1/orders?status=active`.
-pub async fn orders(State(_state): State<AppState>) -> Response {
-    ok(serde_json::json!([]))
+pub async fn orders(State(state): State<AppState>) -> Response {
+    let Some(execution) = &state.execution else {
+        return ok(serde_json::json!([]));
+    };
+    match execution.get_open_orders(None).await {
+        Ok(orders) => ok(serde_json::json!(orders
+            .into_iter()
+            .map(order_payload)
+            .collect::<Vec<_>>())),
+        Err(e) => ApiProblem::new(
+            502,
+            "ORDER_QUERY_FAILED",
+            format!("orders failed: {e}"),
+        )
+        .into_response(),
+    }
 }
 
-/// `POST /api/v1/orders` — submit an order (requires the execution engine).
+/// `POST /api/v1/orders` — submit an order through the execution engine.
 pub async fn submit_order(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(guard): Extension<RoleGuard>,
-    _body: axum::Json<serde_json::Value>,
+    body: axum::Json<serde_json::Value>,
 ) -> Response {
     // A23: trading mutations require Operator.
     if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
         return *resp;
     }
-    ok(serde_json::json!({ "cloid": "", "status": "rejected" }))
+    let Some(execution) = &state.execution else {
+        return ApiProblem::new(
+            503,
+            "EXECUTION_UNAVAILABLE",
+            "Execution engine is not wired",
+        )
+        .into_response();
+    };
+    let intent = match intent_from_json(&body) {
+        Ok(i) => i,
+        Err(msg) => {
+            return ApiProblem::new(422, "REQUEST_VALIDATION_FAILED", msg).into_response();
+        }
+    };
+    match execution.submit_order(intent, None).await {
+        Ok(order) => ok(serde_json::json!({
+            "cloid": order.cloid,
+            "status": order.status.as_str(),
+            "symbol": order.symbol,
+        })),
+        Err(e) => ApiProblem::new(
+            502,
+            "ORDER_SUBMIT_FAILED",
+            format!("submit failed: {e}"),
+        )
+        .into_response(),
+    }
 }
 
 /// `POST /api/v1/orders/{cloid}/cancel` — 202 Accepted.
 pub async fn cancel_order(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(guard): Extension<RoleGuard>,
-    axum::extract::Path(_cloid): axum::extract::Path<String>,
+    axum::extract::Path(cloid): axum::extract::Path<String>,
 ) -> Response {
     // A23: trading mutations require Operator.
     if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
         return *resp;
     }
-    ok(serde_json::json!({ "accepted": true }))
+    let Some(execution) = &state.execution else {
+        return ApiProblem::new(
+            503,
+            "EXECUTION_UNAVAILABLE",
+            "Execution engine is not wired",
+        )
+        .into_response();
+    };
+    match execution.cancel_order(&cloid).await {
+        Ok(accepted) => ok(serde_json::json!({ "accepted": accepted, "cloid": cloid })),
+        Err(e) => ApiProblem::new(
+            502,
+            "ORDER_CANCEL_FAILED",
+            format!("cancel failed: {e}"),
+        )
+        .into_response(),
+    }
+}
+
+/// Build an `OrderIntent` from the JSON body contract:
+/// `{ symbol, side, size, price?, order_type, time_in_force? }`.
+fn intent_from_json(body: &serde_json::Value) -> Result<hypeedge_domain::models::OrderIntent, String> {
+    use hypeedge_domain::decimal::{Price, Size};
+    use hypeedge_domain::enums::{OrderType, Side, TimeInForce};
+    let symbol = body
+        .get("symbol")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    if symbol.is_empty() {
+        return Err(String::from("symbol is required"));
+    }
+    let side = match body.get("side").and_then(|v| v.as_str()) {
+        Some("buy") => Side::Buy,
+        Some("sell") => Side::Sell,
+        _ => return Err(String::from("side must be buy or sell")),
+    };
+    let size = body
+        .get("size")
+        .and_then(|v| v.as_str())
+        .and_then(|s| hypeedge_domain::decimal::Decimal::from_str_lenient(s).ok())
+        .map(Size::new)
+        .ok_or_else(|| String::from("size must be a decimal string"))?;
+    let price = body
+        .get("price")
+        .and_then(|v| v.as_str())
+        .and_then(|s| hypeedge_domain::decimal::Decimal::from_str_lenient(s).ok())
+        .map(Price::new);
+    let order_type = match body.get("order_type").and_then(|v| v.as_str()) {
+        Some("market") => OrderType::Market,
+        Some("limit") => OrderType::Limit,
+        _ => return Err(String::from("order_type must be market or limit")),
+    };
+    let time_in_force = match body.get("time_in_force").and_then(|v| v.as_str()) {
+        Some("ioc") => TimeInForce::Ioc,
+        Some("alo") => TimeInForce::Alo,
+        _ => TimeInForce::Gtc,
+    };
+    Ok(hypeedge_domain::models::OrderIntent {
+        symbol,
+        side,
+        size,
+        price,
+        order_type,
+        time_in_force,
+        strategy_id: None,
+        sub_account: None,
+        reduce_only: false,
+        cloid: None,
+        client_id: None,
+        is_spot: false,
+        risk_reducing: false,
+        max_slippage_bps: 50,
+    })
+}
+
+/// Serialize an order for the frontend contract.
+fn order_payload(order: hypeedge_domain::models::Order) -> serde_json::Value {
+    serde_json::json!({
+        "cloid": order.cloid,
+        "symbol": order.symbol,
+        "side": order.side.as_str(),
+        "size": order.size.to_string(),
+        "price": order.price.map(|p| p.to_string()),
+        "order_type": order.order_type.as_str(),
+        "status": order.status.as_str(),
+        "filled_size": order.filled_size.to_string(),
+        "avg_fill_price": order.avg_fill_price.map(|p| p.to_string()),
+        "strategy_id": order.strategy_id,
+        "error_message": order.error_message,
+        "created_at": order.created_at.to_rfc3339(),
+    })
 }
 
 #[cfg(test)]

@@ -10,9 +10,9 @@ pub mod kill_switch;
 pub mod safety;
 
 pub use action_budget::{
-    ActionBudgetController, ActionBudgetRecoveryState, ActionBudgetView, BudgetAction,
-    BudgetAllocation, BudgetPermission, BudgetWindowStats, CancelHeadroomSnapshot, FillCredit,
-    NetworkAttemptDebit, PermissionRequest, RemoteActionSnapshot,
+    ActionBudgetController, ActionBudgetRecoveryState, ActionBudgetSettings, ActionBudgetView,
+    BudgetAction, BudgetAllocation, BudgetPermission, BudgetWindowStats, CancelHeadroomSnapshot,
+    FillCredit, NetworkAttemptDebit, PermissionRequest, RemoteActionSnapshot,
 };
 pub use canary::{
     CanaryDirective, CanaryGateEvaluator, CanaryObservation, CanaryRiskEnvelope, ExpansionEvidence,
