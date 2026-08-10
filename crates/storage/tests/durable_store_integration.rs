@@ -10,6 +10,8 @@ use chrono::Utc;
 use hypeedge_domain::decimal::Decimal;
 use hypeedge_domain::enums::{OrderStatus, OrderType, Side, TimeInForce};
 use hypeedge_domain::models::{Order, RiskCheckResult};
+use hypeedge_domain::traits::DurableOrderStore;
+use hypeedge_storage::adapters::PooledDurableOrderStore;
 use hypeedge_storage::durable_order_store::PostgresDurableOrderStore;
 use hypeedge_storage::outbox::PostgresOutboxStore;
 use sqlx::PgPool;
@@ -549,4 +551,28 @@ async fn immediate_fill_persists_fill_fields() {
     assert_eq!(filled_size, "0.100000000000000000", "filled_size must be persisted (A11)");
     assert_eq!(avg_fill_price.as_deref(), Some("99.000000000000000000"));
     assert!(filled_at.is_some(), "filled_at must be persisted (A11)");
+}
+
+#[tokio::test]
+async fn pooled_adapter_implements_durable_order_store_trait() {
+    // 6a: the pool-holding adapter must implement the domain trait so the app
+    // can construct `Arc<dyn DurableOrderStore>` for the engine.
+    let _guard = SERIAL.lock().await;
+    let Some(pool) = try_pool().await else { return };
+    let _test_lock = acquire_test_lock(&pool).await;
+    clean_tables(&pool).await;
+    seed_account_and_position(&pool).await;
+
+    let store: std::sync::Arc<dyn DurableOrderStore> =
+        std::sync::Arc::new(PooledDurableOrderStore::new(pool, None, 30.0, 3600));
+    let cloid = valid_cloid(103);
+    let mut order = make_order(&cloid, Side::Buy, "0.1", Some("100"));
+    order.status = OrderStatus::Submitted;
+    let result = store
+        .persist_placement(&order, &passing_risk(), Uuid::new_v4(), true, None)
+        .await
+        .unwrap();
+    assert!(result.passed, "placement via trait adapter: {result:?}");
+    let loaded = store.get_order(&cloid).await.unwrap().expect("order persisted");
+    assert_eq!(loaded.cloid, cloid);
 }

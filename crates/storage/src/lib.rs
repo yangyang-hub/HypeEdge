@@ -9,6 +9,7 @@
 //!
 //! The ClickHouse writer and spool are added in a later Phase-1 increment.
 
+pub mod adapters;
 pub mod checkpoint;
 pub mod clickhouse_writer;
 pub mod command_queue;

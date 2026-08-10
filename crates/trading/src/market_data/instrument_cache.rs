@@ -37,6 +37,9 @@ pub struct InstrumentInfo {
     pub quote_token: Option<String>,
     pub only_isolated: bool,
     pub margin_mode: Option<String>,
+    /// The numeric asset index from the HL meta universe, used by the execution
+    /// engine's order wire (`a` field). `None` for spot pairs.
+    pub asset_index: Option<i64>,
 }
 
 impl InstrumentInfo {
@@ -65,6 +68,7 @@ impl InstrumentInfo {
             quote_token: None,
             only_isolated,
             margin_mode,
+            asset_index: None,
         }
     }
 
@@ -93,6 +97,7 @@ impl InstrumentInfo {
             quote_token: Some(quote_token),
             only_isolated: false,
             margin_mode: None,
+            asset_index: None,
         }
     }
 
@@ -170,10 +175,15 @@ pub fn parse_meta(
             .get("marginMode")
             .and_then(|v| v.as_str())
             .map(str::to_string);
-        instruments.insert(
+        let mut info = InstrumentInfo::new_perp(
             name.to_string(),
-            InstrumentInfo::new_perp(name.to_string(), sz_decimals, max_leverage, only_isolated, margin_mode),
+            sz_decimals,
+            max_leverage,
+            only_isolated,
+            margin_mode,
         );
+        info.asset_index = asset.get("index").and_then(|v| v.as_i64());
+        instruments.insert(name.to_string(), info);
     }
 
     let token_by_index: HashMap<i64, &serde_json::Value> = tokens
@@ -351,6 +361,12 @@ impl crate::execution::normalizer::InstrumentSpecProvider for InstrumentMetaCach
     }
 }
 
+impl crate::execution::exchange::AssetIndexProvider for InstrumentMetaCache {
+    fn asset_index(&self, symbol: &str) -> Option<i64> {
+        self.get(symbol).and_then(|info| info.asset_index)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,8 +374,8 @@ mod tests {
     fn perp_meta() -> serde_json::Value {
         serde_json::json!({
             "universe": [
-                { "name": "BTC", "szDecimals": 5, "maxLeverage": 50, "marginMode": "cross" },
-                { "name": "ETH", "szDecimals": 4, "maxLeverage": 25 }
+                { "name": "BTC", "index": 1, "szDecimals": 5, "maxLeverage": 50, "marginMode": "cross" },
+                { "name": "ETH", "index": 2, "szDecimals": 4, "maxLeverage": 25 }
             ]
         })
     }
@@ -397,6 +413,24 @@ mod tests {
 
         // Display-name alias resolves to the exchange coin.
         assert_eq!(aliases.get("PURR/USDC").map(String::as_str), Some("@1"));
+    }
+
+    #[test]
+    fn asset_index_provider_reads_meta_index() {
+        // 6b: the cache must expose the perp asset index the execution engine
+        // needs for the order wire.
+        let (instruments, _) = parse_meta(&perp_meta(), &spot_meta()).unwrap();
+        let cache = InstrumentMetaCache {
+            source: Arc::new(UnreachableSource),
+            refresh_interval: std::time::Duration::from_secs(1),
+            instruments: std::sync::RwLock::new(instruments),
+            spot_aliases: std::sync::RwLock::new(Default::default()),
+            loaded: std::sync::atomic::AtomicBool::new(true),
+        };
+        use crate::execution::exchange::AssetIndexProvider;
+        assert_eq!(cache.asset_index("BTC"), Some(1));
+        assert_eq!(cache.asset_index("ETH"), Some(2));
+        assert_eq!(cache.asset_index("UNKNOWN"), None);
     }
 
     #[test]
