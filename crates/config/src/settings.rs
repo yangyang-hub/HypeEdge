@@ -6,6 +6,7 @@
 //! lives in [`Settings::validate`].
 
 use std::collections::HashMap;
+use std::fmt;
 
 use hypeedge_domain::Decimal;
 use serde::Deserialize;
@@ -50,13 +51,36 @@ impl Default for ConfigDecimal {
 }
 
 /// Hyperliquid exchange connection settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct ExchangeSettings {
     pub api_url: String,
     pub ws_url: String,
     pub account_address: String,
     pub agent_private_key: String,
+}
+
+/// `Debug` redacts the agent private key so structured logging of settings
+/// never leaks the signing key into the log stream.
+impl fmt::Debug for ExchangeSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ExchangeSettings")
+            .field("api_url", &self.api_url)
+            .field("ws_url", &self.ws_url)
+            .field("account_address", &self.account_address)
+            .field(
+                "agent_private_key",
+                &if self.agent_private_key.is_empty() {
+                    "<unset>".to_string()
+                } else {
+                    format!(
+                        "<redacted:{}>",
+                        self.agent_private_key.chars().take(4).collect::<String>()
+                    )
+                },
+            )
+            .finish()
+    }
 }
 
 impl Default for ExchangeSettings {
@@ -783,5 +807,27 @@ pub enum ConfigError {
 impl ConfigError {
     fn validation(msg: impl Into<String>) -> Self {
         ConfigError::Validation(msg.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exchange_debug_redacts_agent_private_key() {
+        let s = ExchangeSettings {
+            agent_private_key: "0xdeadbeefcafe1234".into(),
+            ..ExchangeSettings::default()
+        };
+        let dbg = format!("{s:?}");
+        assert!(
+            !dbg.contains("0xdeadbeefcafe1234"),
+            "Debug must not leak the agent private key: {dbg}"
+        );
+        assert!(
+            dbg.contains("<redacted:0xde>"),
+            "redaction marker missing: {dbg}"
+        );
     }
 }

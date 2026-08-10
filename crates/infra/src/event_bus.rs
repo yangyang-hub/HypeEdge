@@ -25,6 +25,11 @@ pub struct BoundedMailbox<T> {
     space_available: Notify,
     /// Wakes a blocked `recv` when `put` adds an item.
     item_ready: Notify,
+    /// Classifies an item as lossy (evictable on overflow). Only lossy-typed
+    /// items may be dropped oldest-first when the queue is full; reliable items
+    /// are never evicted (B8: a wildcard mailbox must not lose Order*/Risk
+    /// events to market-data overflow).
+    is_lossy: Box<dyn Fn(&T) -> bool + Send + Sync>,
 }
 
 struct MailboxState<T> {
@@ -36,6 +41,13 @@ struct MailboxState<T> {
 
 impl<T> BoundedMailbox<T> {
     pub fn new(capacity: usize) -> Self {
+        Self::with_classifier(capacity, |_| false)
+    }
+
+    pub fn with_classifier(
+        capacity: usize,
+        is_lossy: impl Fn(&T) -> bool + Send + Sync + 'static,
+    ) -> Self {
         Self {
             state: Mutex::new(MailboxState {
                 items: VecDeque::with_capacity(capacity),
@@ -45,6 +57,7 @@ impl<T> BoundedMailbox<T> {
             }),
             space_available: Notify::new(),
             item_ready: Notify::new(),
+            is_lossy: Box::new(is_lossy),
         }
     }
 
@@ -68,8 +81,10 @@ impl<T> BoundedMailbox<T> {
         }
     }
 
-    /// Lossy put: drop the oldest item if full, then push. Returns how many
-    /// items were dropped (0 or 1). Returns `None` if closed.
+    /// Lossy put: drop the oldest lossy item if full, then push. Reliable
+    /// items are never evicted; if the queue is full of reliable items the
+    /// incoming lossy item is dropped instead. Returns how many items were
+    /// dropped (0 or 1). Returns `None` if closed.
     pub fn put_lossy(&self, item: T) -> Option<u64> {
         let mut st = self.state.lock().unwrap();
         if st.closed {
@@ -77,9 +92,19 @@ impl<T> BoundedMailbox<T> {
         }
         let mut dropped = 0;
         if st.items.len() >= st.capacity {
-            st.items.pop_front();
-            dropped = 1;
-            st.dropped += dropped;
+            match st.items.iter().position(|it| (self.is_lossy)(it)) {
+                Some(idx) => {
+                    st.items.remove(idx);
+                    dropped = 1;
+                    st.dropped += 1;
+                }
+                None => {
+                    // Queue is full of reliable items; drop the incoming lossy
+                    // item rather than evicting a reliable event.
+                    st.dropped += 1;
+                    return Some(1);
+                }
+            }
         }
         st.items.push_back(item);
         drop(st);
@@ -118,6 +143,11 @@ impl<T> BoundedMailbox<T> {
 
     pub fn len(&self) -> usize {
         self.state.lock().unwrap().items.len()
+    }
+
+    /// The queue capacity (used by the sync publish path's backpressure check).
+    pub fn capacity(&self) -> usize {
+        self.state.lock().unwrap().capacity
     }
 
     pub fn is_empty(&self) -> bool {
@@ -197,7 +227,7 @@ impl EventBus {
     /// Subscribe to one event type with a custom mailbox capacity (e.g. the
     /// strategy runner's latest-value `maxsize=1` lossy mailboxes).
     pub fn subscribe_maxsize(&self, event_type: EventType, maxsize: usize) -> Mailbox {
-        let mb = Arc::new(BoundedMailbox::new(maxsize));
+        let mb = Arc::new(BoundedMailbox::with_classifier(maxsize, event_is_lossy));
         self.state
             .lock()
             .unwrap()
@@ -259,33 +289,29 @@ impl EventBus {
     }
 
     /// Synchronous publish for use from sync contexts (e.g. callbacks).
-    /// Reliable queues that are full return `Err`; lossy queues drop.
+    /// Reliable events are pushed atomically (retrying briefly for a concurrent
+    /// consumer to drain) and fail loudly with `Err` rather than being dropped;
+    /// lossy events drop under overflow (only lossy-typed items are evicted).
     pub fn publish_sync(&self, event: Arc<Event>) -> Result<(), EventBusBackpressureError> {
         let lossy = event.payload.is_lossy();
         let targets = self.matching_mailboxes(event.payload.event_type());
         for mb in targets {
             if lossy {
                 mb.put_lossy(event.clone());
-            } else if mb.len() >= self.capacity() {
-                return Err(EventBusBackpressureError {
-                    event_type: event.payload.event_type().as_str().to_string(),
-                });
             } else {
-                // `try_recv` semantics for the sync putter: we checked space
-                // above; a concurrent reliable put could still race. Retry a
-                // bounded number of times to keep ordering close to Python's
-                // `put_nowait`.
-                let mut attempts = 0;
-                while mb.len() >= self.capacity() && attempts < 100 {
+                let mut pushed = false;
+                for _ in 0..100 {
+                    if mb.try_recv_forced(event.clone()) {
+                        pushed = true;
+                        break;
+                    }
                     std::thread::yield_now();
-                    attempts += 1;
                 }
-                if mb.len() >= self.capacity() {
+                if !pushed {
                     return Err(EventBusBackpressureError {
                         event_type: event.payload.event_type().as_str().to_string(),
                     });
                 }
-                let _ = mb.try_recv_forced(event.clone());
             }
         }
         self.publish_count.fetch_add(1, Ordering::Relaxed);
@@ -314,7 +340,7 @@ impl EventBus {
 
     fn new_mailbox(&self) -> Mailbox {
         let cap = self.capacity();
-        Arc::new(BoundedMailbox::new(cap))
+        Arc::new(BoundedMailbox::with_classifier(cap, event_is_lossy))
     }
 
     fn matching_mailboxes(&self, event_type: EventType) -> Vec<Mailbox> {
@@ -353,6 +379,13 @@ impl<T> BoundedMailbox<T> {
 /// Convenience: turn a domain event into a shared, envelope-wrapped event.
 pub fn wrap(event: DomainEvent) -> Arc<Event> {
     Arc::new(Event::new(event))
+}
+
+/// Classifier for `Arc<Event>` mailboxes: market-data / market-making-analytics
+/// events are lossy (evictable on overflow); trading, risk, kill-switch,
+/// reconciliation, and account events are reliable (never evicted).
+fn event_is_lossy(event: &Arc<Event>) -> bool {
+    event.payload.is_lossy()
 }
 
 #[cfg(test)]
@@ -431,12 +464,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sync_publish_reliable_full_fails() {
+    async fn wildcard_overflow_never_drops_reliable() {
+        // B8 regression: a full wildcard mailbox must evict only lossy-typed
+        // items; a reliable Order* event queued first must survive overflow.
+        let bus = EventBus::new(2);
+        let all = bus.subscribe_all();
+        bus.publish(order_event()).await; // reliable
+        bus.publish(book_event()).await; // lossy -> full
+        bus.publish(book_event()).await; // lossy overflow -> evicts lossy only
+        assert_eq!(all.len(), 2);
+        assert_eq!(all.dropped(), 1);
+        let first = all.recv().await.unwrap();
+        assert!(
+            matches!(first.payload, DomainEvent::OrderSubmitted(_)),
+            "reliable order event must not be evicted by lossy overflow"
+        );
+    }
+
+    #[test]
+    fn sync_publish_reliable_full_returns_err_not_drop() {
+        // B9 regression: publish_sync on a full reliable mailbox must surface
+        // backpressure (Err) and must not drop the queued reliable event.
         let bus = EventBus::new(1);
-        let _sub = bus.subscribe(EventType::OrderSubmitted);
+        let sub = bus.subscribe(EventType::OrderSubmitted);
         bus.publish_sync(order_event()).unwrap();
+        assert_eq!(sub.len(), 1);
         let err = bus.publish_sync(order_event()).unwrap_err();
         assert!(err.event_type.contains("Order"));
+        assert_eq!(sub.len(), 1, "reliable event must not be dropped");
     }
 
     #[tokio::test]

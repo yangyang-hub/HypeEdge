@@ -358,8 +358,9 @@ fn parse_f64(v: Option<&serde_json::Value>) -> f64 {
     }
 }
 
-/// Run loop placeholder — the live connect/subscribe/reconnect loop is wired
-/// in the `app` crate; the pure parts above are what this module owns.
+/// Run loop placeholder — the live connect/subscribe/reconnect loop is NOT yet
+/// wired anywhere (the app wiring workstream is pending); the pure parse/publish
+/// parts above are what this module owns.
 pub struct WsFeedConfig {
     pub url: String,
     pub coins: Vec<String>,

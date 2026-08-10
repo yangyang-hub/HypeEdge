@@ -11,9 +11,10 @@ use hypeedge_app::HypeEdgeApp;
     about = "HypeEdge quantitative trading system"
 )]
 struct Cli {
-    /// Configuration environment (dev | testnet | mainnet).
-    #[arg(long, env = "HYPE_ENV", default_value = "dev")]
-    environment: String,
+    /// Configuration environment (dev | testnet | mainnet). When unset, the
+    /// config loader resolves it: process `HYPE_ENV` > `.env` > "dev".
+    #[arg(long, env = "HYPE_ENV")]
+    environment: Option<String>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -51,7 +52,7 @@ async fn main() {
         .with_target(false)
         .init();
 
-    let settings = match hypeedge_config::loader::load_settings(Some(&cli.environment)) {
+    let settings = match hypeedge_config::loader::load_settings(cli.environment.as_deref()) {
         Ok(s) => s,
         Err(e) => {
             tracing::error!(error = %e, "settings load failed");
@@ -60,7 +61,12 @@ async fn main() {
     };
 
     match cli.command {
-        Some(Command::Export { output, coin, start_ms, end_ms }) => {
+        Some(Command::Export {
+            output,
+            coin,
+            start_ms,
+            end_ms,
+        }) => {
             let ch = settings.clickhouse.clone();
             let client = clickhouse::Client::default()
                 .with_url(format!("http://{}:{}", ch.host, ch.port))
@@ -71,14 +77,8 @@ async fn main() {
             let start = start_ms.unwrap_or(now - 30 * 24 * 3600 * 1000);
             let end = end_ms.unwrap_or(now);
             let coins: Vec<&str> = coin.iter().map(|c| c.as_str()).collect();
-            match hypeedge_storage::duckdb_export::export_all(
-                &client,
-                &output,
-                &coins,
-                start,
-                end,
-            )
-            .await
+            match hypeedge_storage::duckdb_export::export_all(&client, &output, &coins, start, end)
+                .await
             {
                 Ok(totals) => {
                     tracing::info!(file = %output, totals = ?totals, "duckdb_export_all_complete");

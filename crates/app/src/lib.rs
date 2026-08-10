@@ -63,10 +63,10 @@ impl HypeEdgeApp {
     }
 }
 
-/// Build settings from the environment (mirrors `hypeedge.__main__`).
+/// Build settings from the environment (mirrors `hypeedge.__main__`). When
+/// `HYPE_ENV` is unset the loader falls back to `.env` / "dev".
 pub fn load_app_settings() -> Result<AppSettings, String> {
-    let env = std::env::var("HYPE_ENV").unwrap_or_else(|_| "dev".into());
-    load_settings(Some(&env)).map_err(|e| e.to_string())
+    load_settings(std::env::var("HYPE_ENV").ok().as_deref()).map_err(|e| e.to_string())
 }
 
 /// Convenience: settings defaults for tests (dev).

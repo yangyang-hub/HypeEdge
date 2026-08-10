@@ -174,9 +174,11 @@ impl ExecutionEngine {
     }
 
     fn publish(&self, payload: DomainEvent, correlation_id: &str) {
-        let _ = self
-            .event_bus
-            .publish_sync(Arc::new(Event::new(payload).with_correlation_id(correlation_id)));
+        if let Err(e) = self.event_bus.publish_sync(Arc::new(
+            Event::new(payload).with_correlation_id(correlation_id),
+        )) {
+            tracing::warn!(event_type = %e.event_type, "event_bus_publish_sync_backpressure");
+        }
     }
 
     async fn store(&self, order: &Order) {
@@ -700,11 +702,17 @@ impl ExecutionEngine {
                         self.persist_transition(order, "cancelled", command_id, Some("succeeded")).await?;
                         self.publish(DomainEvent::OrderCancelled(order.clone()), &cloid);
                     }
-                    Some(OrderStatus::Rejected) | Some(OrderStatus::Expired) => {
+                    Some(OrderStatus::Rejected) => {
                         self.state_machine
                             .transition(order, OrderStatus::Rejected, Some("status_query_rejected"))?;
                         self.persist_transition(order, "rejected", command_id, Some("failed")).await?;
                         self.publish(DomainEvent::OrderRejected(order.clone()), &cloid);
+                    }
+                    Some(OrderStatus::Expired) => {
+                        self.state_machine
+                            .transition(order, OrderStatus::Expired, Some("status_query_expired"))?;
+                        self.persist_transition(order, "expired", command_id, Some("failed")).await?;
+                        self.publish(DomainEvent::OrderExpired(order.clone()), &cloid);
                     }
                     _ => {
                         self.state_machine

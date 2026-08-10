@@ -181,11 +181,24 @@ impl OrderStatus {
             (Pending, Submitted | Rejected | Cancelled)
                 | (
                     Submitted,
-                    Acknowledged | SubmitUnknown | Rejected | Filled | Cancelled | CancelUnknown
+                    Acknowledged
+                        | SubmitUnknown
+                        | Rejected
+                        | Filled
+                        | Cancelled
+                        | CancelUnknown
+                        | PartialFill
+                        | Expired
                 )
                 | (
                     SubmitUnknown,
-                    Acknowledged | PartialFill | Filled | Cancelled | CancelUnknown | Rejected
+                    Acknowledged
+                        | PartialFill
+                        | Filled
+                        | Cancelled
+                        | CancelUnknown
+                        | Rejected
+                        | Expired
                 )
                 | (
                     Acknowledged,
@@ -599,6 +612,17 @@ mod tests {
                 assert!(!s.can_transition(t), "{s:?} -> {t:?} must be illegal");
             }
         }
+    }
+
+    #[test]
+    fn submitted_unknown_can_reach_expired_and_partial_fill() {
+        // B10 regression: `expiresAfter` orders and aggressive IOC partial fills
+        // that surface after submit must be reachable from Submitted/SubmitUnknown.
+        assert!(OrderStatus::Submitted.can_transition(OrderStatus::Expired));
+        assert!(OrderStatus::SubmitUnknown.can_transition(OrderStatus::Expired));
+        assert!(OrderStatus::Submitted.can_transition(OrderStatus::PartialFill));
+        // Sanity: Pending still cannot jump straight to a terminal fill.
+        assert!(!OrderStatus::Pending.can_transition(OrderStatus::Expired));
     }
 
     #[test]

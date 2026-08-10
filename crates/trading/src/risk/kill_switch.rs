@@ -46,13 +46,16 @@ impl KillSwitch {
             *reason_guard = Some(reason.to_string());
             drop(active);
             drop(reason_guard);
-            let _ = self
-                .bus
-                .publish_sync(Arc::new(Event::new(DomainEvent::KillSwitchTriggered(
-                    KillSwitchData {
-                        reason: Some(reason.to_string()),
-                    },
-                ))));
+            if let Err(e) =
+                self.bus
+                    .publish_sync(Arc::new(Event::new(DomainEvent::KillSwitchTriggered(
+                        KillSwitchData {
+                            reason: Some(reason.to_string()),
+                        },
+                    ))))
+            {
+                tracing::error!(event_type = %e.event_type, "kill_switch_event_publish_backpressure");
+            }
         }
     }
 
