@@ -228,16 +228,17 @@ pub fn parse_meta(
         };
         let sz_decimals = base.get("szDecimals").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let display_name = format!("{base_name}/{quote_name}");
-        instruments.insert(
+        let mut spot_info = InstrumentInfo::new_spot(
             exchange_name.to_string(),
-            InstrumentInfo::new_spot(
-                exchange_name.to_string(),
-                display_name.clone(),
-                sz_decimals,
-                base_name.to_string(),
-                quote_name.to_string(),
-            ),
+            display_name.clone(),
+            sz_decimals,
+            base_name.to_string(),
+            quote_name.to_string(),
         );
+        // Hyperliquid spot order actions use the numeric suffix of the exchange
+        // name (`@1` → 1) as the asset index.
+        spot_info.asset_index = exchange_name.strip_prefix('@').and_then(|n| n.parse().ok());
+        instruments.insert(exchange_name.to_string(), spot_info);
         aliases.insert(exchange_name.to_string(), exchange_name.to_string());
         match aliases.get(&display_name) {
             Some(existing) if existing != exchange_name => {

@@ -25,9 +25,9 @@ pub use config_normalize::{
 pub use indicators::{atr, ema, macd, momentum, sma};
 pub use params::TrendParams;
 pub use registry::{
-    StrategyBuildContext, StrategyConfigSnapshot, StrategyInstanceDefinition, StrategyRegistry,
-    StrategyRuntimeHandle, StrategyTypeCapabilities, StrategyTypePlugin, funding_arb_capabilities,
-    market_maker_capabilities, trend_follow_capabilities,
+    FaultedRuntimeHandle, StrategyBuildContext, StrategyConfigSnapshot, StrategyInstanceDefinition,
+    StrategyRegistry, StrategyRuntimeHandle, StrategyTypeCapabilities, StrategyTypePlugin,
+    funding_arb_capabilities, market_maker_capabilities, trend_follow_capabilities,
 };
 pub use runner::StrategyRunner;
 pub use supervisor::{

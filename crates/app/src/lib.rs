@@ -76,6 +76,7 @@ impl HypeEdgeApp {
             base_state,
             self.runtime.execution.clone(),
             self.runtime.market_data.clone(),
+            self.runtime.instrument_meta.clone(),
             self.runtime.config_versions.clone(),
             self.runtime.trading_enabled.clone(),
             self.runtime.safety_mode.clone(),
@@ -83,6 +84,7 @@ impl HypeEdgeApp {
             self.runtime.sse_pool.clone(),
             self.runtime.funding_arb_deps.clone(),
             self.runtime.mm_runtime.clone(),
+            self.runtime.action_budget.clone(),
             self.runtime.account_tracker.clone(),
         );
         hypeedge_api::build_router(api_state)

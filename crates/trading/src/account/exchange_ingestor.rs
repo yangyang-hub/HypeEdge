@@ -493,7 +493,7 @@ impl ExchangeEventIngestor {
         }
 
         // 2. Fills by time (paged until fewer than 2000 or cursor advances).
-        let mut fill_cursor = self
+        let fill_cursor = self
             .projector
             .cursor("fills")
             .await
@@ -522,13 +522,6 @@ impl ExchangeEventIngestor {
             if ordered_fills.len() < 2000 {
                 break;
             }
-            if fill_cursor == 0 {
-                tracing::warn!(
-                    retained = ordered_fills.len(),
-                    "initial_fill_history_bootstrap_truncated"
-                );
-                break;
-            }
             let latest_ms = ordered_fills
                 .last()
                 .and_then(|f| f.get("time"))
@@ -538,7 +531,6 @@ impl ExchangeEventIngestor {
                 return Err("user_fills_history_cursor_not_advancing".into());
             }
             start_ms = latest_ms;
-            fill_cursor = start_ms;
         }
 
         // 3. Funding history (B6): the endpoint caps its response (~500 items),

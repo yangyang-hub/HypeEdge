@@ -48,6 +48,8 @@ pub struct StrategyAllocation {
 /// Storage for strategy instances / runtime states / configs.
 #[async_trait]
 pub trait StrategyStateStore: Send + Sync {
+    async fn upsert_instance(&self, instance: &StrategyInstanceDefinition) -> Result<(), String>;
+    async fn upsert_config(&self, config: &StrategyConfigSnapshot) -> Result<(), String>;
     async fn list_instances(&self) -> Result<Vec<StrategyInstanceDefinition>, String>;
     async fn get_instance(
         &self,
@@ -159,6 +161,7 @@ impl StrategySupervisor {
         };
         let handle = self.registry.create(&context)?;
         handle.start().await?;
+        handle.set_mode(target).await?;
         // Set desired + runtime to the target. An empty reason string clears any
         // prior reason (e.g. a fault reason) on the fresh start.
         self.state_store
@@ -497,7 +500,6 @@ impl StrategySupervisor {
             handle.apply_config(&config).await?;
         }
         let _ = runtime;
-        let _ = expected_revision;
         self.state_store
             .set_runtime(
                 strategy_id,
@@ -505,7 +507,7 @@ impl StrategySupervisor {
                 Some(config_revision),
                 true,
                 Some("config_applied"),
-                None,
+                expected_revision,
             )
             .await?;
         Ok(())
@@ -625,6 +627,14 @@ impl InMemoryStrategyStateStore {
 
 #[async_trait]
 impl StrategyStateStore for InMemoryStrategyStateStore {
+    async fn upsert_instance(&self, instance: &StrategyInstanceDefinition) -> Result<(), String> {
+        self.insert_instance(instance.clone()).await;
+        Ok(())
+    }
+    async fn upsert_config(&self, config: &StrategyConfigSnapshot) -> Result<(), String> {
+        self.insert_config(config.clone()).await;
+        Ok(())
+    }
     async fn list_instances(&self) -> Result<Vec<StrategyInstanceDefinition>, String> {
         Ok(self
             .inner

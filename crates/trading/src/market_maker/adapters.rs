@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use hypeedge_domain::decimal::{Size, Usd};
+use hypeedge_domain::decimal::{Decimal, Size, Usd};
+use hypeedge_domain::enums::{Side, TimeInForce};
 use hypeedge_domain::traits::ExecutionClient;
 
 use super::models::{ActionBudgetSnapshot, InventorySnapshot};
@@ -17,7 +18,7 @@ use crate::account::AccountTracker;
 use crate::execution::ExecutionEngine;
 use crate::market_data::live_provider::LiveMarketDataProvider;
 use crate::risk::ActionBudgetController;
-use crate::trading::quotes::{QuotePlan, QuoteSlotView};
+use crate::trading::quotes::{QuotePlan, QuoteRiskOwner, QuoteSlotKey, QuoteSlotView};
 
 /// Inventory from the live account tracker.
 pub struct TrackerInventoryProvider {
@@ -126,21 +127,18 @@ impl ProviderFundingProvider {
     }
 }
 
+#[async_trait::async_trait]
 impl FundingSnapshotProvider for ProviderFundingProvider {
-    fn get_funding(&self, symbol: &str) -> Option<(f64, i64)> {
-        // `get_funding` is async; the runtime's funding provider is sync. Bridge
-        // by blocking on a short poll — acceptable because the provider caches
-        // the latest funding in memory.
-        let rt = tokio::runtime::Handle::current();
-        rt.block_on(async { self.provider.get_funding(symbol).await })
+    async fn get_funding(&self, symbol: &str) -> Option<(f64, i64)> {
+        self.provider
+            .get_funding(symbol)
+            .await
             .map(|f| (f.funding_rate, f.timestamp))
     }
 }
 
-/// Quote slots from the engine's open orders (best-effort; empty views mean the
-/// coordinator treats the slot as available to place).
+/// Quote slots from the engine's open orders.
 pub struct EngineSlotProvider {
-    #[allow(dead_code)] // future: read open orders from the engine for live slot views
     engine: Arc<ExecutionEngine>,
 }
 
@@ -150,36 +148,73 @@ impl EngineSlotProvider {
     }
 }
 
+#[async_trait::async_trait]
 impl QuoteSlotProvider for EngineSlotProvider {
-    fn get_quote_slots(
+    async fn get_quote_slots(
         &self,
-        _strategy_id: &str,
-        _symbol: &str,
+        strategy_id: &str,
+        symbol: &str,
     ) -> Result<(QuoteSlotView, QuoteSlotView), String> {
-        // The coordinator validates slot ownership against the desired set; with
-        // empty views it will Place. A fuller implementation reads open orders
-        // from the engine. This is the wiring seam for live quote-slot tracking.
-        Ok((empty_slot_view(), empty_slot_view()))
+        let orders = self
+            .engine
+            .get_open_orders(Some(symbol))
+            .await
+            .map_err(|e| format!("engine open orders: {e}"))?;
+        let mut bid_owners = Vec::new();
+        let mut ask_owners = Vec::new();
+        for order in orders {
+            if order.strategy_id.as_deref() != Some(strategy_id) {
+                continue;
+            }
+            let Some(price) = order.price else {
+                continue;
+            };
+            let remaining = order.size.inner() - order.filled_size.inner();
+            if remaining <= Decimal::ZERO {
+                continue;
+            }
+            let owner = QuoteRiskOwner {
+                order_id: order.exchange_oid.clone(),
+                cloid: order.cloid.clone(),
+                price,
+                remaining_size: Size::new(remaining),
+                status: order.status,
+                plan_revision: 0,
+                live_since: order
+                    .acknowledged_at
+                    .or(order.submitted_at)
+                    .unwrap_or_else(Utc::now),
+                exchange_order_id_known: order.exchange_oid.is_some(),
+            };
+            match order.side {
+                Side::Buy => bid_owners.push(owner),
+                Side::Sell => ask_owners.push(owner),
+            }
+        }
+        if bid_owners.len() > 1 || ask_owners.len() > 1 {
+            return Err(format!(
+                "strategy {strategy_id} has multiple live orders on one quote side (bid={}, ask={}); reconciliation required",
+                bid_owners.len(),
+                ask_owners.len()
+            ));
+        }
+        let view = |side: Side, owners: Vec<QuoteRiskOwner>| QuoteSlotView {
+            key: QuoteSlotKey {
+                strategy_id: strategy_id.to_string(),
+                symbol: symbol.to_string(),
+                side,
+                level: 0,
+            },
+            revision: 0,
+            plan_revision: 0,
+            owners,
+            last_transition_at: None,
+        };
+        Ok((view(Side::Buy, bid_owners), view(Side::Sell, ask_owners)))
     }
 }
 
-fn empty_slot_view() -> QuoteSlotView {
-    QuoteSlotView {
-        key: crate::trading::quotes::QuoteSlotKey {
-            strategy_id: String::new(),
-            symbol: String::new(),
-            side: hypeedge_domain::enums::Side::Buy,
-            level: 0,
-        },
-        revision: 0,
-        plan_revision: 0,
-        owners: vec![],
-        last_transition_at: None,
-    }
-}
-
-/// Command client forwarding quote plans to the execution engine (best-effort:
-/// submit the plan's child placements through the engine's ExecutionClient).
+/// Command client forwarding quote-plan diffs to the execution engine.
 pub struct EngineQuotePlanClient {
     engine: Arc<ExecutionEngine>,
 }
@@ -193,47 +228,88 @@ impl EngineQuotePlanClient {
 #[async_trait::async_trait]
 impl QuotePlanCommandClient for EngineQuotePlanClient {
     async fn submit_quote_plan(&self, plan: &QuotePlan) -> Result<(), String> {
-        // Place each desired quote through the engine. The plan's diffs carry
-        // Place/Cancel decisions; here we forward the desired bids/asks as
-        // limit orders. A fuller implementation reconciles diff-by-diff.
-        for quote in [&plan.diffs[0], plan.diffs.get(1).unwrap_or(&plan.diffs[0])] {
-            if quote.action != hypeedge_domain::enums::QuoteAction::Place {
-                continue;
+        for diff in &plan.diffs {
+            match diff.action {
+                hypeedge_domain::enums::QuoteAction::Place => {
+                    self.place_quote(diff).await?;
+                }
+                hypeedge_domain::enums::QuoteAction::Cancel => {
+                    if let Some(source) = &diff.source {
+                        self.engine
+                            .cancel_order(&source.cloid)
+                            .await
+                            .map_err(|e| format!("cancel quote: {e}"))?;
+                    }
+                }
+                hypeedge_domain::enums::QuoteAction::CancelThenPlace => {
+                    if let Some(source) = &diff.source {
+                        self.engine
+                            .cancel_order(&source.cloid)
+                            .await
+                            .map_err(|e| format!("cancel-then-place quote: {e}"))?;
+                    }
+                    self.place_quote(diff).await?;
+                }
+                hypeedge_domain::enums::QuoteAction::Keep
+                | hypeedge_domain::enums::QuoteAction::NoAction
+                | hypeedge_domain::enums::QuoteAction::BlockedUnknown
+                | hypeedge_domain::enums::QuoteAction::Modify => {
+                    // MODIFY is disabled; Keep/NoAction need no network work.
+                    continue;
+                }
             }
-            let Some(price) = quote.desired.price else {
-                continue;
-            };
-            let Some(size) = quote.desired.size else {
-                continue;
-            };
-            let intent = hypeedge_domain::models::OrderIntent {
-                symbol: quote.desired.slot.symbol.clone(),
-                side: quote.desired.slot.side,
-                size,
-                price: Some(price),
-                order_type: hypeedge_domain::enums::OrderType::Limit,
-                time_in_force: hypeedge_domain::enums::TimeInForce::Gtc,
-                strategy_id: Some(plan.strategy_id.clone()),
-                sub_account: None,
-                reduce_only: false,
-                cloid: None,
-                client_id: None,
-                is_spot: false,
-                risk_reducing: false,
-                max_slippage_bps: 50,
-            };
-            self.engine
-                .submit_order(intent, None)
-                .await
-                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }
 
     async fn cancel_strategy_quotes(&self, request: &QuoteCancelRequest) -> Result<(), String> {
-        let _ = request;
-        // Cancel all the strategy's open orders on its symbol.
-        let _ = self.engine.cancel_all_orders(Some(&request.symbol)).await;
+        let open = self
+            .engine
+            .get_open_orders(Some(&request.symbol))
+            .await
+            .map_err(|e| format!("open orders: {e}"))?;
+        for order in open {
+            if order.strategy_id.as_deref() != Some(request.strategy_id.as_str()) {
+                continue;
+            }
+            self.engine
+                .cancel_order(&order.cloid)
+                .await
+                .map_err(|e| format!("cancel strategy quote: {e}"))?;
+        }
         Ok(())
+    }
+}
+
+impl EngineQuotePlanClient {
+    async fn place_quote(&self, diff: &crate::trading::quotes::QuoteDiff) -> Result<(), String> {
+        let Some(price) = diff.desired.price else {
+            return Ok(());
+        };
+        let Some(size) = diff.desired.size else {
+            return Ok(());
+        };
+        let intent = hypeedge_domain::models::OrderIntent {
+            symbol: diff.desired.slot.symbol.clone(),
+            side: diff.desired.slot.side,
+            size,
+            price: Some(price),
+            order_type: hypeedge_domain::enums::OrderType::Limit,
+            // ALO: maker quotes must never cross/take liquidity.
+            time_in_force: TimeInForce::Alo,
+            strategy_id: Some(diff.desired.slot.strategy_id.clone()),
+            sub_account: None,
+            reduce_only: false,
+            cloid: None,
+            client_id: None,
+            is_spot: false,
+            risk_reducing: false,
+            max_slippage_bps: 50,
+        };
+        self.engine
+            .submit_order(intent, None)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
     }
 }

@@ -59,7 +59,7 @@ async fn handle_socket(state: AppState, mut socket: WebSocket, strategy_id: Stri
     let mut interval = tokio::time::interval(Duration::from_millis(250));
     loop {
         interval.tick().await;
-        let snapshot = provider();
+        let snapshot = provider(&strategy_id).await;
         if let Some(snapshot) = snapshot {
             let revision = (Some(snapshot.quote_revision), snapshot.market_version);
             if revision != previous_revision {

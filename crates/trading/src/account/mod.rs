@@ -15,10 +15,10 @@ pub mod tracker;
 
 pub use account_health::{
     AccountFreshnessThresholds, AccountHealthDimension, AccountHealthProvider,
-    AccountHealthSnapshot, AccountStatePoller, AccountStateSource, ClearinghouseRestClient,
-    FreshnessObservation, FreshnessResult, FreshnessStatus, LayeredAccountHealthProvider,
-    MutableAccountHealthProvider, PolledAccountSnapshot, RestAccountStateSource,
-    RiskProximityEvaluator,
+    AccountHealthSnapshot, AccountSnapshotSink, AccountStatePoller, AccountStateSource,
+    ClearinghouseRestClient, FreshnessObservation, FreshnessResult, FreshnessStatus,
+    LayeredAccountHealthProvider, MutableAccountHealthProvider, PolledAccountSnapshot,
+    RestAccountStateSource, RiskProximityEvaluator,
 };
 pub use exchange_ingestor::{
     CommittedFillProjection, ExchangeEventIngestor, ExchangeFactProjector, InfoClient,

@@ -42,6 +42,29 @@ pub trait StrategyRuntimeHandle: Send + Sync {
     async fn stop(&self) -> Result<(), String>;
 }
 
+/// A runtime handle that fails every lifecycle operation with a fixed reason.
+/// Used when a strategy factory cannot construct the real runtime (e.g. a
+/// funding-arb sub-account mismatch) instead of panicking or silently no-oping.
+pub struct FaultedRuntimeHandle {
+    pub message: String,
+}
+
+#[async_trait::async_trait]
+impl StrategyRuntimeHandle for FaultedRuntimeHandle {
+    async fn start(&self) -> Result<(), String> {
+        Err(self.message.clone())
+    }
+    async fn set_mode(&self, _: MarketMakerLifecycle) -> Result<(), String> {
+        Err(self.message.clone())
+    }
+    async fn apply_config(&self, _: &StrategyConfigSnapshot) -> Result<(), String> {
+        Err(self.message.clone())
+    }
+    async fn stop(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
+
 pub type StrategyFactory =
     Arc<dyn Fn(&StrategyBuildContext) -> Arc<dyn StrategyRuntimeHandle> + Send + Sync>;
 

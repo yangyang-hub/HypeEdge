@@ -22,9 +22,13 @@ use super::estimators::{AdverseMarkoutEstimator, DecisionLatencyEstimator};
 use super::models::{ActionBudgetSnapshot, InventorySnapshot, MarketFeatures, MarketMakerConfig};
 use super::policy::MarketMakerPolicy;
 use super::shadow::{ShadowActionEstimate, ShadowOrderState};
+use crate::account::AccountTracker;
+use crate::execution::ExecutionEngine;
 use crate::market_data::features::MarketFeatureEngine;
+use crate::market_data::live_provider::LiveMarketDataProvider;
+use crate::risk::ActionBudgetController;
 use crate::strategy::registry::{StrategyConfigSnapshot, StrategyRuntimeHandle};
-use crate::trading::quote_coordinator::QuoteCoordinator;
+use crate::trading::quote_coordinator::{QuoteCoordinator, QuoteCoordinatorConfig};
 use crate::trading::quotes::{DesiredQuoteSet, QuotePlan, QuoteSlotView};
 
 type Mailbox = Arc<BoundedMailbox<Arc<Event>>>;
@@ -42,16 +46,18 @@ pub trait AccountHealthProvider: Send + Sync {
     fn allows_risk_increase(&self) -> bool;
 }
 
+#[async_trait]
 pub trait QuoteSlotProvider: Send + Sync {
-    fn get_quote_slots(
+    async fn get_quote_slots(
         &self,
         strategy_id: &str,
         symbol: &str,
     ) -> Result<(QuoteSlotView, QuoteSlotView), String>;
 }
 
+#[async_trait]
 pub trait FundingSnapshotProvider: Send + Sync {
-    fn get_funding(&self, symbol: &str) -> Option<(f64, i64)>;
+    async fn get_funding(&self, symbol: &str) -> Option<(f64, i64)>;
 }
 
 /// A cancel request for the durable command client.
@@ -125,6 +131,86 @@ impl MarketMakerRuntimeSnapshot {
             "best_ask": features.map(|f| f.best_ask.to_string()),
             "external_reference": external_reference,
         })
+    }
+}
+
+/// Builds a per-strategy [`MarketMakerRuntime`] from shared live dependencies.
+///
+/// The old wiring kept a single placeholder runtime bound to `mm_wiring` and
+/// ignored the build context, so every created strategy operated (or failed)
+/// on the same BTC runtime. The factory now binds the actual strategy id,
+/// sub-account, and symbol from the control-plane instance.
+pub struct MarketMakerRuntimeFactory {
+    event_bus: Arc<EventBus>,
+    tracker: Arc<AccountTracker>,
+    budget: Arc<tokio::sync::Mutex<ActionBudgetController>>,
+    market_data: Arc<LiveMarketDataProvider>,
+    engine: Arc<ExecutionEngine>,
+    feature_engine: Arc<tokio::sync::Mutex<MarketFeatureEngine>>,
+}
+
+impl MarketMakerRuntimeFactory {
+    pub fn new(
+        event_bus: Arc<EventBus>,
+        tracker: Arc<AccountTracker>,
+        budget: Arc<tokio::sync::Mutex<ActionBudgetController>>,
+        market_data: Arc<LiveMarketDataProvider>,
+        engine: Arc<ExecutionEngine>,
+    ) -> Option<Self> {
+        let feature_engine = Arc::new(tokio::sync::Mutex::new(
+            MarketFeatureEngine::new(20, 60.0, 10_000).ok()?,
+        ));
+        Some(Self {
+            event_bus,
+            tracker,
+            budget,
+            market_data,
+            engine,
+            feature_engine,
+        })
+    }
+
+    pub fn build(
+        &self,
+        ctx: &crate::strategy::registry::StrategyBuildContext,
+    ) -> Option<Arc<MarketMakerRuntime>> {
+        use crate::market_maker::adapters::{
+            ControllerBudgetProvider, EngineQuotePlanClient, EngineSlotProvider,
+            ProviderFundingProvider, TrackerHealthProvider, TrackerInventoryProvider,
+        };
+        let symbol = if ctx.instance.symbol.is_empty() || ctx.instance.symbol == "AUTO" {
+            "BTC".to_string()
+        } else {
+            ctx.instance.symbol.clone()
+        };
+        let inventory = Arc::new(TrackerInventoryProvider::new(self.tracker.clone()));
+        let budget_provider = Arc::new(ControllerBudgetProvider::new(self.budget.clone()));
+        let health = Arc::new(TrackerHealthProvider::new(self.tracker.clone()));
+        let slots = Arc::new(EngineSlotProvider::new(self.engine.clone()));
+        let commands = Arc::new(EngineQuotePlanClient::new(self.engine.clone()));
+        let funding = Some(
+            Arc::new(ProviderFundingProvider::new(self.market_data.clone()))
+                as Arc<dyn FundingSnapshotProvider>,
+        );
+        MarketMakerRuntime::new(
+            ctx.instance.strategy_id.clone(),
+            ctx.instance.strategy_id.clone(),
+            ctx.instance.sub_account.clone(),
+            symbol,
+            self.event_bus.clone(),
+            self.feature_engine.clone(),
+            MarketMakerPolicy::new(),
+            QuoteCoordinator::new(QuoteCoordinatorConfig::default()).ok()?,
+            inventory,
+            budget_provider,
+            health,
+            slots,
+            commands,
+            funding,
+            chrono::Duration::seconds(5),
+        )
+        .ok()
+        .map(Arc::new)
     }
 }
 
@@ -343,12 +429,15 @@ impl MarketMakerRuntime {
                 sample_count: 0,
             })
         };
-        let funding_rate = self
-            .funding
-            .as_ref()
-            .and_then(|f| f.get_funding(&self.symbol))
-            .map(|(rate, _)| hypeedge_domain::decimal::Decimal::from_f64(rate).unwrap_or_default())
-            .unwrap_or_default();
+        let funding_rate = match &self.funding {
+            Some(f) => match f.get_funding(&self.symbol).await {
+                Some((rate, _)) => {
+                    hypeedge_domain::decimal::Decimal::from_f64(rate).unwrap_or_default()
+                }
+                None => hypeedge_domain::decimal::Decimal::ZERO,
+            },
+            None => hypeedge_domain::decimal::Decimal::ZERO,
+        };
 
         let features = {
             let mut engine = self.feature_engine.lock().await;
@@ -435,7 +524,9 @@ impl MarketMakerRuntime {
             let mut shadow = self.shadow.lock().await;
             Ok(shadow.views(&self.strategy_id, &self.symbol))
         } else {
-            self.slots.get_quote_slots(&self.strategy_id, &self.symbol)
+            self.slots
+                .get_quote_slots(&self.strategy_id, &self.symbol)
+                .await
         }
     }
 
@@ -772,8 +863,9 @@ mod tests {
         }
     }
     struct FakeSlots;
+    #[async_trait]
     impl QuoteSlotProvider for FakeSlots {
-        fn get_quote_slots(
+        async fn get_quote_slots(
             &self,
             _: &str,
             _: &str,

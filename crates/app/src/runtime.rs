@@ -13,11 +13,13 @@ use hypeedge_domain::enums::SafetyMode;
 use hypeedge_domain::models::RiskLimits;
 use hypeedge_domain::traits::{DurableOrderStore, ExecutionClient, SystemStateStore};
 use hypeedge_infra::event_bus::EventBus;
+use hypeedge_storage::account_state_store::PostgresAccountSnapshotStore;
 use hypeedge_storage::adapters::{PooledDurableOrderStore, PooledExecutionCommandQueue};
+use hypeedge_storage::clickhouse_writer::ClickHouseWriter;
 use hypeedge_storage::exchange_ingestor_store::PostgresExchangeFactProjector;
 use hypeedge_storage::system_state_store::PooledSystemStateStore;
 use hypeedge_trading::account::{
-    AccountStatePoller, AccountTracker, ExchangeEventIngestor, InfoClient,
+    AccountSnapshotSink, AccountStatePoller, AccountTracker, ExchangeEventIngestor, InfoClient,
     LayeredAccountHealthProvider, RestAccountStateSource,
 };
 use hypeedge_trading::execution::{
@@ -28,7 +30,10 @@ use hypeedge_trading::market_data::{
     BookManager, InstrumentMetaCache, LiveMarketDataProvider, RateLimiter, RestClient,
     WebSocketFeed, WsFeedConfig,
 };
-use hypeedge_trading::risk::{ActionBudgetController, KillSwitch, RiskChecker, SafetyController};
+use hypeedge_trading::risk::{
+    ActionBudgetController, CancelHeadroomSnapshot, KillSwitch, RemoteActionSnapshot, RiskChecker,
+    SafetyController,
+};
 
 /// What a fully wired runtime hands to the app / API state.
 pub struct RuntimeWiring {
@@ -39,6 +44,7 @@ pub struct RuntimeWiring {
     pub account_tracker: Arc<AccountTracker>,
     pub execution: Option<Arc<ExecutionEngine>>,
     pub market_data: Option<Arc<LiveMarketDataProvider>>,
+    pub instrument_meta: Option<Arc<InstrumentMetaCache>>,
     pub config_versions: Option<Arc<dyn hypeedge_storage::ConfigVersionStore>>,
     pub sse_outbox: Option<Arc<hypeedge_storage::outbox::PostgresOutboxStore>>,
     pub sse_pool: Option<sqlx::PgPool>,
@@ -48,8 +54,9 @@ pub struct RuntimeWiring {
     /// Funding-arb runtime dependencies (wiring follow-up), when a store is wired.
     pub funding_arb_deps:
         Option<Arc<hypeedge_trading::funding_arb::runtime::FundingArbRuntimeDependencies>>,
-    /// The live market-maker runtime (wiring follow-up) for the WS snapshot provider.
-    pub mm_runtime: Option<Arc<hypeedge_trading::market_maker::MarketMakerRuntime>>,
+    /// The live market-maker runtime factory (wiring follow-up) for per-strategy
+    /// runtimes and the WS snapshot provider.
+    pub mm_runtime: Option<Arc<hypeedge_trading::market_maker::MarketMakerRuntimeFactory>>,
 }
 
 /// Build the full runtime in dependency order. When the V2 trading chain is not
@@ -94,6 +101,7 @@ pub async fn build_runtime(
             account_tracker,
             execution: None,
             market_data: None,
+            instrument_meta: None,
             config_versions: None,
             sse_outbox: None,
             sse_pool: None,
@@ -146,6 +154,26 @@ pub async fn build_runtime(
         Some(provider)
     };
 
+    // ClickHouse writer: persist market-data events to the time-series store.
+    {
+        let ch = &settings.clickhouse;
+        let mut writer = ClickHouseWriter::new(
+            &format!("http://{}:{}", ch.host, ch.port),
+            &ch.database,
+            &ch.username,
+            &ch.password,
+            ch.batch_size as usize,
+            std::time::Duration::from_secs_f64(ch.flush_interval),
+            ch.spool_path.clone().into(),
+        );
+        let bus = event_bus.clone();
+        tokio::spawn(async move {
+            if let Err(e) = writer.run(&bus).await {
+                tracing::error!(error = %e, "clickhouse_writer_exited");
+            }
+        });
+    }
+
     // WS feed owns its own book manager; run() needs the Arc alone.
     {
         let feed = Arc::new(WebSocketFeed::from_config(WsFeedConfig {
@@ -172,40 +200,23 @@ pub async fn build_runtime(
         });
     }
 
-    // ---------- Account chain (6d) ----------
-    let health = Arc::new(LayeredAccountHealthProvider::default());
-    let state_source = Arc::new(RestAccountStateSource::new(
-        rest.clone(),
-        &account,
-        account_tracker.clone(),
-    )?);
-    let poller = AccountStatePoller::new(
-        state_source,
-        account_tracker.clone(),
-        health.clone(),
-        settings.market_making.account_poll_interval_seconds,
-        settings
-            .market_making
-            .near_risk_account_poll_interval_seconds,
-        None,
-        None,
-    )?;
-    {
-        let poller = Arc::new(poller);
-        tokio::spawn(async move {
-            if let Err(e) = poller.run().await {
-                tracing::error!(error = %e, "account_state_poller_exited");
-            }
-        });
-    }
+    // ---------- Risk limits (6e) ----------
+    let risk_limits = RiskLimits {
+        max_position_pct: settings.risk.max_position_pct,
+        max_strategy_loss_pct: settings.risk.max_strategy_loss_pct,
+        max_drawdown_pct: settings.risk.max_drawdown_pct,
+        max_leverage: settings.risk.max_leverage,
+        timeout_ms: settings.risk.risk_check_timeout_ms as u64,
+        account_stale_seconds: (settings.market_making.account_poll_interval_seconds * 2.0)
+            .max(5.0),
+    };
+    let risk_checker = Arc::new(RiskChecker::new(account_tracker.clone(), risk_limits));
 
-    // Ingestor + reconciler require Postgres (durable projector). A Postgres
-    // failure degrades to a no-DB wiring (trading still possible without the
-    // durable ledger, matching the Python-era fallback) rather than killing the
-    // whole runtime build.
-    let (_pg, config_versions, sse_outbox, sse_pool, durable_order_store) =
+    // ---------- Postgres (durable ledger) ----------
+    // V2 trading is fail-closed on the durable ledger: no Postgres, no trading.
+    let (_pg, config_versions, sse_outbox, sse_pool, durable_order_store, snapshot_sink) =
         if settings.postgres.url.trim().is_empty() {
-            (None, None, None, None, None)
+            return Err("v2 trading requires a configured Postgres durable ledger".into());
         } else {
             match hypeedge_storage::Postgres::connect(
                 &settings.postgres.url,
@@ -240,36 +251,54 @@ pub async fn build_runtime(
                     ));
                     let order_store = Arc::new(PooledDurableOrderStore::new(
                         pool.clone(),
-                        None,
+                        Some(risk_limits),
                         30.0,
                         settings.postgres.risk_reservation_ttl_seconds as i64,
                     )) as Arc<dyn DurableOrderStore>;
+                    let snapshot_sink: Option<Arc<dyn AccountSnapshotSink>> =
+                        Some(Arc::new(PostgresAccountSnapshotStore::new(pool.clone())));
                     (
                         Some(storage),
                         Some(cfg_versions),
                         Some(outbox),
                         Some(pool),
                         Some(order_store),
+                        snapshot_sink,
                     )
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "postgres_connect_failed_degrading_no_db");
-                    (None, None, None, None, None)
+                    return Err(format!("postgres connect failed: {e}"));
                 }
             }
         };
 
-    // ---------- Risk (6e) ----------
-    let risk_limits = RiskLimits {
-        max_position_pct: settings.risk.max_position_pct,
-        max_strategy_loss_pct: settings.risk.max_strategy_loss_pct,
-        max_drawdown_pct: settings.risk.max_drawdown_pct,
-        max_leverage: settings.risk.max_leverage,
-        timeout_ms: settings.risk.risk_check_timeout_ms as u64,
-        account_stale_seconds: (settings.market_making.account_poll_interval_seconds * 2.0)
-            .max(5.0),
-    };
-    let risk_checker = Arc::new(RiskChecker::new(account_tracker.clone(), risk_limits));
+    // ---------- Account chain (6d) ----------
+    let health = Arc::new(LayeredAccountHealthProvider::default());
+    let state_source = Arc::new(RestAccountStateSource::new(
+        rest.clone(),
+        &account,
+        account_tracker.clone(),
+    )?);
+    let poller = AccountStatePoller::new(
+        state_source,
+        account_tracker.clone(),
+        health.clone(),
+        snapshot_sink,
+        settings.market_making.account_poll_interval_seconds,
+        settings
+            .market_making
+            .near_risk_account_poll_interval_seconds,
+        None,
+        None,
+    )?;
+    {
+        let poller = Arc::new(poller);
+        tokio::spawn(async move {
+            if let Err(e) = poller.run().await {
+                tracing::error!(error = %e, "account_state_poller_exited");
+            }
+        });
+    }
     let safety = Arc::new(tokio::sync::Mutex::new(SafetyController::new(
         SafetyMode::Starting,
     )));
@@ -334,6 +363,57 @@ pub async fn build_runtime(
     }));
     let _ = engine_cell.set(engine.clone());
 
+    // User-rate-limit poll: refreshes the rate limiter's action credits and
+    // reconciles the action-budget controller (B3). Without this, every
+    // placement is rejected as stale and the budget stays in CancelOnly.
+    {
+        let rest = rest.clone();
+        let account = account.clone();
+        let budget = action_budget.clone();
+        let engine_cell = engine_cell.clone();
+        let poll_interval_secs = settings
+            .action_budget
+            .remote_poll_interval_normal_seconds
+            .max(5.0);
+        let cancel_headroom_initial = settings.action_budget.cancel_headroom_initial as i64;
+        tokio::spawn(async move {
+            loop {
+                match rest.poll_action_credit_snapshot(&account).await {
+                    Ok(Some(data)) => {
+                        let observed_at = chrono::Utc::now();
+                        if let Ok(remote) =
+                            RemoteActionSnapshot::from_user_rate_limit(&account, &data, observed_at)
+                        {
+                            let remaining = remote.remaining().max(0);
+                            let mut guard = budget.lock().await;
+                            if let Err(e) = guard.reconcile_remote(remote.clone()) {
+                                tracing::warn!(error = %e, "action_budget_reconcile_failed");
+                            } else {
+                                let cap = cancel_headroom_initial.max(remaining);
+                                guard.reconcile_cancel_headroom(CancelHeadroomSnapshot {
+                                    cap,
+                                    used: cap - remaining,
+                                    observed_at,
+                                });
+                            }
+                            if let Some(engine) = engine_cell.get() {
+                                let count = engine.open_order_count().await;
+                                guard.update_possible_live_orders(count as i64);
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        tracing::warn!("action_credit_poll_returned_none");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "action_credit_poll_failed");
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_secs_f64(poll_interval_secs)).await;
+            }
+        });
+    }
+
     // Durable worker: claims commands and dispatches through the engine.
     if let Some(pool) = &sse_pool {
         let queue = Arc::new(PooledExecutionCommandQueue::new(
@@ -386,16 +466,15 @@ pub async fn build_runtime(
                 tracker: tracker_ref,
                 cycles,
                 meta,
-                trading_ready: Box::new(|| true),
+                trading_ready: Box::new(|| Box::pin(async { true })),
                 kill_switch_active: Box::new({
                     let ks = kill_switch.clone();
                     move || {
                         let ks = ks.clone();
-                        tokio::runtime::Handle::current()
-                            .block_on(async move { ks.is_active().await })
+                        Box::pin(async move { ks.is_active().await })
                     }
                 }),
-                account_allows_risk_increase: Box::new(|| true),
+                account_allows_risk_increase: Box::new(|| Box::pin(async { true })),
                 reconcile: Box::new(|| Box::pin(async { true })),
                 deployment: hypeedge_trading::funding_arb::runtime::FundingArbDeployment {
                     max_notional_usd: fa.max_notional_usd.0,
@@ -416,13 +495,17 @@ pub async fn build_runtime(
     // Market-maker runtime (only when the MM feature is enabled and there is a
     // live engine + provider).
     let mm_runtime = if settings.features.market_making_enabled {
-        build_market_maker_runtime(
+        let market_data = market_data
+            .clone()
+            .ok_or_else(|| "market_making_enabled requires a market-data provider".to_string())?;
+        hypeedge_trading::market_maker::MarketMakerRuntimeFactory::new(
             event_bus.clone(),
             account_tracker.clone(),
             action_budget.clone(),
-            market_data.clone(),
+            market_data,
             engine.clone(),
         )
+        .map(Arc::new)
     } else {
         None
     };
@@ -435,6 +518,7 @@ pub async fn build_runtime(
         account_tracker,
         execution: Some(engine),
         market_data,
+        instrument_meta: Some(meta_cache),
         config_versions,
         sse_outbox,
         sse_pool,
@@ -468,6 +552,7 @@ pub fn build_control_plane(settings: &AppSettings, event_bus: Arc<EventBus>) -> 
         account_tracker: Arc::new(AccountTracker::new()),
         execution: None,
         market_data: None,
+        instrument_meta: None,
         config_versions: None,
         sse_outbox: None,
         sse_pool: None,
@@ -512,59 +597,4 @@ fn map_action_budget_settings(
         minimum_marginal_usdc_per_action: s.minimum_marginal_usdc_per_action,
         minimum_actions_for_economic_gate: s.minimum_actions_for_economic_gate,
     }
-}
-
-/// Build the live market-maker runtime with provider adapters (wiring follow-up).
-/// Returns `None` when a required live dependency is missing.
-fn build_market_maker_runtime(
-    event_bus: Arc<EventBus>,
-    tracker: Arc<AccountTracker>,
-    budget: Arc<tokio::sync::Mutex<ActionBudgetController>>,
-    market_data: Option<Arc<LiveMarketDataProvider>>,
-    engine: Arc<ExecutionEngine>,
-) -> Option<Arc<hypeedge_trading::market_maker::MarketMakerRuntime>> {
-    use hypeedge_trading::market_maker::adapters::{
-        ControllerBudgetProvider, EngineQuotePlanClient, EngineSlotProvider,
-        ProviderFundingProvider, TrackerHealthProvider, TrackerInventoryProvider,
-    };
-    use hypeedge_trading::market_maker::runtime::MarketMakerRuntime;
-    use hypeedge_trading::trading::quote_coordinator::{QuoteCoordinator, QuoteCoordinatorConfig};
-
-    let market_data = market_data?;
-    let feature_engine = Arc::new(tokio::sync::Mutex::new(
-        hypeedge_trading::market_data::MarketFeatureEngine::new(20, 60.0, 10_000).ok()?,
-    ));
-    let inventory = Arc::new(TrackerInventoryProvider::new(tracker.clone()));
-    let budget_provider = Arc::new(ControllerBudgetProvider::new(budget));
-    let health = Arc::new(TrackerHealthProvider::new(tracker));
-    let slots = Arc::new(EngineSlotProvider::new(engine.clone()));
-    let commands = Arc::new(EngineQuotePlanClient::new(engine));
-    let funding = Some(Arc::new(ProviderFundingProvider::new(market_data))
-        as Arc<
-            dyn hypeedge_trading::market_maker::runtime::FundingSnapshotProvider,
-        >);
-    let coordinator = QuoteCoordinator::new(QuoteCoordinatorConfig::default()).ok()?;
-
-    // The runtime requires a strategy_id/session_id/symbol; the supervisor
-    // re-binds per instance, so this is a placeholder identity the handle
-    // factory overrides.
-    MarketMakerRuntime::new(
-        "mm_wiring".into(),
-        "mm_session".into(),
-        String::new(),
-        "BTC".into(),
-        event_bus,
-        feature_engine,
-        hypeedge_trading::market_maker::MarketMakerPolicy::new(),
-        coordinator,
-        inventory,
-        budget_provider,
-        health,
-        slots,
-        commands,
-        funding,
-        chrono::Duration::seconds(5),
-    )
-    .ok()
-    .map(Arc::new)
 }

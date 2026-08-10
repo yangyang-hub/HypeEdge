@@ -14,6 +14,16 @@ use axum::response::IntoResponse;
 pub async fn risk_status(State(state): State<AppState>) -> Response {
     let risk = &state.settings.risk;
     let safety_mode = state.safety_mode.read().await.clone();
+    let tracker = &state.account_tracker;
+    let drawdown = tracker.drawdown_pct();
+    let leverage = tracker.get_leverage();
+    let action_credits = match &state.action_budget {
+        Some(budget) => {
+            let guard = budget.lock().await;
+            guard.snapshot().address_remaining.max(0)
+        }
+        None => 0,
+    };
     ok(serde_json::json!({
         "kill_switch_active": state.kill_switch.is_active().await,
         "kill_switch_reason": state.kill_switch.reason().await,
@@ -22,22 +32,30 @@ pub async fn risk_status(State(state): State<AppState>) -> Response {
         "limits": [
             {
                 "name": "总回撤",
-                "current": "0",
-                "limit": format!("{}", risk.max_drawdown_pct),
+                "current": format!("{:.4}", drawdown),
+                "limit": format!("{:.4}", risk.max_drawdown_pct),
                 "unit": "%",
-                "pct_used": "0",
+                "pct_used": if risk.max_drawdown_pct > 0.0 {
+                    format!("{:.2}", drawdown / risk.max_drawdown_pct * 100.0)
+                } else {
+                    "0".into()
+                },
             },
             {
                 "name": "最大杠杆",
-                "current": "0",
+                "current": format!("{:.2}", leverage),
                 "limit": format!("{}", risk.max_leverage),
                 "unit": "x",
-                "pct_used": "0",
+                "pct_used": if risk.max_leverage > 0 {
+                    format!("{:.2}", leverage / risk.max_leverage as f64 * 100.0)
+                } else {
+                    "0".into()
+                },
             },
         ],
         "check_stats": {},
         "strategy_pnl": {},
-        "action_credits_remaining": 0,
+        "action_credits_remaining": action_credits,
     }))
 }
 
@@ -48,7 +66,7 @@ pub async fn kill_switch(
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
     // A23: kill-switch is admin-only.
-    if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
+    if let Err(resp) = authorize(guard.0, ApiRole::Admin) {
         return *resp;
     }
     let action = body.get("action").and_then(|a| a.as_str()).unwrap_or("");

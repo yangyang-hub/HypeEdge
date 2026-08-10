@@ -172,7 +172,7 @@ impl FundingArbMarketScanner for LiveFundingArbScanner {
             ) else {
                 continue;
             };
-            let volumes = self.volumes(&perp, &spot).await;
+            let volumes = self.volumes(&perp, &spot, &display).await;
             out.push(FundingArbMarketSnapshot {
                 perp_symbol: perp,
                 spot_symbol: spot,
@@ -200,7 +200,7 @@ impl FundingArbMarketScanner for LiveFundingArbScanner {
         ) else {
             return Ok(None);
         };
-        let volumes = self.volumes(perp_symbol, spot_symbol).await;
+        let volumes = self.volumes(perp_symbol, spot_symbol, spot_symbol).await;
         Ok(Some(FundingArbMarketSnapshot {
             perp_symbol: perp_symbol.to_string(),
             spot_symbol: spot_symbol.to_string(),
@@ -217,7 +217,12 @@ impl FundingArbMarketScanner for LiveFundingArbScanner {
 impl LiveFundingArbScanner {
     /// 24h notional volumes from the asset-ctxs (perp `dayNtlVlm`) and spot
     /// (`dayNtlVlm` on spot pairs). Falls back to 0.
-    async fn volumes(&self, perp: &str, _spot: &str) -> (Decimal, Decimal) {
+    async fn volumes(
+        &self,
+        perp: &str,
+        spot_exchange: &str,
+        spot_display: &str,
+    ) -> (Decimal, Decimal) {
         let ctxs = match self.rest.get_meta_and_asset_ctxs().await {
             Ok(v) => v,
             Err(_) => return (Decimal::ZERO, Decimal::ZERO),
@@ -245,7 +250,7 @@ impl LiveFundingArbScanner {
                     .and_then(|v| v.as_str())
                     .and_then(|s| Decimal::from_str_lenient(s).ok())
                     .unwrap_or(Decimal::ZERO);
-                if coin == perp {
+                if coin == spot_exchange || coin == spot_display {
                     spot_v = vol;
                 }
             }

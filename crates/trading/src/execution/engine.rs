@@ -238,13 +238,6 @@ impl ExecutionEngine {
         deferred: Option<bool>,
     ) -> Result<Order, HypeEdgeError> {
         // Spot validity gates (unconditional).
-        if intent.is_spot {
-            return Err(HypeEdgeError::order_rejected(
-                "Hyperliquid spot execution is not enabled for this deployment",
-                intent.cloid.clone(),
-                Some("spot_execution_not_enabled".to_string()),
-            ));
-        }
         if intent.is_spot && intent.reduce_only {
             return Err(HypeEdgeError::order_rejected(
                 "Spot orders cannot use reduce_only",
@@ -880,6 +873,25 @@ impl ExecutionEngine {
                             OrderStatus::Filled,
                             Some("status_query_filled"),
                         )?;
+                        let order_payload = status_data
+                            .get("order")
+                            .filter(|v| v.is_object())
+                            .unwrap_or(&status_data);
+                        if let Some(total_sz) = order_payload
+                            .get("totalSz")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Decimal::from_str_lenient(s).ok())
+                        {
+                            order.filled_size = Size::new(total_sz.max(order.filled_size.inner()));
+                        }
+                        if let Some(avg_px) = order_payload
+                            .get("avgPx")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Decimal::from_str_lenient(s).ok())
+                            .filter(|d| *d > Decimal::ZERO)
+                        {
+                            order.avg_fill_price = Some(Price::new(avg_px));
+                        }
                         order.filled_at = Some(Utc::now());
                         self.persist_transition(order, "filled", command_id, Some("succeeded"))
                             .await?;
@@ -1021,6 +1033,25 @@ impl ExecutionEngine {
                             OrderStatus::Filled,
                             Some("cancel_status_filled"),
                         )?;
+                        let order_payload = status_data
+                            .get("order")
+                            .filter(|v| v.is_object())
+                            .unwrap_or(&status_data);
+                        if let Some(total_sz) = order_payload
+                            .get("totalSz")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Decimal::from_str_lenient(s).ok())
+                        {
+                            order.filled_size = Size::new(total_sz.max(order.filled_size.inner()));
+                        }
+                        if let Some(avg_px) = order_payload
+                            .get("avgPx")
+                            .and_then(|v| v.as_str())
+                            .and_then(|s| Decimal::from_str_lenient(s).ok())
+                            .filter(|d| *d > Decimal::ZERO)
+                        {
+                            order.avg_fill_price = Some(Price::new(avg_px));
+                        }
                         order.filled_at = Some(Utc::now());
                         order.error_message = Some("cancel_not_applied_order_filled".into());
                         self.persist_transition(order, "filled", command_id, Some("failed"))
@@ -2380,7 +2411,10 @@ mod tests {
         let exchange: Arc<dyn ExchangeClient> = Arc::new(
             MockExchange::new(vec![])
                 .with_order_error()
-                .with_query(serde_json::json!({"status": "order", "order": {"status": "filled"}})),
+                .with_query(serde_json::json!({
+                    "status": "order",
+                    "order": {"status": "filled", "totalSz": "1.0", "avgPx": "49950"}
+                })),
         );
         let engine = base_engine(exchange);
         let order = engine.submit_order(limit_intent(), None).await.unwrap();
@@ -2390,6 +2424,8 @@ mod tests {
             "cloid resolution must apply the authoritative outcome"
         );
         assert!(order.filled_at.is_some());
+        assert_eq!(order.filled_size.to_string(), "1");
+        assert_eq!(order.avg_fill_price.unwrap().to_string(), "49950");
     }
 
     #[tokio::test]

@@ -30,7 +30,11 @@ pub async fn system_status(State(state): State<AppState>) -> Response {
         "safety_mode": safety_mode,
         "safety_reason": safety_mode,
         "shutting_down": false,
-        "meta_loaded": false,
+        "meta_loaded": state
+            .instrument_meta
+            .as_ref()
+            .map(|m| m.is_loaded())
+            .unwrap_or(false),
         "features": {
             "durable_ledger_v2": features.durable_ledger_v2,
             "execution_v2": features.execution_v2,
@@ -59,7 +63,11 @@ pub async fn bootstrap(State(state): State<AppState>) -> Response {
             "safety_mode": *state.safety_mode.read().await,
             "safety_reason": *state.safety_mode.read().await,
             "shutting_down": false,
-            "meta_loaded": false,
+            "meta_loaded": state
+                .instrument_meta
+                .as_ref()
+                .map(|m| m.is_loaded())
+                .unwrap_or(false),
         },
         "positions": [],
         "server_time": now.to_rfc3339(),

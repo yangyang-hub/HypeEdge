@@ -68,6 +68,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/strategies/{strategy_id}/config-versions",
             post(routes::strategies::create_config_version),
+        )
+        .route(
+            "/strategies/{strategy_id}/config-versions/{version}/activate",
+            post(routes::strategies::activate_config_version),
         );
 
     Router::new()

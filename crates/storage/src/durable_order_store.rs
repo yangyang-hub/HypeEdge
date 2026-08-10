@@ -518,7 +518,10 @@ impl PostgresDurableOrderStore {
         })
     }
 
-    /// The reference price for a reservation: order price > supplied > position mark.
+    /// The reference price for a reservation: supplied market reference >
+    /// order price > position mark (A16: the order must not control the
+    /// notional used by risk checks — a marketable limit can fill far from
+    /// its own limit).
     async fn reference_price<'c, E>(
         &self,
         executor: E,
@@ -528,15 +531,15 @@ impl PostgresDurableOrderStore {
     where
         E: sqlx::Executor<'c, Database = Postgres>,
     {
-        if let Some(price) = order.price
-            && price.inner() > Decimal::ZERO
-        {
-            return Ok(price.inner());
-        }
         if let Some(supplied) = supplied_reference_price
             && supplied > Decimal::ZERO
         {
             return Ok(supplied);
+        }
+        if let Some(price) = order.price
+            && price.inner() > Decimal::ZERO
+        {
+            return Ok(price.inner());
         }
         let mark: Option<BigDecimal> = if order.sub_account.is_none() {
             sqlx::query_scalar(
@@ -951,7 +954,6 @@ fn merge_transport_transition(record: &OrderRow, order: &Order) -> Result<Order,
         OrderStatus::Submitted,
         OrderStatus::SubmitUnknown,
         OrderStatus::Acknowledged,
-        OrderStatus::Filled,
     ];
     let preserve_current = terminal.contains(&current_status)
         || (current_status == OrderStatus::PartialFill
@@ -1083,4 +1085,64 @@ async fn append_event_rows(
     .await
     .map_err(map_sqlx)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bigdecimal::BigDecimal;
+    use chrono::Utc;
+    use hypeedge_domain::decimal::Decimal as D;
+    use hypeedge_domain::decimal::Size;
+
+    fn row(status: &str) -> OrderRow {
+        OrderRow {
+            order_id: Uuid::new_v4(),
+            command_id: Uuid::new_v4(),
+            cloid: "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
+            symbol: "BTC".into(),
+            side: "buy".into(),
+            order_type: "limit".into(),
+            time_in_force: "Gtc".into(),
+            size: BigDecimal::from(1),
+            price: Some(BigDecimal::from(100)),
+            status: status.into(),
+            strategy_id: None,
+            sub_account: None,
+            reduce_only: false,
+            is_spot: false,
+            risk_reducing: false,
+            max_slippage_bps: 50,
+            filled_size: BigDecimal::from(0),
+            avg_fill_price: None,
+            revision: 1,
+            error_message: None,
+            exchange_oid: None,
+            submitted_at: Some(Utc::now()),
+            acknowledged_at: None,
+            filled_at: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn partial_fill_to_filled_is_persisted() {
+        let record = row("partial_fill");
+        let mut incoming = to_domain(record.clone()).unwrap();
+        incoming.status = OrderStatus::Filled;
+        incoming.filled_size = Size::new(D::ONE);
+        let merged = merge_transport_transition(&record, &incoming).unwrap();
+        assert_eq!(merged.status, OrderStatus::Filled);
+        assert_eq!(merged.filled_size.inner(), D::ONE);
+    }
+
+    #[test]
+    fn partial_fill_does_not_regress_to_acknowledged() {
+        let record = row("partial_fill");
+        let mut incoming = to_domain(record.clone()).unwrap();
+        incoming.status = OrderStatus::Acknowledged;
+        let merged = merge_transport_transition(&record, &incoming).unwrap();
+        assert_eq!(merged.status, OrderStatus::PartialFill);
+    }
 }

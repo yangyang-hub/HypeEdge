@@ -19,7 +19,7 @@ pub use inventory::{InventoryController, InventoryDecision};
 pub use models::{ActionBudgetSnapshot, InventorySnapshot, MarketFeatures, MarketMakerConfig};
 pub use policy::MarketMakerPolicy;
 pub use runtime::{
-    MarketMakerRuntime, MarketMakerRuntimeHandle, MarketMakerRuntimeSnapshot, QuoteCancelRequest,
-    QuotePlanCommandClient,
+    MarketMakerRuntime, MarketMakerRuntimeFactory, MarketMakerRuntimeHandle,
+    MarketMakerRuntimeSnapshot, QuoteCancelRequest, QuotePlanCommandClient,
 };
 pub use shadow::{ShadowActionEstimate, ShadowOrderState};

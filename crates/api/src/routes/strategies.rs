@@ -6,6 +6,7 @@
 //! wiring lands.
 
 use axum::extract::{Extension, Path, State};
+use axum::http::HeaderMap;
 use axum::response::Response;
 
 use crate::auth::{ApiRole, authorize};
@@ -13,7 +14,10 @@ use crate::errors::{ApiProblem, ok};
 use crate::middleware::RoleGuard;
 use crate::state::AppState;
 use axum::response::IntoResponse;
-use hypeedge_trading::strategy::StrategyStateStore;
+use hypeedge_trading::strategy::{
+    default_funding_arb_config, default_market_maker_config, default_trend_follow_config_values,
+    normalize_funding_arb_config, normalize_market_maker_config, normalize_trend_follow_config,
+};
 
 /// The `AUTO` market symbol (funding-arb scopes the whole account).
 const AUTO_MARKET_SYMBOL: &str = "AUTO";
@@ -102,29 +106,73 @@ pub async fn create_strategy(
         .get("initial_config")
         .cloned()
         .unwrap_or(serde_json::json!({}));
+    let config = merge_config_defaults(&strategy_type, config);
+    let config = match strategy_type.as_str() {
+        "trend_follow" => normalize_trend_follow_config(&config),
+        "market_maker" => normalize_market_maker_config(&config),
+        "funding_arb" => normalize_funding_arb_config(&config),
+        _ => Err(
+            hypeedge_domain::error::HypeEdgeError::StrategyRegistration {
+                message: format!("unknown strategy_type {strategy_type}"),
+            },
+        ),
+    };
+    let config = match config {
+        Ok(c) => c,
+        Err(e) => {
+            return ApiProblem::new(
+                422,
+                "REQUEST_VALIDATION_FAILED",
+                format!("invalid strategy config: {e}"),
+            )
+            .into_response();
+        }
+    };
+    let sub_account = if state.settings.exchange.account_address.is_empty() {
+        "0x0000000000000000000000000000000000000000".to_string()
+    } else {
+        state.settings.exchange.account_address.to_lowercase()
+    };
     let instance = hypeedge_trading::strategy::StrategyInstanceDefinition {
         strategy_id,
         strategy_type,
-        sub_account: "0x0000000000000000000000000000000000000000".into(),
+        sub_account,
         symbol,
         desired_state: hypeedge_domain::enums::MarketMakerLifecycle::Stopped,
         desired_config_revision: 1,
         revision: 0,
     };
-    state
+    if let Err(e) = state
         .strategies
         .state_store
-        .insert_instance(instance.clone())
-        .await;
-    state
+        .upsert_instance(&instance)
+        .await
+    {
+        return ApiProblem::new(
+            409,
+            "STRATEGY_CREATE_FAILED",
+            format!("failed to persist strategy: {e}"),
+        )
+        .into_response();
+    }
+    let config_snapshot = hypeedge_trading::strategy::StrategyConfigSnapshot {
+        strategy_id: instance.strategy_id.clone(),
+        revision: 1,
+        values: config,
+    };
+    if let Err(e) = state
         .strategies
         .state_store
-        .insert_config(hypeedge_trading::strategy::StrategyConfigSnapshot {
-            strategy_id: instance.strategy_id.clone(),
-            revision: 1,
-            values: config,
-        })
-        .await;
+        .upsert_config(&config_snapshot)
+        .await
+    {
+        return ApiProblem::new(
+            409,
+            "STRATEGY_CREATE_FAILED",
+            format!("failed to persist strategy config: {e}"),
+        )
+        .into_response();
+    }
     ok(strategy_payload(&instance))
 }
 
@@ -276,6 +324,7 @@ pub async fn list_config_versions(
 pub async fn create_config_version(
     State(state): State<AppState>,
     Extension(guard): Extension<RoleGuard>,
+    headers: HeaderMap,
     Path(strategy_id): Path<String>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
@@ -298,6 +347,7 @@ pub async fn create_config_version(
         .unwrap_or("")
         .to_string();
     let config = body.get("config").cloned().unwrap_or(serde_json::json!({}));
+    let config = merge_config_defaults(&strategy_type, config);
     if strategy_type.is_empty() {
         return ApiProblem::new(
             422,
@@ -306,12 +356,90 @@ pub async fn create_config_version(
         )
         .into_response();
     }
+    let config = match strategy_type.as_str() {
+        "trend_follow" => normalize_trend_follow_config(&config),
+        "market_maker" => normalize_market_maker_config(&config),
+        "funding_arb" => normalize_funding_arb_config(&config),
+        _ => Err(
+            hypeedge_domain::error::HypeEdgeError::StrategyRegistration {
+                message: format!("unknown strategy_type {strategy_type}"),
+            },
+        ),
+    };
+    let config = match config {
+        Ok(c) => c,
+        Err(e) => {
+            return ApiProblem::new(
+                422,
+                "REQUEST_VALIDATION_FAILED",
+                format!("invalid strategy config: {e}"),
+            )
+            .into_response();
+        }
+    };
+    let expected_revision = headers
+        .get("if-match")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok());
     match store
-        .create_config_version(&strategy_id, &strategy_type, &config, "api", None)
+        .create_config_version(
+            &strategy_id,
+            &strategy_type,
+            &config,
+            "api",
+            expected_revision,
+        )
         .await
     {
         Ok(record) => ok(serde_json::json!({ "data": config_version_payload(&record) })),
         Err(e) => ApiProblem::new(409, "CONFIG_VERSION_CONFLICT", e.to_string()).into_response(),
+    }
+}
+
+fn merge_config_defaults(strategy_type: &str, config: serde_json::Value) -> serde_json::Value {
+    let defaults = match strategy_type {
+        "trend_follow" => default_trend_follow_config_values(),
+        "market_maker" => default_market_maker_config(),
+        "funding_arb" => default_funding_arb_config(),
+        _ => serde_json::json!({}),
+    };
+    let mut merged = defaults.as_object().cloned().unwrap_or_default();
+    if let Some(supplied) = config.as_object() {
+        for (k, v) in supplied {
+            merged.insert(k.clone(), v.clone());
+        }
+    }
+    serde_json::Value::Object(merged)
+}
+
+/// `POST /api/v1/strategies/{strategy_id}/config-versions/{version}/activate`.
+pub async fn activate_config_version(
+    State(state): State<AppState>,
+    Extension(guard): Extension<RoleGuard>,
+    headers: HeaderMap,
+    Path((strategy_id, version)): Path<(String, u64)>,
+    axum::Json(body): axum::Json<serde_json::Value>,
+) -> Response {
+    // A23: config activation requires Operator.
+    if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
+        return *resp;
+    }
+    let expected_revision = headers
+        .get("if-match")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| body.get("expected_revision").and_then(|v| v.as_u64()));
+    match state
+        .strategies
+        .supervisor
+        .activate_config(&strategy_id, version, expected_revision)
+        .await
+    {
+        Ok(()) => ok(serde_json::json!({
+            "strategy_id": strategy_id,
+            "activated_config_version": version,
+        })),
+        Err(e) => ApiProblem::new(409, "CONFIG_VERSION_CONFLICT", e).into_response(),
     }
 }
 
@@ -358,6 +486,7 @@ mod config_version_tests {
         let resp = create_config_version(
             State(state),
             Extension(RoleGuard(crate::auth::ApiRole::Admin)),
+            HeaderMap::new(),
             Path("tf_1".into()),
             axum::Json(serde_json::json!({
                 "strategy_type": "trend_follow",

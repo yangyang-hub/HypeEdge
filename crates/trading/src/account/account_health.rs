@@ -387,6 +387,12 @@ pub struct PolledAccountSnapshot {
     pub spot_balances: Vec<SpotBalance>,
 }
 
+/// Durable sink for authoritative clearinghouse snapshots (Postgres).
+#[async_trait::async_trait]
+pub trait AccountSnapshotSink: Send + Sync {
+    async fn persist(&self, snapshot: &PolledAccountSnapshot) -> Result<(), String>;
+}
+
 /// Async clearinghouse-state source used by [`AccountStatePoller`].
 #[async_trait::async_trait]
 pub trait AccountStateSource: Send + Sync {
@@ -405,6 +411,7 @@ pub struct AccountStatePoller {
     source: Arc<dyn AccountStateSource>,
     tracker: Arc<AccountTracker>,
     health: Arc<dyn MutableAccountHealthProvider>,
+    snapshot_sink: Option<Arc<dyn AccountSnapshotSink>>,
     normal_interval: Duration,
     near_risk_interval: Duration,
     risk_proximity_evaluator: RiskProximityEvaluator,
@@ -414,10 +421,12 @@ pub struct AccountStatePoller {
 }
 
 impl AccountStatePoller {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: Arc<dyn AccountStateSource>,
         tracker: Arc<AccountTracker>,
         health: Arc<dyn MutableAccountHealthProvider>,
+        snapshot_sink: Option<Arc<dyn AccountSnapshotSink>>,
         normal_interval_seconds: f64,
         near_risk_interval_seconds: f64,
         risk_proximity_evaluator: Option<RiskProximityEvaluator>,
@@ -438,6 +447,7 @@ impl AccountStatePoller {
             source,
             tracker,
             health,
+            snapshot_sink,
             normal_interval: Duration::from_secs_f64(normal_interval_seconds),
             near_risk_interval: Duration::from_secs_f64(near_risk_interval_seconds),
             risk_proximity_evaluator: risk_proximity_evaluator
@@ -458,6 +468,11 @@ impl AccountStatePoller {
             Ok(snapshot) => {
                 let received_at = snapshot.received_at;
                 self.apply_snapshot(&snapshot);
+                if let Some(sink) = &self.snapshot_sink
+                    && let Err(e) = sink.persist(&snapshot).await
+                {
+                    tracing::warn!(error = %e, "account_snapshot_persist_failed");
+                }
                 self.health
                     .record_success(AccountHealthDimension::Clearinghouse, Some(received_at));
                 self.health
@@ -885,6 +900,7 @@ mod tests {
                 source.clone(),
                 tracker.clone(),
                 health.clone(),
+                None,
                 6.0,
                 1.0,
                 None,
@@ -897,6 +913,7 @@ mod tests {
                 source.clone(),
                 tracker.clone(),
                 health.clone(),
+                None,
                 3.0,
                 3.0,
                 None,
@@ -904,7 +921,9 @@ mod tests {
             )
             .is_err()
         );
-        assert!(AccountStatePoller::new(source, tracker, health, 3.0, 1.0, None, None).is_ok());
+        assert!(
+            AccountStatePoller::new(source, tracker, health, None, 3.0, 1.0, None, None).is_ok()
+        );
     }
 
     struct FailSource;
@@ -923,7 +942,8 @@ mod tests {
         let health: Arc<dyn MutableAccountHealthProvider> =
             Arc::new(LayeredAccountHealthProvider::default());
         let poller =
-            AccountStatePoller::new(source, tracker, health.clone(), 3.0, 1.0, None, None).unwrap();
+            AccountStatePoller::new(source, tracker, health.clone(), None, 3.0, 1.0, None, None)
+                .unwrap();
         let interval = poller.poll_once().await;
         assert_eq!(interval, Duration::from_secs(1));
         let snapshot = health.get_account_health(None);

@@ -26,6 +26,7 @@ pub type TrendStrategyFactory =
 pub struct TrendFollowRuntimeHandle {
     strategy_id: String,
     strategy: Arc<tokio::sync::Mutex<TrendFollowStrategy>>,
+    config_error: Option<String>,
     stop_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<()>>>>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), String>>>>,
     /// The process event bus the runner subscribes to (A4). Previously the
@@ -43,6 +44,7 @@ impl TrendFollowRuntimeHandle {
         Self {
             strategy_id,
             strategy: Arc::new(tokio::sync::Mutex::new(strategy)),
+            config_error: None,
             stop_tx: Arc::new(tokio::sync::Mutex::new(None)),
             task: tokio::sync::Mutex::new(None),
             event_bus,
@@ -57,6 +59,9 @@ impl TrendFollowRuntimeHandle {
 #[async_trait]
 impl StrategyRuntimeHandle for TrendFollowRuntimeHandle {
     async fn start(&self) -> Result<(), String> {
+        if let Some(e) = &self.config_error {
+            return Err(format!("trend-follow config error: {e}"));
+        }
         let mut task_guard = self.task.lock().await;
         if task_guard.is_some() {
             return Ok(()); // idempotent
@@ -215,7 +220,7 @@ pub fn build_trend_follow_plugin(
                         error = %e,
                         "trend_follow_config_decode_failed"
                     );
-                    return Arc::new(TrendFollowRuntimeHandle::new(
+                    let mut handle = TrendFollowRuntimeHandle::new(
                         ctx.instance.strategy_id.clone(),
                         TrendFollowStrategy::new(
                             ctx.instance.strategy_id.clone(),
@@ -224,8 +229,16 @@ pub fn build_trend_follow_plugin(
                             tracker.clone(),
                         ),
                         event_bus.clone(),
-                    ));
+                    );
+                    handle.config_error = Some(e);
+                    return Arc::new(handle);
                 }
+            };
+            let mut params = params;
+            params.symbol = if ctx.instance.symbol.is_empty() {
+                "BTC".to_string()
+            } else {
+                ctx.instance.symbol.clone()
             };
             let strategy = TrendFollowStrategy::new(
                 ctx.instance.strategy_id.clone(),

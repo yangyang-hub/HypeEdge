@@ -19,11 +19,14 @@ use hypeedge_domain::enums::{
 };
 use hypeedge_domain::models::{L2BookSnapshot, Order, OrderIntent, Position};
 use hypeedge_domain::traits::ExecutionClient;
+use tokio::sync::mpsc;
 
 use super::models::{FundingArbCycle, FundingArbParams};
 use super::scanner::{FundingArbMarketScanner, FundingArbMarketSnapshot};
 use super::store::FundingArbCycleStore;
-use crate::strategy::registry::{StrategyConfigSnapshot, StrategyRuntimeHandle};
+use crate::strategy::registry::{
+    FaultedRuntimeHandle, StrategyConfigSnapshot, StrategyRuntimeHandle,
+};
 
 /// Instrument metadata the runtime needs (a subset of `InstrumentInfo`).
 #[derive(Debug, Clone)]
@@ -85,9 +88,9 @@ pub struct FundingArbRuntimeDependencies {
     pub tracker: Arc<dyn FundingArbAccountView>,
     pub cycles: Arc<dyn FundingArbCycleStore>,
     pub meta: Arc<dyn FundingArbInstrumentMeta>,
-    pub trading_ready: Box<dyn Fn() -> bool + Send + Sync>,
-    pub kill_switch_active: Box<dyn Fn() -> bool + Send + Sync>,
-    pub account_allows_risk_increase: Box<dyn Fn() -> bool + Send + Sync>,
+    pub trading_ready: Box<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>,
+    pub kill_switch_active: Box<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>,
+    pub account_allows_risk_increase: Box<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>,
     pub reconcile: Box<dyn Fn() -> BoxFuture<'static, bool> + Send + Sync>,
     pub deployment: FundingArbDeployment,
     pub account_address: String,
@@ -406,6 +409,122 @@ impl FundingArbRuntimeHandle {
                 "instrument metadata mismatch for cycle {}",
                 cycle.cycle_id
             ));
+        }
+        Ok(())
+    }
+
+    /// Recover a cycle that was open when the process restarted (A19).
+    pub async fn recover_active_cycle(&self) -> Result<(), String> {
+        let Some(deps) = self.deps.clone() else {
+            return Ok(());
+        };
+        let Some(cycle) = deps.cycles.get_active(&self.strategy_id).await? else {
+            return Ok(());
+        };
+        match cycle.state {
+            FundingArbCycleState::Open
+            | FundingArbCycleState::Rebalancing
+            | FundingArbCycleState::ExitingPerp
+            | FundingArbCycleState::ExitingSpot => {
+                tracing::info!(
+                    strategy_id = %self.strategy_id,
+                    cycle_id = %cycle.cycle_id,
+                    state = cycle.state.as_str(),
+                    "funding_arb_recovered_active_cycle"
+                );
+                *self.cycle.lock().await = Some(cycle);
+            }
+            _ => {
+                tracing::error!(
+                    strategy_id = %self.strategy_id,
+                    cycle_state = cycle.state.as_str(),
+                    "funding_arb_recovered_unresumable_cycle_faulting"
+                );
+                *self.cycle.lock().await = Some(cycle.clone());
+                self.transition(
+                    FundingArbCycleState::Faulted,
+                    "cycle_recovery_faulted",
+                    Some(serde_json::json!({
+                        "error_code": "unresumable_cycle_state",
+                        "error_message": format!(
+                            "recovered cycle in {} state",
+                            cycle.state.as_str()
+                        ),
+                    })),
+                    serde_json::json!({
+                        "error_code": "unresumable_cycle_state",
+                    }),
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// One driver tick: entry scanning when flat; rebalance/exit when open.
+    pub async fn tick(&self) -> Result<(), String> {
+        let Some(deps) = self.deps.clone() else {
+            return Ok(());
+        };
+        let cycle = self.cycle.lock().await.clone();
+        let Some(cycle) = cycle else {
+            if !*self.allow_entry.lock().await {
+                *self.entry_block_reason.lock().await = Some("entry_disabled_by_lifecycle".into());
+                return Ok(());
+            }
+            if (deps.kill_switch_active)().await
+                || !(deps.trading_ready)().await
+                || !(deps.account_allows_risk_increase)().await
+            {
+                *self.entry_block_reason.lock().await = Some("safety_gates_blocked".into());
+                return Ok(());
+            }
+            *self.entry_block_reason.lock().await = None;
+            let candidates = deps.scanner.scan().await?;
+            for candidate in candidates {
+                let Some(perp_meta) = deps.meta.get(&candidate.perp_symbol) else {
+                    continue;
+                };
+                let spot_meta = deps
+                    .meta
+                    .get(&candidate.spot_symbol)
+                    .or_else(|| deps.meta.get(&candidate.spot_display));
+                let Some(spot_meta) = spot_meta else {
+                    continue;
+                };
+                if let Ok(Some(plan)) =
+                    self.candidate_plan(&candidate, &perp_meta, &spot_meta, Utc::now())
+                {
+                    self.open_cycle(&plan).await?;
+                    break;
+                }
+            }
+            return Ok(());
+        };
+
+        if (deps.kill_switch_active)().await {
+            return self.close_cycle("kill_switch_active").await;
+        }
+        if matches!(
+            cycle.state,
+            FundingArbCycleState::Open | FundingArbCycleState::Rebalancing
+        ) {
+            if cycle.state == FundingArbCycleState::Open
+                && let Ok(Some(snapshot)) = deps
+                    .scanner
+                    .get_market(&cycle.perp_symbol, &cycle.spot_symbol)
+                    .await
+                && snapshot.funding_rate <= self.params.exit_funding_rate
+            {
+                return self.close_cycle("funding_exit_threshold").await;
+            }
+            return self.rebalance_if_needed().await;
+        }
+        if matches!(
+            cycle.state,
+            FundingArbCycleState::ExitingPerp | FundingArbCycleState::ExitingSpot
+        ) {
+            return self.close_cycle("resume_interrupted_exit").await;
         }
         Ok(())
     }
@@ -1353,87 +1472,51 @@ pub fn build_funding_arb_plugin(
                 let strategy_id = ctx.instance.strategy_id.clone();
                 let config_revision = ctx.config.revision;
                 let deps = deps.clone();
-                let handle = FundingArbRuntimeHandle::new(
+                match FundingArbRuntimeHandle::new(
                     strategy_id,
                     params,
                     config_revision,
                     sub_account,
                     deps,
-                )
-                .unwrap_or_else(|e| {
-                    // A construction failure is fatal at factory time; expose a
-                    // faulted handle is not possible without deps, so panic with a
-                    // clear message (the supervisor would catch registration errors).
-                    panic!("funding-arb runtime construction failed: {e}")
-                });
-                Arc::new(FundingArbRuntimeAdapter {
-                    inner: tokio::sync::Mutex::new(handle),
-                })
+                ) {
+                    Ok(handle) => Arc::new(FundingArbRuntimeAdapter {
+                        inner: Arc::new(tokio::sync::Mutex::new(handle)),
+                        stop_tx: tokio::sync::Mutex::new(None),
+                        task: tokio::sync::Mutex::new(None),
+                    }),
+                    Err(e) => Arc::new(FaultedRuntimeHandle {
+                        message: format!("funding-arb runtime construction failed: {e}"),
+                    }),
+                }
             },
         ),
     }
 }
 
-/// Adapter that maps `FundingArbRuntimeHandle` to `StrategyRuntimeHandle`.
+/// Adapter that maps `FundingArbRuntimeHandle` to `StrategyRuntimeHandle` and
+/// drives the live scan/open/rebalance/close loop while the strategy runs.
 pub struct FundingArbRuntimeAdapter {
-    inner: tokio::sync::Mutex<FundingArbRuntimeHandle>,
+    inner: Arc<tokio::sync::Mutex<FundingArbRuntimeHandle>>,
+    stop_tx: tokio::sync::Mutex<Option<mpsc::Sender<()>>>,
+    task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), String>>>>,
 }
 
 #[async_trait]
 impl StrategyRuntimeHandle for FundingArbRuntimeAdapter {
     async fn start(&self) -> Result<(), String> {
-        let handle = self.inner.lock().await;
-        let mut started = handle.started.lock().await;
-        *started = true;
-        // A19: recover a cycle that was open when the process restarted. The
-        // in-memory binding is empty after a restart, so without this the
-        // runtime would never rebalance/close the persisted hedge, and a later
-        // `open_cycle` would violate the active-cycle unique index forever.
-        if let Some(deps) = handle.deps.clone()
-            && let Some(cycle) = deps.cycles.get_active(&handle.strategy_id).await?
+        let handle = self.inner.clone();
         {
-            match cycle.state {
-                FundingArbCycleState::Open
-                | FundingArbCycleState::Rebalancing
-                | FundingArbCycleState::ExitingPerp
-                | FundingArbCycleState::ExitingSpot => {
-                    tracing::info!(
-                        strategy_id = %handle.strategy_id,
-                        cycle_id = %cycle.cycle_id,
-                        state = cycle.state.as_str(),
-                        "funding_arb_recovered_active_cycle"
-                    );
-                    *handle.cycle.lock().await = Some(cycle);
-                }
-                _ => {
-                    // An entry-intermediate state cannot be resumed safely;
-                    // fault it so the operator can intervene (exposure is
-                    // handled by reconciliation, not silently left managed).
-                    tracing::error!(
-                        strategy_id = %handle.strategy_id,
-                        cycle_state = cycle.state.as_str(),
-                        "funding_arb_recovered_unresumable_cycle_faulting"
-                    );
-                    *handle.cycle.lock().await = Some(cycle.clone());
-                    handle
-                        .transition(
-                            FundingArbCycleState::Faulted,
-                            "cycle_recovery_faulted",
-                            Some(serde_json::json!({
-                                "error_code": "unresumable_cycle_state",
-                                "error_message": format!(
-                                    "recovered cycle in {} state",
-                                    cycle.state.as_str()
-                                ),
-                            })),
-                            serde_json::json!({
-                                "error_code": "unresumable_cycle_state",
-                            }),
-                        )
-                        .await?;
-                }
+            let guard = self.inner.lock().await;
+            if *guard.started.lock().await {
+                return Ok(()); // idempotent
             }
+            guard.recover_active_cycle().await?;
+            *guard.started.lock().await = true;
         }
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+        *self.stop_tx.lock().await = Some(stop_tx);
+        let task = tokio::spawn(async move { Self::run_driver(handle, stop_rx).await });
+        *self.task.lock().await = Some(task);
         Ok(())
     }
     async fn set_mode(&self, mode: MarketMakerLifecycle) -> Result<(), String> {
@@ -1442,6 +1525,7 @@ impl StrategyRuntimeHandle for FundingArbRuntimeAdapter {
             MarketMakerLifecycle::Warming | MarketMakerLifecycle::Shadow => Ok(()),
             MarketMakerLifecycle::Running => {
                 *handle.allow_entry.lock().await = true;
+                *handle.entry_block_reason.lock().await = None;
                 Ok(())
             }
             MarketMakerLifecycle::Paused | MarketMakerLifecycle::Faulted => {
@@ -1468,9 +1552,55 @@ impl StrategyRuntimeHandle for FundingArbRuntimeAdapter {
         Ok(())
     }
     async fn stop(&self) -> Result<(), String> {
-        let handle = self.inner.lock().await;
-        *handle.allow_entry.lock().await = false;
-        *handle.started.lock().await = false;
+        {
+            let handle = self.inner.lock().await;
+            *handle.allow_entry.lock().await = false;
+            *handle.started.lock().await = false;
+        }
+        if let Some(tx) = self.stop_tx.lock().await.take() {
+            let _ = tx.send(()).await;
+        }
+        if let Some(task) = self.task.lock().await.take() {
+            let _ = task.await;
+        }
+        Ok(())
+    }
+}
+
+impl FundingArbRuntimeAdapter {
+    /// The live driver: scan candidates while flat, and rebalance/close while
+    /// a cycle is open. Rebalancing and closing are never gated by `allow_entry`
+    /// — safety exits must always work.
+    async fn run_driver(
+        handle: Arc<tokio::sync::Mutex<FundingArbRuntimeHandle>>,
+        mut stop_rx: mpsc::Receiver<()>,
+    ) -> Result<(), String> {
+        let interval = handle
+            .lock()
+            .await
+            .deps
+            .as_ref()
+            .map(|d| d.deployment.poll_interval_seconds)
+            .unwrap_or(5.0)
+            .max(0.5);
+        loop {
+            tokio::select! {
+                _ = stop_rx.recv() => break,
+                _ = tokio::time::sleep(Duration::from_secs_f64(interval)) => {}
+            }
+            let guard = handle.lock().await;
+            if !*guard.started.lock().await {
+                break;
+            }
+            if let Err(e) = guard.tick().await {
+                tracing::error!(
+                    strategy_id = %guard.strategy_id,
+                    error = %e,
+                    "funding_arb_driver_tick_error"
+                );
+            }
+            drop(guard);
+        }
         Ok(())
     }
 }
@@ -1528,9 +1658,9 @@ mod tests {
             tracker: Arc::new(NoopTracker),
             cycles: Arc::new(NoopStore),
             meta: Arc::new(FakeMeta),
-            trading_ready: Box::new(|| true),
-            kill_switch_active: Box::new(|| false),
-            account_allows_risk_increase: Box::new(|| true),
+            trading_ready: Box::new(|| Box::pin(async { true })),
+            kill_switch_active: Box::new(|| Box::pin(async { false })),
+            account_allows_risk_increase: Box::new(|| Box::pin(async { true })),
             reconcile: Box::new(|| Box::pin(async { true })),
             deployment: FundingArbDeployment {
                 max_notional_usd: Decimal::from_str_lenient("500").unwrap(),
@@ -2000,9 +2130,9 @@ mod tests {
             tracker: Arc::new(env.clone()),
             cycles: Arc::new(env.clone()),
             meta: Arc::new(env.clone()),
-            trading_ready: Box::new(|| true),
-            kill_switch_active: Box::new(|| false),
-            account_allows_risk_increase: Box::new(|| true),
+            trading_ready: Box::new(|| Box::pin(async { true })),
+            kill_switch_active: Box::new(|| Box::pin(async { false })),
+            account_allows_risk_increase: Box::new(|| Box::pin(async { true })),
             reconcile: Box::new(|| Box::pin(async { true })),
             deployment: FundingArbDeployment {
                 max_notional_usd: Decimal::from_str_lenient("500").unwrap(),
@@ -2179,7 +2309,9 @@ mod tests {
         env.state.lock().unwrap().current_cycle = Some(cycle_in_state(FundingArbCycleState::Open));
         let handle = scripted_runtime(&env);
         let adapter = FundingArbRuntimeAdapter {
-            inner: tokio::sync::Mutex::new(handle),
+            inner: Arc::new(tokio::sync::Mutex::new(handle)),
+            stop_tx: tokio::sync::Mutex::new(None),
+            task: tokio::sync::Mutex::new(None),
         };
         adapter.start().await.unwrap();
         assert!(
@@ -2192,7 +2324,9 @@ mod tests {
             Some(cycle_in_state(FundingArbCycleState::EnteringSpot));
         let handle2 = scripted_runtime(&env2);
         let adapter2 = FundingArbRuntimeAdapter {
-            inner: tokio::sync::Mutex::new(handle2),
+            inner: Arc::new(tokio::sync::Mutex::new(handle2)),
+            stop_tx: tokio::sync::Mutex::new(None),
+            task: tokio::sync::Mutex::new(None),
         };
         adapter2.start().await.unwrap();
         let states = env2.state.lock().unwrap().cycle_states.clone();
