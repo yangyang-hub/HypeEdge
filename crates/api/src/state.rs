@@ -158,7 +158,11 @@ impl AppState {
             Arc<hypeedge_trading::funding_arb::runtime::FundingArbRuntimeDependencies>,
         >,
         mm_runtime: Option<Arc<hypeedge_trading::market_maker::MarketMakerRuntime>>,
+        account_tracker: Arc<hypeedge_trading::account::AccountTracker>,
     ) -> Self {
+        // The wired account tracker is the one the clearinghouse poller fills;
+        // AppState::new created an empty one that would otherwise shadow it.
+        state.account_tracker = account_tracker;
         state.execution = execution.clone();
         state.market_data = market_data;
         state.config_versions = config_versions;
