@@ -46,6 +46,9 @@ pub struct TrendFollowStrategy {
     candle_count: usize,
     working_order_cloid: Option<String>,
     working_order_is_close: bool,
+    /// A reversal queued after a close order is submitted: the new position in
+    /// the crossed direction opens once the close fill is reflected (A6).
+    pending_reverse: Option<Side>,
     status: StrategyStatus,
 }
 
@@ -73,6 +76,7 @@ impl TrendFollowStrategy {
             candle_count: 0,
             working_order_cloid: None,
             working_order_is_close: false,
+            pending_reverse: None,
             status: StrategyStatus::Stopped,
         }
     }
@@ -208,16 +212,32 @@ impl TrendFollowStrategy {
         Ok(())
     }
 
+    /// Stop-loss check: closes the position when the market crosses the stop.
+    /// Runs even while paused (A7) — a safety pause is exactly when an open
+    /// position must still be stopped out. Returns `true` when it closed.
+    async fn check_stop_loss(&mut self, current_price: f64) -> Result<bool, String> {
+        if let Some(stop) = self.stop_price {
+            if self.position_size > 0.0 && current_price <= stop {
+                self.close_position(current_price).await?;
+                return Ok(true);
+            }
+            if self.position_size < 0.0 && current_price >= stop {
+                self.close_position(current_price).await?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     async fn process_candle(&mut self, candle: &Candle) -> Result<(), String> {
-        let p = &self.params;
         let (macd_line, signal_line, _hist) = macd(
             &self.closes,
-            p.fast_ema_period,
-            p.slow_ema_period,
-            p.signal_ema_period,
+            self.params.fast_ema_period,
+            self.params.slow_ema_period,
+            self.params.signal_ema_period,
         );
-        let atr_values = atr(&self.highs, &self.lows, &self.closes, p.atr_period);
-        let mom_values = momentum(&self.closes, p.momentum_period);
+        let atr_values = atr(&self.highs, &self.lows, &self.closes, self.params.atr_period);
+        let mom_values = momentum(&self.closes, self.params.momentum_period);
 
         let macd_val = macd_line.last().copied().unwrap_or(f64::NAN);
         let signal_val = signal_line.last().copied().unwrap_or(f64::NAN);
@@ -243,28 +263,38 @@ impl TrendFollowStrategy {
             .unwrap_or(0.0);
 
         // Stop-loss first.
-        if let Some(stop) = self.stop_price {
-            if self.position_size > 0.0 && current_price <= stop {
-                return self.close_position(current_price).await;
-            }
-            if self.position_size < 0.0 && current_price >= stop {
-                return self.close_position(current_price).await;
-            }
+        if self.check_stop_loss(current_price).await? {
+            return Ok(());
+        }
+
+        // A pending reversal (the close order from a flip filled) opens once the
+        // position is actually flat.
+        if self.position_size == 0.0
+            && let Some(side) = self.pending_reverse.take()
+        {
+            return self.open_position(side, current_price, atr_val).await;
         }
 
         if let Some(prev) = prev_above {
             let bullish_cross = macd_above && !prev;
             let bearish_cross = !macd_above && prev;
-            if bullish_cross && mom_val > p.momentum_threshold {
+            if bullish_cross && mom_val > self.params.momentum_threshold {
                 if self.position_size < 0.0 {
+                    // A6: queue the reversal; the close order's working cloid
+                    // blocks an immediate open, so it opens once the fill is
+                    // reflected and this branch re-runs on a later candle.
                     self.close_position(current_price).await?;
+                    self.pending_reverse = Some(Side::Buy);
+                    return Ok(());
                 }
                 if self.position_size == 0.0 {
                     return self.open_position(Side::Buy, current_price, atr_val).await;
                 }
-            } else if bearish_cross && mom_val < -p.momentum_threshold {
+            } else if bearish_cross && mom_val < -self.params.momentum_threshold {
                 if self.position_size > 0.0 {
                     self.close_position(current_price).await?;
+                    self.pending_reverse = Some(Side::Sell);
+                    return Ok(());
                 }
                 if self.position_size == 0.0 {
                     return self.open_position(Side::Sell, current_price, atr_val).await;
@@ -310,8 +340,15 @@ impl Strategy for TrendFollowStrategy {
                 && self.working_order_cloid.as_deref() == Some(o.cloid.as_str())
             {
                 self.sync_position_from_tracker();
+                let was_close = self.working_order_is_close;
                 self.working_order_cloid = None;
                 self.working_order_is_close = false;
+                // A6: only a *filled* close leaves the queued reversal active
+                // (it opens on the next candle once the position is flat); a
+                // rejected/cancelled/expired close means the flip did not happen.
+                if was_close && !matches!(event.event_type(), EventType::OrderFilled) {
+                    self.pending_reverse = None;
+                }
             }
             return Ok(());
         }
@@ -330,13 +367,26 @@ impl Strategy for TrendFollowStrategy {
             .push(candle.high.inner().to_string().parse().unwrap_or(0.0));
         self.lows
             .push(candle.low.inner().to_string().parse().unwrap_or(0.0));
+        let current_price = candle
+            .close
+            .inner()
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(0.0);
+
+        // A7: the stop-loss always evaluates — even while paused and before the
+        // indicator warmup completes — because a paused strategy holding an open
+        // position must still be stopped out.
+        if self.check_stop_loss(current_price).await? {
+            return Ok(());
+        }
 
         let min_candles = self.params.slow_ema_period * MIN_CANDLES_FACTOR;
         if self.candle_count < min_candles {
             return Ok(());
         }
         if self.status == StrategyStatus::Paused {
-            return Ok(());
+            return Ok(()); // paused: no new signals or entries
         }
         self.process_candle(candle).await
     }
@@ -367,5 +417,187 @@ impl Strategy for TrendFollowStrategy {
 
     fn set_status(&mut self, status: StrategyStatus) {
         self.status = status;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hypeedge_domain::enums::OrderStatus;
+    use hypeedge_domain::error::HypeEdgeError;
+
+    fn candle(close: &str) -> Candle {
+        let px = Price::new(Decimal::from_str_strict(close).unwrap());
+        Candle {
+            symbol: "BTC".into(),
+            interval: "1m".into(),
+            open: px,
+            high: px,
+            low: px,
+            close: px,
+            volume: Size::new(Decimal::ONE),
+            timestamp: 1_700_000_000_000,
+        }
+    }
+
+    fn order_for(cloid: &str, side: Side) -> Order {
+        let mut order = Order::new(
+            cloid.into(),
+            "BTC".into(),
+            side,
+            Size::new(Decimal::ONE),
+            None,
+            OrderType::Market,
+            hypeedge_domain::enums::TimeInForce::Ioc,
+        );
+        order.strategy_id = Some("tf_1".into());
+        order
+    }
+
+    fn wrap(payload: DomainEvent) -> Event {
+        Event::new(payload)
+    }
+
+    /// An execution client that records every intent; market orders fill
+    /// immediately, limit orders ack.
+    struct MockExecution {
+        submitted: std::sync::Mutex<Vec<OrderIntent>>,
+    }
+    impl MockExecution {
+        fn new() -> Self {
+            Self {
+                submitted: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+    #[async_trait]
+    impl ExecutionClient for MockExecution {
+        async fn submit_order(
+            &self,
+            intent: OrderIntent,
+            _deferred: Option<bool>,
+        ) -> Result<Order, HypeEdgeError> {
+            self.submitted.lock().unwrap().push(intent.clone());
+            let mut order = Order::new(
+                intent.cloid.clone().unwrap_or_default(),
+                intent.symbol.clone(),
+                intent.side,
+                intent.size,
+                intent.price,
+                intent.order_type,
+                intent.time_in_force,
+            );
+            order.strategy_id = intent.strategy_id.clone();
+            if intent.order_type == OrderType::Market {
+                order.status = OrderStatus::Filled;
+                order.filled_size = intent.size;
+            } else {
+                order.status = OrderStatus::Acknowledged;
+            }
+            Ok(order)
+        }
+        async fn cancel_order(&self, _: &str) -> Result<bool, HypeEdgeError> {
+            Ok(true)
+        }
+        async fn cancel_all_orders(&self, _: Option<&str>) -> Result<u64, HypeEdgeError> {
+            Ok(0)
+        }
+        async fn get_order(&self, _: &str) -> Result<Option<Order>, HypeEdgeError> {
+            Ok(None)
+        }
+        async fn get_open_orders(&self, _: Option<&str>) -> Result<Vec<Order>, HypeEdgeError> {
+            Ok(vec![])
+        }
+    }
+
+    #[tokio::test]
+    async fn paused_strategy_still_stops_out() {
+        // A7 regression: a paused strategy holding an open position must still
+        // run its stop-loss.
+        let exec = Arc::new(MockExecution::new());
+        let mut strategy = TrendFollowStrategy::new(
+            "tf_1".into(),
+            TrendParams::default(),
+            exec.clone(),
+            None,
+        );
+        strategy.status = StrategyStatus::Paused;
+        strategy.position_size = 1.0;
+        strategy.stop_price = Some(50000.0);
+
+        strategy.on_event(&wrap(DomainEvent::CandleUpdate(candle("49000")))).await.unwrap();
+
+        let submitted = exec.submitted.lock().unwrap();
+        assert!(!submitted.is_empty(), "stop-loss must fire while paused (A7)");
+        assert_eq!(submitted[0].side, Side::Sell, "long stop closes with a sell");
+    }
+
+    #[tokio::test]
+    async fn filled_close_keeps_queued_reversal_rejected_clears() {
+        // A6 regression: a flip queues a reversal after the close order; only a
+        // *filled* close keeps it active, a rejected/cancelled close cancels it.
+        let exec = Arc::new(MockExecution::new());
+        let mut strategy = TrendFollowStrategy::new(
+            "tf_1".into(),
+            TrendParams::default(),
+            exec.clone(),
+            None,
+        );
+
+        strategy.working_order_cloid = Some("close_c1".into());
+        strategy.working_order_is_close = true;
+        strategy.pending_reverse = Some(Side::Buy);
+        strategy
+            .on_event(&wrap(DomainEvent::OrderFilled(order_for("close_c1", Side::Sell))))
+            .await
+            .unwrap();
+        assert_eq!(
+            strategy.pending_reverse,
+            Some(Side::Buy),
+            "filled close keeps the queued reversal (A6)"
+        );
+        assert_eq!(strategy.working_order_cloid, None);
+
+        strategy.working_order_cloid = Some("close_c2".into());
+        strategy.working_order_is_close = true;
+        strategy.pending_reverse = Some(Side::Sell);
+        strategy
+            .on_event(&wrap(DomainEvent::OrderRejected(order_for("close_c2", Side::Buy))))
+            .await
+            .unwrap();
+        assert_eq!(
+            strategy.pending_reverse,
+            None,
+            "a rejected close cancels the queued reversal (A6)"
+        );
+    }
+
+    #[tokio::test]
+    async fn flat_position_with_pending_reverse_opens_reversal() {
+        // A6 regression: once the close fill is reflected (position flat), the
+        // queued reversal position actually opens.
+        let exec = Arc::new(MockExecution::new());
+        let mut strategy = TrendFollowStrategy::new(
+            "tf_1".into(),
+            TrendParams::default(),
+            exec.clone(),
+            None,
+        );
+        // Warm up indicators with a mildly-varying series so ATR > 0.
+        strategy.candle_count = 80;
+        for i in 0..80 {
+            let px = 100.0 + (i % 7) as f64 * 0.5;
+            strategy.closes.push(px);
+            strategy.highs.push(px + 0.5);
+            strategy.lows.push(px - 0.5);
+        }
+        strategy.pending_reverse = Some(Side::Buy);
+        strategy.status = StrategyStatus::Running;
+
+        strategy.process_candle(&candle("100")).await.unwrap();
+
+        let submitted = exec.submitted.lock().unwrap();
+        assert!(!submitted.is_empty(), "pending reversal must open (A6)");
+        assert_eq!(submitted[0].side, Side::Buy);
     }
 }

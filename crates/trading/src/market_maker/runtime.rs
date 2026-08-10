@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use hypeedge_domain::decimal::{Decimal, Size, Usd};
 use hypeedge_domain::enums::{MarketMakerLifecycle, QuoteDecision};
 use hypeedge_domain::events::{DomainEvent, Event, EventType};
 use hypeedge_domain::models::L2BookSnapshot;
@@ -482,7 +483,6 @@ impl MarketMakerRuntime {
         let reliable_mailbox = self.bus.subscribe_many(RELIABLE_EVENTS);
         let markout_mailbox = self.bus.subscribe_maxsize(EventType::MmFillMarkout, 256);
 
-        let mut result = Ok(());
         loop {
             tokio::select! {
                 _ = stop_rx.recv() => break,
@@ -490,8 +490,15 @@ impl MarketMakerRuntime {
                     match maybe {
                         Some(event) => {
                             if let Err(e) = self.handle_event(&event).await {
-                                result = Err(e);
-                                break;
+                                // A9: a transient cycle failure (stale inventory,
+                                // provider hiccup, exchange rate limit) must not
+                                // kill the event loop — that leaves resting quotes
+                                // live while the strategy is dead. Log the reason
+                                // and keep listening; the next book update re-runs
+                                // the cycle.
+                                tracing::error!(error = %e, "market_maker_cycle_error_continuing");
+                                *self.last_reason.lock().await =
+                                    format!("cycle_error: {e}");
                             }
                         }
                         None => break,
@@ -506,7 +513,7 @@ impl MarketMakerRuntime {
             .unsubscribe_many(RELIABLE_EVENTS, &reliable_mailbox);
         self.bus
             .unsubscribe(EventType::MmFillMarkout, &markout_mailbox);
-        result
+        Ok(())
     }
 }
 
@@ -630,6 +637,9 @@ impl StrategyRuntimeHandle for MarketMakerRuntimeHandle {
             return Err("configuration belongs to another strategy".into());
         }
         let decoded = decode_market_maker_config(config)?;
+        // A8: never admit a degenerate config (zero notionals / zero quote size
+        // would divide by zero in inventory sizing).
+        decoded.validate()?;
         if decoded.version != config.revision {
             return Err("decoded configuration version does not match registry revision".into());
         }
@@ -650,19 +660,54 @@ impl StrategyRuntimeHandle for MarketMakerRuntimeHandle {
     }
 }
 
-/// Decode a config snapshot into `MarketMakerConfig` (default adapter).
+/// Decode a config snapshot into `MarketMakerConfig` (A8). The previous
+/// "default adapter" returned `default_with(...)`, whose notionals and quote
+/// size are all zero — `inventory.calculate` then divided by zero and the
+/// event loop panicked. Decode the operator's real values with non-zero
+/// fallbacks, and validate before returning.
 pub fn decode_market_maker_config(
     config: &StrategyConfigSnapshot,
 ) -> Result<MarketMakerConfig, String> {
-    // The registry config revision is the version.
     let defaults = MarketMakerConfig::default_with(
         config.revision,
         hypeedge_domain::decimal::Decimal::from_str_lenient("0.1").unwrap(),
         hypeedge_domain::decimal::Decimal::from_str_lenient("0.001").unwrap(),
         hypeedge_domain::decimal::Decimal::from_str_lenient("0.001").unwrap(),
     );
-    let _ = config;
-    Ok(defaults)
+    let v = &config.values;
+    let get_dec = |k: &str, fallback: &str| -> Result<Decimal, String> {
+        match v.get(k) {
+            Some(serde_json::Value::String(s)) => {
+                Decimal::from_str_lenient(s).map_err(|_| format!("invalid decimal for {k}"))
+            }
+            Some(serde_json::Value::Number(n)) => n
+                .as_f64()
+                .ok_or_else(|| format!("invalid number for {k}"))
+                .and_then(|f| Decimal::from_f64(f).map_err(|_| format!("invalid decimal for {k}"))),
+            Some(_) => Err(format!("unexpected type for {k}")),
+            None => Ok(Decimal::from_str_lenient(fallback).unwrap_or(Decimal::ZERO)),
+        }
+    };
+    let cfg = MarketMakerConfig {
+        soft_inventory_notional: Usd::new(get_dec("soft_inventory_notional", "100")?),
+        hard_inventory_notional: Usd::new(get_dec("hard_inventory_notional", "150")?),
+        emergency_inventory_notional: Usd::new(get_dec("emergency_inventory_notional", "200")?),
+        quote_size: Size::new(get_dec("quote_size", "0.001")?),
+        max_quote_lifetime_seconds: get_dec("max_quote_lifetime_seconds", "10")?,
+        horizon_seconds: get_dec("horizon_seconds", "5")?,
+        inventory_skew_bps: get_dec("inventory_skew_bps", "5")?,
+        inventory_gamma_bps: get_dec("inventory_gamma_bps", "1")?,
+        max_inventory_shift_bps: get_dec("max_inventory_shift_bps", "20")?,
+        min_half_spread_bps: get_dec("min_half_spread_bps", "1")?,
+        toxicity_spread_bps: get_dec("toxicity_spread_bps", "10")?,
+        max_depth_participation: get_dec("max_depth_participation", "0.05")?,
+        signed_maker_fee_rate: get_dec("signed_maker_fee_rate", "-0.0002")?,
+        expected_fill_probability: get_dec("expected_fill_probability", "0.10")?,
+        min_expected_pnl_usdc: Usd::new(get_dec("min_expected_pnl_usdc", "0")?),
+        ..defaults
+    };
+    cfg.validate()?;
+    Ok(cfg)
 }
 
 #[cfg(test)]
@@ -880,5 +925,40 @@ mod tests {
         assert_eq!(desired.bid.decision, QuoteDecision::NoQuote);
         assert_eq!(desired.bid.reason, "lifecycle_paused");
         assert_eq!(*plans.lock().await, 0);
+    }
+
+    #[test]
+    fn decode_market_maker_config_reads_real_values_and_validates() {
+        // A8 regression: the decoder must read the operator's values with
+        // non-zero fallbacks and validate, not return the all-zero `default_with`
+        // (which used to divide by zero in inventory sizing).
+        let config = StrategyConfigSnapshot {
+            strategy_id: "mm_1".into(),
+            revision: 3,
+            values: serde_json::json!({
+                "soft_inventory_notional": "250",
+                "hard_inventory_notional": "400",
+                "emergency_inventory_notional": "600",
+                "quote_size": "0.005",
+            }),
+        };
+        let decoded = decode_market_maker_config(&config).unwrap();
+        assert_eq!(decoded.version, 3);
+        assert_eq!(decoded.soft_inventory_notional.to_string(), "250");
+        assert_eq!(decoded.hard_inventory_notional.to_string(), "400");
+        assert_eq!(decoded.emergency_inventory_notional.to_string(), "600");
+        assert_eq!(decoded.quote_size.to_string(), "0.005");
+        assert!(decoded.validate().is_ok(), "decoded config must validate");
+
+        // A missing/invalid config must error, not panic.
+        let bad = StrategyConfigSnapshot {
+            strategy_id: "mm_1".into(),
+            revision: 4,
+            values: serde_json::json!({ "soft_inventory_notional": "-5" }),
+        };
+        assert!(
+            decode_market_maker_config(&bad).is_err(),
+            "invalid notionals must fail decode/validate"
+        );
     }
 }

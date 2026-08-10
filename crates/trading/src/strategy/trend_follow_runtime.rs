@@ -28,6 +28,10 @@ pub struct TrendFollowRuntimeHandle {
     strategy: Arc<tokio::sync::Mutex<TrendFollowStrategy>>,
     stop_tx: Arc<tokio::sync::Mutex<Option<mpsc::Sender<()>>>>,
     task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<Result<(), String>>>>,
+    /// The process event bus the runner subscribes to (A4). Previously the
+    /// runner was constructed with a private bus nothing ever published to, so
+    /// the strategy silently never received any market data.
+    event_bus: Arc<EventBus>,
 }
 
 impl TrendFollowRuntimeHandle {
@@ -36,12 +40,12 @@ impl TrendFollowRuntimeHandle {
         strategy: TrendFollowStrategy,
         event_bus: Arc<EventBus>,
     ) -> Self {
-        let _ = event_bus; // subscriptions are owned by the runner; kept for API parity
         Self {
             strategy_id,
             strategy: Arc::new(tokio::sync::Mutex::new(strategy)),
             stop_tx: Arc::new(tokio::sync::Mutex::new(None)),
             task: tokio::sync::Mutex::new(None),
+            event_bus,
         }
     }
 
@@ -60,7 +64,7 @@ impl StrategyRuntimeHandle for TrendFollowRuntimeHandle {
         let (stop_tx, stop_rx) = mpsc::channel(1);
         *self.stop_tx.lock().await = Some(stop_tx);
         let adapter = LockedStrategyAdapter(self.strategy.clone());
-        let mut runner = StrategyRunner::new(Box::new(adapter), Arc::new(EventBus::new(10_000)));
+        let mut runner = StrategyRunner::new(Box::new(adapter), self.event_bus.clone());
         let handle = tokio::spawn(async move { runner.run(stop_rx).await });
         *task_guard = Some(handle);
         Ok(())
@@ -142,10 +146,19 @@ pub fn decode_trend_follow_config(config: &StrategyConfigSnapshot) -> Result<Tre
             .map(|x| x as usize)
             .ok_or_else(|| format!("missing integer field {k}"))
     };
+    // A5: the canonical normalized config stores decimal fields as strings
+    // (config_normalize.rs), so `as_f64()` alone would reject every real
+    // config and silently fall back to defaults. Accept both forms.
     let get_f = |k: &str| -> Result<f64, String> {
-        v.get(k)
-            .and_then(|x| x.as_f64())
-            .ok_or_else(|| format!("missing numeric field {k}"))
+        match v.get(k) {
+            Some(serde_json::Value::String(s)) => s
+                .parse::<f64>()
+                .map_err(|_| format!("invalid numeric field {k}")),
+            Some(serde_json::Value::Number(n)) => n
+                .as_f64()
+                .ok_or_else(|| format!("invalid numeric field {k}")),
+            Some(_) | None => Err(format!("missing numeric field {k}")),
+        }
     };
     Ok(TrendParams {
         symbol: "BTC".to_string(),
@@ -191,7 +204,29 @@ pub fn build_trend_follow_plugin(
         strategy_type: "trend_follow".to_string(),
         capabilities: super::registry::trend_follow_capabilities(),
         factory: Arc::new(move |ctx: &StrategyBuildContext| {
-            let params = decode_trend_follow_config(&ctx.config).unwrap_or_default();
+            let params = match decode_trend_follow_config(&ctx.config) {
+                Ok(p) => p,
+                Err(e) => {
+                    // A5: never silently trade with defaults on a decode error.
+                    // Registration normalizes config, so this is a genuine
+                    // invariant violation — log loudly and fail the factory.
+                    tracing::error!(
+                        strategy_id = %ctx.instance.strategy_id,
+                        error = %e,
+                        "trend_follow_config_decode_failed"
+                    );
+                    return Arc::new(TrendFollowRuntimeHandle::new(
+                        ctx.instance.strategy_id.clone(),
+                        TrendFollowStrategy::new(
+                            ctx.instance.strategy_id.clone(),
+                            TrendParams::default(),
+                            execution.clone(),
+                            tracker.clone(),
+                        ),
+                        event_bus.clone(),
+                    ));
+                }
+            };
             let strategy = TrendFollowStrategy::new(
                 ctx.instance.strategy_id.clone(),
                 params,
