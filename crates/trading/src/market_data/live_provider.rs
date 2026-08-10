@@ -259,6 +259,11 @@ impl LiveMarketDataProvider {
         self.funding.lock().await.get(symbol).cloned()
     }
 
+    /// All funding snapshots observed (funding-arb scanner).
+    pub async fn all_funding(&self) -> Vec<FundingRate> {
+        self.funding.lock().await.values().cloned().collect()
+    }
+
     pub async fn get_candles(&self, symbol: &str, interval: &str, limit: usize) -> Vec<Candle> {
         let candles = self.candles.lock().await;
         let series = candles.get(&(symbol.to_string(), interval.to_string()));

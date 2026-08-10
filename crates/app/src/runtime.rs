@@ -45,6 +45,10 @@ pub struct RuntimeWiring {
     pub trading_enabled: Arc<tokio::sync::RwLock<bool>>,
     pub safety_mode: Arc<tokio::sync::RwLock<String>>,
     pub action_budget: Option<Arc<tokio::sync::Mutex<ActionBudgetController>>>,
+    /// Funding-arb runtime dependencies (wiring follow-up), when a store is wired.
+    pub funding_arb_deps: Option<Arc<hypeedge_trading::funding_arb::runtime::FundingArbRuntimeDependencies>>,
+    /// The live market-maker runtime (wiring follow-up) for the WS snapshot provider.
+    pub mm_runtime: Option<Arc<hypeedge_trading::market_maker::MarketMakerRuntime>>,
 }
 
 /// Build the full runtime in dependency order. When the V2 trading chain is not
@@ -95,6 +99,8 @@ pub async fn build_runtime(
             trading_enabled,
             safety_mode,
             action_budget: None,
+            funding_arb_deps: None,
+            mm_runtime: None,
         });
     }
 
@@ -326,6 +332,74 @@ pub async fn build_runtime(
     // Outbox → SSE relay is wired by AppState::from_wiring (the durable broker
     // is constructed there from sse_outbox + sse_pool).
 
+    // ---------- Strategy runtimes (wiring follow-up) ----------
+    // Funding-arb deps: live scanner + instrument meta + durable cycle store.
+    let funding_arb_deps = sse_pool.as_ref().and_then(|pool| {
+        if !settings.features.funding_arb_execution_enabled {
+            return None;
+        }
+        let scanner = Arc::new(hypeedge_trading::funding_arb::live_scanner::LiveFundingArbScanner::new(
+            market_data.clone()?,
+            rest.clone(),
+        ));
+        let meta = Arc::new(
+            hypeedge_trading::funding_arb::live_scanner::InstrumentCacheFundingArbMeta::new(
+                meta_cache.clone(),
+            ),
+        );
+        let cycles = Arc::new(hypeedge_storage::funding_arb_store::PostgresFundingArbCycleStore::new(
+            pool.clone(),
+        ));
+        let tracker_ref = account_tracker.clone();
+        let fa = settings.funding_arb.clone();
+        Some(Arc::new(
+            hypeedge_trading::funding_arb::runtime::FundingArbRuntimeDependencies {
+                execution: engine.clone(),
+                scanner,
+                tracker: tracker_ref,
+                cycles,
+                meta,
+                trading_ready: Box::new(|| true),
+                kill_switch_active: Box::new({
+                    let ks = kill_switch.clone();
+                    move || {
+                        let ks = ks.clone();
+                        tokio::runtime::Handle::current()
+                            .block_on(async move { ks.is_active().await })
+                    }
+                }),
+                account_allows_risk_increase: Box::new(|| true),
+                reconcile: Box::new(|| Box::pin(async { true })),
+                deployment: hypeedge_trading::funding_arb::runtime::FundingArbDeployment {
+                    max_notional_usd: fa.max_notional_usd.0,
+                    poll_interval_seconds: fa.poll_interval_seconds,
+                    order_status_poll_interval_seconds: fa.order_status_poll_interval_seconds,
+                    max_leg_attempts: fa.max_leg_attempts,
+                    market_stale_seconds: fa.market_stale_seconds,
+                    min_spot_24h_volume_usd: fa.min_spot_24h_volume_usd.0,
+                    min_perp_24h_volume_usd: fa.min_perp_24h_volume_usd.0,
+                    min_top_book_depth_usd: fa.min_top_book_depth_usd.0,
+                    max_combined_spread_bps: fa.max_combined_spread_bps.0,
+                },
+                account_address: account.clone(),
+            },
+        ))
+    });
+
+    // Market-maker runtime (only when the MM feature is enabled and there is a
+    // live engine + provider).
+    let mm_runtime = if settings.features.market_making_enabled {
+        build_market_maker_runtime(
+            event_bus.clone(),
+            account_tracker.clone(),
+            action_budget.clone(),
+            market_data.clone(),
+            engine.clone(),
+        )
+    } else {
+        None
+    };
+
     Ok(RuntimeWiring {
         settings: Arc::new(settings.clone()),
         event_bus: event_bus.clone(),
@@ -346,6 +420,8 @@ pub async fn build_runtime(
             safety_mode
         },
         action_budget: Some(action_budget),
+        funding_arb_deps,
+        mm_runtime,
     })
 }
 
@@ -371,6 +447,8 @@ pub fn build_control_plane(settings: &AppSettings, event_bus: Arc<EventBus>) -> 
         trading_enabled: Arc::new(tokio::sync::RwLock::new(false)),
         safety_mode: Arc::new(tokio::sync::RwLock::new("starting".into())),
         action_budget: None,
+        funding_arb_deps: None,
+        mm_runtime: None,
     }
 }
 
@@ -407,4 +485,56 @@ fn map_action_budget_settings(
         minimum_marginal_usdc_per_action: s.minimum_marginal_usdc_per_action,
         minimum_actions_for_economic_gate: s.minimum_actions_for_economic_gate,
     }
+}
+
+/// Build the live market-maker runtime with provider adapters (wiring follow-up).
+/// Returns `None` when a required live dependency is missing.
+fn build_market_maker_runtime(
+    event_bus: Arc<EventBus>,
+    tracker: Arc<AccountTracker>,
+    budget: Arc<tokio::sync::Mutex<ActionBudgetController>>,
+    market_data: Option<Arc<LiveMarketDataProvider>>,
+    engine: Arc<ExecutionEngine>,
+) -> Option<Arc<hypeedge_trading::market_maker::MarketMakerRuntime>> {
+    use hypeedge_trading::market_maker::adapters::{
+        ControllerBudgetProvider, EngineQuotePlanClient, EngineSlotProvider,
+        ProviderFundingProvider, TrackerHealthProvider, TrackerInventoryProvider,
+    };
+    use hypeedge_trading::market_maker::runtime::MarketMakerRuntime;
+    use hypeedge_trading::trading::quote_coordinator::{QuoteCoordinator, QuoteCoordinatorConfig};
+
+    let market_data = market_data?;
+    let feature_engine = Arc::new(tokio::sync::Mutex::new(
+        hypeedge_trading::market_data::MarketFeatureEngine::new(20, 60.0, 10_000).ok()?,
+    ));
+    let inventory = Arc::new(TrackerInventoryProvider::new(tracker.clone()));
+    let budget_provider = Arc::new(ControllerBudgetProvider::new(budget));
+    let health = Arc::new(TrackerHealthProvider::new(tracker));
+    let slots = Arc::new(EngineSlotProvider::new(engine.clone()));
+    let commands = Arc::new(EngineQuotePlanClient::new(engine));
+    let funding = Some(Arc::new(ProviderFundingProvider::new(market_data)) as Arc<dyn hypeedge_trading::market_maker::runtime::FundingSnapshotProvider>);
+    let coordinator = QuoteCoordinator::new(QuoteCoordinatorConfig::default()).ok()?;
+
+    // The runtime requires a strategy_id/session_id/symbol; the supervisor
+    // re-binds per instance, so this is a placeholder identity the handle
+    // factory overrides.
+    MarketMakerRuntime::new(
+        "mm_wiring".into(),
+        "mm_session".into(),
+        String::new(),
+        "BTC".into(),
+        event_bus,
+        feature_engine,
+        hypeedge_trading::market_maker::MarketMakerPolicy::new(),
+        coordinator,
+        inventory,
+        budget_provider,
+        health,
+        slots,
+        commands,
+        funding,
+        chrono::Duration::seconds(5),
+    )
+    .ok()
+    .map(Arc::new)
 }

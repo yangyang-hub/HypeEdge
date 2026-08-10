@@ -81,6 +81,8 @@ impl HypeEdgeApp {
             self.runtime.safety_mode.clone(),
             self.runtime.sse_outbox.clone(),
             self.runtime.sse_pool.clone(),
+            self.runtime.funding_arb_deps.clone(),
+            self.runtime.mm_runtime.clone(),
         );
         hypeedge_api::build_router(api_state)
     }

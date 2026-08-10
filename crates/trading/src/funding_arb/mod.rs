@@ -1,5 +1,6 @@
 //! Funding-rate arbitrage strategy, port of `src/hypeedge/strategy/funding_arb/`.
 
+pub mod live_scanner;
 pub mod models;
 pub mod runtime;
 pub mod scanner;

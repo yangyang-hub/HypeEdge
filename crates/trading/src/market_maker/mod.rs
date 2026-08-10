@@ -4,6 +4,7 @@
 //! Ports `src/hypeedge/strategy/market_maker/` (the pure, testable parts). The
 //! coalesced runtime loop and its providers land in a follow-up increment.
 
+pub mod adapters;
 pub mod estimators;
 pub mod fair_value;
 pub mod inventory;

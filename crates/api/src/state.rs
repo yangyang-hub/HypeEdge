@@ -154,6 +154,10 @@ impl AppState {
         safety_mode: Arc<tokio::sync::RwLock<String>>,
         sse_outbox: Option<Arc<hypeedge_storage::outbox::PostgresOutboxStore>>,
         sse_pool: Option<sqlx::PgPool>,
+        funding_arb_deps: Option<
+            Arc<hypeedge_trading::funding_arb::runtime::FundingArbRuntimeDependencies>,
+        >,
+        mm_runtime: Option<Arc<hypeedge_trading::market_maker::MarketMakerRuntime>>,
     ) -> Self {
         state.execution = execution.clone();
         state.market_data = market_data;
@@ -161,13 +165,39 @@ impl AppState {
         state.trading_enabled = trading_enabled;
         state.safety_mode = safety_mode;
         if let (Some(outbox), Some(pool)) = (&sse_outbox, &sse_pool) {
-            state.sse_broker = Arc::new(crate::sse_broker::SseBroker::new(
+            let broker = Arc::new(crate::sse_broker::SseBroker::new(
                 state.event_bus.clone(),
                 Some(outbox.clone()),
                 Some(pool.clone()),
                 1000,
                 256,
             ));
+            state.sse_broker = broker.clone();
+            // Outbox → SSE relay (wiring follow-up): poll the durable outbox
+            // and publish committed events to the broker so `/api/v1/events`
+            // delivers the durable stream.
+            let outbox = outbox.clone();
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                loop {
+                    let events = match outbox.claim_batch(&pool, "sse-relay", 200).await {
+                        Ok(events) => events,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "sse_relay_claim_failed");
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            continue;
+                        }
+                    };
+                    if events.is_empty() {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        continue;
+                    }
+                    for event in &events {
+                        broker.publish(event).await;
+                        let _ = outbox.mark_published(&pool, event, "sse-relay").await;
+                    }
+                }
+            });
         }
         // 6f: when the execution engine is wired, register the real trend-follow
         // plugin (replacing the noop) so strategy lifecycle drives actual orders.
@@ -176,6 +206,8 @@ impl AppState {
                 state.event_bus.clone(),
                 state.account_tracker.clone(),
                 engine.clone(),
+                funding_arb_deps,
+                mm_runtime,
             );
         }
         state
@@ -186,10 +218,15 @@ impl StrategyControlPlane {
     /// Build a control plane whose registry registers the real strategy
     /// runtimes (6f). Falls back to noop plugins for strategy types without a
     /// wired runtime yet.
+    #[allow(clippy::too_many_arguments)]
     pub fn with_real_plugins(
         event_bus: Arc<EventBus>,
         tracker: Arc<hypeedge_trading::account::AccountTracker>,
         execution: Arc<hypeedge_trading::execution::ExecutionEngine>,
+        funding_arb_deps: Option<
+            Arc<hypeedge_trading::funding_arb::runtime::FundingArbRuntimeDependencies>,
+        >,
+        mm_runtime: Option<Arc<hypeedge_trading::market_maker::MarketMakerRuntime>>,
     ) -> Self {
         let mut registry = StrategyRegistry::new();
         registry.register_plugin(hypeedge_trading::strategy::build_trend_follow_plugin(
@@ -197,19 +234,34 @@ impl StrategyControlPlane {
             Some(tracker as Arc<dyn hypeedge_trading::strategy::StrategyAccountView>),
             execution as Arc<dyn ExecutionClient>,
         ));
-        // funding_arb / market_maker real plugins land with their provider
-        // adapters; keep the noop handles for those types so lifecycle still
-        // drives.
-        for (strategy_type, capabilities) in [
-            (
-                "market_maker",
-                hypeedge_trading::strategy::market_maker_capabilities(),
-            ),
-            (
-                "funding_arb",
-                hypeedge_trading::strategy::funding_arb_capabilities(),
-            ),
-        ] {
+        // funding_arb real plugin when its deps are wired.
+        if let Some(deps) = funding_arb_deps {
+            registry.register_plugin(hypeedge_trading::funding_arb::runtime::build_funding_arb_plugin(
+                Some(deps),
+            ));
+        }
+        // market_maker real plugin when its runtime is wired.
+        if let Some(runtime) = mm_runtime {
+            registry.register_plugin(hypeedge_trading::strategy::StrategyTypePlugin {
+                strategy_type: "market_maker".to_string(),
+                capabilities: hypeedge_trading::strategy::market_maker_capabilities(),
+                factory: Arc::new(move |_ctx| {
+                    Arc::new(hypeedge_trading::market_maker::MarketMakerRuntimeHandle::new(
+                        runtime.clone(),
+                    ))
+                }),
+            });
+        }
+        // Remaining types without a wired runtime keep a noop handle.
+        for strategy_type in ["trend_follow", "market_maker", "funding_arb"] {
+            if registry.contains(strategy_type) {
+                continue;
+            }
+            let capabilities = match strategy_type {
+                "market_maker" => hypeedge_trading::strategy::market_maker_capabilities(),
+                "funding_arb" => hypeedge_trading::strategy::funding_arb_capabilities(),
+                _ => hypeedge_trading::strategy::trend_follow_capabilities(),
+            };
             registry.register_plugin(hypeedge_trading::strategy::StrategyTypePlugin {
                 strategy_type: strategy_type.to_string(),
                 capabilities,

@@ -289,6 +289,26 @@ impl MarketMakerRuntime {
                 || position.sub_account.as_deref() == Some(self.sub_account.as_str()))
     }
 
+    /// A monitoring snapshot of the runtime (wiring follow-up: feeds the API's
+    /// market-making WS provider).
+    pub async fn snapshot(&self) -> MarketMakerRuntimeSnapshot {
+        MarketMakerRuntimeSnapshot {
+            strategy_id: self.strategy_id.clone(),
+            session_id: self.session_id.clone(),
+            symbol: self.symbol.clone(),
+            mode: *self.mode.lock().await,
+            config_version: self.config.lock().await.as_ref().map(|c| c.version),
+            quote_revision: *self.revision.lock().await,
+            market_version: None,
+            connection_generation: None,
+            last_cycle_at: *self.last_cycle_at.lock().await,
+            last_reason: Some(self.last_reason.lock().await.clone()),
+            desired: self.last_desired.lock().await.clone(),
+            plan: self.last_plan.lock().await.clone(),
+            features: self.last_features.lock().await.clone(),
+        }
+    }
+
     /// The coalesced cycle: build features, quote, coordinate, act.
     async fn cycle(&self, reason: &str) -> Result<(), String> {
         let config = self.config.lock().await.clone();
