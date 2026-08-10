@@ -726,6 +726,19 @@ impl AppSettings {
                 ));
             }
         }
+        // A23: on mainnet (real money), binding a non-loopback host with no API
+        // tokens would expose the full admin control plane (kill switch,
+        // strategy lifecycle, trading) to the LAN with no credential — fail
+        // closed. Dev/testnet are operator-controlled lab deployments that
+        // deliberately bind a LAN host, so they are left to the operator.
+        if self.environment == "mainnet"
+            && configured_tokens.is_empty()
+            && !is_loopback_host(&self.api.host)
+        {
+            return Err(ConfigError::validation(
+                "mainnet binding a non-loopback API host requires at least one API role token",
+            ));
+        }
 
         // Feature cut-over chain.
         let f = &self.features;
@@ -810,6 +823,14 @@ impl ConfigError {
     }
 }
 
+/// Whether an API bind host is loopback (no LAN exposure when tokens are empty).
+fn is_loopback_host(host: &str) -> bool {
+    let host = host.trim();
+    matches!(host, "localhost" | "127.0.0.1" | "::1")
+        || host.starts_with("127.")
+        || host.starts_with("[::1")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -828,6 +849,26 @@ mod tests {
         assert!(
             dbg.contains("<redacted:0xde>"),
             "redaction marker missing: {dbg}"
+        );
+    }
+
+    #[test]
+    fn mainnet_non_loopback_host_requires_api_token() {
+        // A23: mainnet binding a non-loopback host with no tokens fails closed.
+        let mut s = AppSettings {
+            environment: "mainnet".into(),
+            ..AppSettings::default()
+        };
+        s.api.host = "0.0.0.0".into();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("API role token"),
+            "mainnet non-loopback must require a token: {err}"
+        );
+        s.api.host = "127.0.0.1".into();
+        assert!(
+            s.validate().is_ok(),
+            "loopback host is allowed on mainnet without tokens"
         );
     }
 }

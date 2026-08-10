@@ -6,9 +6,11 @@
 //! renders quietly instead of retry-spamming. All money/price fields are
 //! decimal strings (frontend contract).
 
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::response::Response;
 
+use crate::auth::{authorize, ApiRole};
+use crate::middleware::RoleGuard;
 use crate::errors::ok;
 use crate::state::AppState;
 
@@ -94,8 +96,13 @@ pub async fn positions(State(state): State<AppState>) -> Response {
 /// `POST /api/v1/positions/{symbol}/close` — 202 Accepted.
 pub async fn close_position(
     State(_state): State<AppState>,
+    Extension(guard): Extension<RoleGuard>,
     axum::extract::Path(_symbol): axum::extract::Path<String>,
 ) -> Response {
+    // A23: trading mutations require Operator.
+    if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
+        return *resp;
+    }
     ok(serde_json::json!({ "accepted": true }))
 }
 
@@ -107,16 +114,26 @@ pub async fn orders(State(_state): State<AppState>) -> Response {
 /// `POST /api/v1/orders` — submit an order (requires the execution engine).
 pub async fn submit_order(
     State(_state): State<AppState>,
+    Extension(guard): Extension<RoleGuard>,
     _body: axum::Json<serde_json::Value>,
 ) -> Response {
+    // A23: trading mutations require Operator.
+    if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
+        return *resp;
+    }
     ok(serde_json::json!({ "cloid": "", "status": "rejected" }))
 }
 
 /// `POST /api/v1/orders/{cloid}/cancel` — 202 Accepted.
 pub async fn cancel_order(
     State(_state): State<AppState>,
+    Extension(guard): Extension<RoleGuard>,
     axum::extract::Path(_cloid): axum::extract::Path<String>,
 ) -> Response {
+    // A23: trading mutations require Operator.
+    if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
+        return *resp;
+    }
     ok(serde_json::json!({ "accepted": true }))
 }
 

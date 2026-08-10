@@ -147,7 +147,13 @@ impl SimulatedBroker {
 
     fn fill_limit(&mut self, intent: &OrderIntent, candle: &Candle, cloid: &str) -> Option<Fill> {
         let limit_price = intent.price?;
-        let is_maker = true;
+        // B16: a limit that crossed the spread (the market traded through it) is
+        // a taker, not a maker. For a buy, a limit at/above the candle high
+        // would have hit the ask; for a sell, at/below the low hits the bid.
+        let is_maker = match intent.side {
+            Side::Buy => limit_price.inner() < candle.high.inner(),
+            Side::Sell => limit_price.inner() > candle.low.inner(),
+        };
         match intent.side {
             Side::Buy if candle.low.inner() > limit_price.inner() => return None,
             Side::Sell if candle.high.inner() < limit_price.inner() => return None,

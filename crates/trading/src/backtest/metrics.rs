@@ -57,6 +57,7 @@ pub struct MetricsCalculator {
     equity_curve: Vec<(i64, Usd)>,
     initial_capital: Usd,
     funding_total: Usd,
+    fees_total: Usd,
     trade_pnls: Vec<Usd>,
 }
 
@@ -65,12 +66,14 @@ impl MetricsCalculator {
         equity_curve: Vec<(i64, Usd)>,
         initial_capital: Usd,
         funding_total: Usd,
+        fees_total: Usd,
         trade_pnls: Vec<Usd>,
     ) -> Self {
         Self {
             equity_curve,
             initial_capital,
             funding_total,
+            fees_total,
             trade_pnls,
         }
     }
@@ -220,12 +223,9 @@ impl MetricsCalculator {
         max_dd
     }
 
-    /// Total fees = sum of abs(fee) over fills (fees passed via trade_pnls here
-    /// is not exact; the engine feeds total fees separately in the Rust port).
+    /// Total fees paid over the run (accumulated by the engine from fill fees).
     fn total_fees(&self) -> Usd {
-        // Fees are accumulated by the engine; this stub returns 0 to keep the
-        // calculator pure — the engine supplies the real total.
-        Usd::ZERO
+        self.fees_total
     }
 
     fn trade_stats(&self) -> (usize, usize, f64, f64, Usd, Usd, Usd, Usd) {
@@ -319,7 +319,7 @@ mod tests {
                 Usd::new(Decimal::from_str_lenient("10100").unwrap()),
             ),
         ];
-        let calc = MetricsCalculator::new(curve, capital, Usd::ZERO, vec![]);
+        let calc = MetricsCalculator::new(curve, capital, Usd::ZERO, Usd::ZERO, vec![]);
         let m = calc.calculate();
         assert_eq!(m.trade_count, 0);
         assert_eq!(m.win_rate, 0.0);
@@ -336,6 +336,7 @@ mod tests {
         let calc = MetricsCalculator::new(
             curve,
             capital,
+            Usd::ZERO,
             Usd::ZERO,
             vec![
                 Usd::new(Decimal::from_str_lenient("50").unwrap()),
@@ -387,6 +388,7 @@ mod tests {
             curve,
             capital,
             Usd::new(Decimal::from_str_lenient("5").unwrap()),
+            Usd::ZERO,
             pnls,
         );
         let m = calc.calculate();
@@ -407,5 +409,40 @@ mod tests {
         assert_eq!(m.final_equity.to_string(), "10200");
         assert_eq!(m.peak_equity.to_string(), "10200");
         assert!((m.duration_days - 0.125).abs() < 1e-9);
+    }
+
+    #[test]
+    fn total_fees_surfaced_and_no_losses_profit_factor_is_null() {
+        // B17 regression: the report must carry the real fee total (was always
+        // 0), and a no-loss run must serialize profit_factor as an explicit
+        // null rather than an opaque non-finite float.
+        let capital = Usd::new(Decimal::from_str_lenient("10000").unwrap());
+        let curve = vec![
+            (0, capital),
+            (
+                1,
+                Usd::new(Decimal::from_str_lenient("10200").unwrap()),
+            ),
+        ];
+        let pnls = vec![
+            Usd::new(Decimal::from_str_lenient("100").unwrap()),
+            Usd::new(Decimal::from_str_lenient("100").unwrap()),
+        ];
+        let calc = MetricsCalculator::new(
+            curve,
+            capital,
+            Usd::ZERO,
+            Usd::new(Decimal::from_str_lenient("12.5").unwrap()),
+            pnls,
+        );
+        let m = calc.calculate();
+        assert_eq!(m.total_fees.to_string(), "12.5", "fees must be surfaced (B17)");
+        assert_eq!(m.profit_factor, f64::INFINITY);
+        let dict = m.to_dict();
+        assert_eq!(
+            dict["profit_factor"],
+            serde_json::Value::Null,
+            "no-loss profit_factor must serialize as explicit null (B17)"
+        );
     }
 }

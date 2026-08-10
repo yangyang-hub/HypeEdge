@@ -123,7 +123,9 @@ pub fn run_monte_carlo(
     confidence: f64,
     seed: u64,
 ) -> MonteCarloResult {
-    if equity_curve.len() < 2 {
+    if equity_curve.len() < 2 || n_simulations == 0 {
+        // C1: zero simulations must return an empty result, not index an empty
+        // vector.
         return MonteCarloResult {
             n_simulations: 0,
             return_ci_lower: 0.0,
@@ -322,5 +324,16 @@ mod tests {
         assert_eq!(r1.p_value_return, r2.p_value_return);
         assert_eq!(r1.n_simulations, 200);
         assert!(r1.observed_return > 0.0);
+    }
+
+    #[test]
+    fn monte_carlo_zero_simulations_does_not_panic() {
+        // C1 regression: 0 simulations must return an empty result, not index
+        // into an empty vector.
+        let curve: Vec<(i64, f64)> = vec![(0, 100.0), (1, 101.0)];
+        let r = run_monte_carlo(&curve, 0, 0.95, 1);
+        assert_eq!(r.n_simulations, 0);
+        assert_eq!(r.return_ci_lower, 0.0);
+        assert_eq!(r.p_value_return, 1.0);
     }
 }

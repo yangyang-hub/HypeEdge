@@ -3,6 +3,7 @@
 
 use std::sync::Arc;
 
+use axum::response::IntoResponse;
 use hypeedge_config::settings::ApiSettings;
 use sha2::{Digest, Sha256};
 
@@ -84,6 +85,26 @@ impl RoleTokens {
 /// Whether this method is a mutation (requires idempotency key + higher roles).
 pub fn is_mutation(method: &str) -> bool {
     !matches!(method, "GET" | "HEAD" | "OPTIONS")
+}
+
+/// Enforce a minimum role for a mutation. Returns `Ok(())` when the caller's
+/// role is at least `min`; otherwise a 403 `FORBIDDEN` problem response (A23).
+/// The middleware inserts `RoleGuard` for every protected path (granting Admin
+/// when no tokens are configured), so handlers only reach this when the request
+/// is authenticated.
+pub fn authorize(role: ApiRole, min: ApiRole) -> Result<(), Box<axum::response::Response>> {
+    if role >= min {
+        Ok(())
+    } else {
+        Err(Box::new(
+            crate::errors::ApiProblem::new(
+                403,
+                "FORBIDDEN",
+                format!("requires {} role or higher", min.as_str()),
+            )
+            .into_response(),
+        ))
+    }
 }
 
 /// Constant-time comparison (avoids early-return token enumeration).

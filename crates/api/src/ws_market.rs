@@ -4,7 +4,6 @@
 //! in-memory book updates. Frame envelope: `{schema_version, sequence, type,
 //! symbol, data}` — the Phase-6 contract.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use axum::extract::ws::{Message, WebSocket};
@@ -90,5 +89,7 @@ async fn handle_socket(state: AppState, mut socket: WebSocket) {
             }
         }
     }
-    let _ = Arc::new(bus);
+    // C3: drop the bus subscription when the connection closes, so the event
+    // bus does not accumulate a stale mailbox per disconnected browser.
+    bus.unsubscribe(hypeedge_domain::events::EventType::L2BookUpdate, &mailbox);
 }

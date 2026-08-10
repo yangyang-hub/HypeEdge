@@ -48,7 +48,8 @@ impl HypeEdgeApp {
         hypeedge_api::build_router(api_state)
     }
 
-    /// Run the HTTP server until shutdown.
+    /// Run the HTTP server until shutdown (C9: graceful shutdown on
+    /// SIGINT/SIGTERM so in-flight requests drain instead of an abrupt kill).
     pub async fn serve(&self) -> Result<(), String> {
         let api = &self.settings.api;
         let addr = format!("{}:{}", api.host, api.port);
@@ -58,9 +59,35 @@ impl HypeEdgeApp {
         let router = self.router();
         tracing::info!(addr = %addr, "api_server_started");
         axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
             .await
             .map_err(|e| format!("serve: {e}"))
     }
+}
+
+/// Wait for SIGINT (Ctrl-C) or SIGTERM, then signal graceful shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::warn!(error = %e, "ctrl_c handler failed");
+        }
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut sig) => {
+                sig.recv().await;
+            }
+            Err(e) => tracing::warn!(error = %e, "SIGTERM handler failed"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = terminate => {},
+    }
+    tracing::info!("shutdown_signal_received");
 }
 
 /// Build settings from the environment (mirrors `hypeedge.__main__`). When
@@ -184,6 +211,88 @@ mod tests {
         assert!(
             app.kill_switch.is_active().await,
             "kill switch should be latched"
+        );
+    }
+
+    #[tokio::test]
+    async fn kill_switch_reset_actually_clears_latch() {
+        // A22 regression: `POST /api/v1/kill-switch {action:"reset"}` must
+        // clear the latch (it was a no-op that reported success).
+        let settings = dev_settings();
+        let app = HypeEdgeApp::new(settings);
+        let router = app.router();
+        let trigger = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/kill-switch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "ks-trigger")
+                    .body(Body::from(r#"{"action":"trigger"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(trigger.status(), StatusCode::OK);
+        assert!(app.kill_switch.is_active().await);
+
+        let reset = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/kill-switch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "ks-reset")
+                    .body(Body::from(r#"{"action":"reset"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(reset.status(), StatusCode::OK);
+        assert!(
+            !app.kill_switch.is_active().await,
+            "reset must actually clear the latch (A22)"
+        );
+    }
+
+    #[tokio::test]
+    async fn viewer_token_cannot_trigger_kill_switch() {
+        // A23 regression: a viewer credential must not be able to halt trading.
+        let mut settings = dev_settings();
+        settings.api.viewer_token = "viewer-token-12345678901234567890123456789012".into();
+        settings.api.operator_token = "".into();
+        settings.api.admin_token = "".into();
+        settings.api.auth_token = "".into();
+        let app = HypeEdgeApp::new(settings);
+        let router = app.router();
+
+        let resp = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/v1/kill-switch")
+                    .header("content-type", "application/json")
+                    .header("idempotency-key", "viewer-ks")
+                    .header(
+                        "authorization",
+                        "Bearer viewer-token-12345678901234567890123456789012",
+                    )
+                    .body(Body::from(r#"{"action":"trigger"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "viewer must be forbidden from the kill switch (A23)"
+        );
+        assert!(
+            !app.kill_switch.is_active().await,
+            "kill switch must remain inactive after a viewer attempt"
         );
     }
 

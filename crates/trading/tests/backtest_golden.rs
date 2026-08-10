@@ -5,7 +5,7 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use hypeedge_domain::decimal::{Decimal, Price, Size};
+use hypeedge_domain::decimal::{Decimal, Price, Size, Usd};
 use hypeedge_domain::enums::{OrderType, Side, TimeInForce};
 use hypeedge_domain::models::{Candle, OrderIntent};
 use hypeedge_domain::traits::ExecutionClient;
@@ -13,7 +13,7 @@ use hypeedge_infra::event_bus::EventBus;
 use hypeedge_trading::backtest::broker::{
     FeeConfig, SimulatedBroker, SlippageConfig, SlippageMode,
 };
-use hypeedge_trading::backtest::engine::SimulatedExecutionClient;
+use hypeedge_trading::backtest::engine::{BacktestEngine, SimulatedExecutionClient};
 
 fn candles() -> Vec<Candle> {
     (0..10)
@@ -101,4 +101,40 @@ async fn backtest_fills_match_python_golden() {
     assert_eq!(sell.timestamp, 26_200_000, "sell candle timestamp");
 
     let _ = Utc::now();
+}
+
+#[tokio::test]
+async fn backtest_engine_run_produces_fills() {
+    // A24 regression: `BacktestEngine::run` must fill orders submitted through
+    // the caller's simulated client (the pre-fix code built a private client
+    // nothing submitted to, so run() always returned zero fills).
+    let bus = Arc::new(EventBus::new(10_000));
+    let broker = Arc::new(std::sync::Mutex::new(SimulatedBroker::new(
+        FeeConfig::default(),
+        SlippageConfig::default(),
+        SlippageMode::Optimistic,
+    )));
+    let client = Arc::new(SimulatedExecutionClient::new(broker, bus));
+    client
+        .submit_order(intent(Side::Buy, "1", "bt_run"), None)
+        .await
+        .unwrap();
+
+    let engine = BacktestEngine::new();
+    let result = engine
+        .run(
+            candles(),
+            None,
+            client,
+            Usd::new(Decimal::from_str_lenient("10000").unwrap()),
+        )
+        .await;
+
+    assert!(
+        !result.fills.is_empty(),
+        "run() must fill the submitted order (A24)"
+    );
+    assert_eq!(result.fills.len(), 1);
+    assert_eq!(result.fills[0].side, Side::Buy);
+    assert!(!result.equity_curve.is_empty());
 }

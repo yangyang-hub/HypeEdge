@@ -61,6 +61,7 @@ pub struct SseBroker {
     outbox: Option<Arc<PostgresOutboxStore>>,
     pool: Option<PgPool>,
     client_queue_size: usize,
+    replay_size: usize,
     clients: std::sync::Mutex<Vec<(ClientMailbox, i64)>>,
     replay: std::sync::Mutex<VecDeque<BufferedEvent>>,
     seen_sequences: std::sync::Mutex<(VecDeque<i64>, std::collections::HashSet<i64>)>,
@@ -80,6 +81,7 @@ impl SseBroker {
             outbox,
             pool,
             client_queue_size,
+            replay_size,
             clients: std::sync::Mutex::new(Vec::new()),
             replay: std::sync::Mutex::new(VecDeque::with_capacity(replay_size)),
             seen_sequences: std::sync::Mutex::new((
@@ -87,6 +89,15 @@ impl SseBroker {
                 std::collections::HashSet::new(),
             )),
             sequence: std::sync::Mutex::new(0),
+        }
+    }
+
+    /// Append to the in-memory replay ring, trimming to `replay_size` (C4).
+    fn push_replay(&self, event: BufferedEvent) {
+        let mut replay = self.replay.lock().unwrap();
+        replay.push_back(event);
+        while replay.len() > self.replay_size {
+            replay.pop_front();
         }
     }
 
@@ -155,7 +166,7 @@ impl SseBroker {
         let mut seq = self.sequence.lock().unwrap();
         *seq = (*seq).max(event.sequence);
         let buffered = from_durable(event);
-        self.replay.lock().unwrap().push_back(buffered.clone());
+        self.push_replay(buffered.clone());
         self.fan_out(buffered);
     }
 
@@ -206,7 +217,7 @@ impl SseBroker {
                     .unwrap_or_else(|_| "{}".into());
                     let buffered = BufferedEvent { sequence: *seq, event_type: event_type.to_string(), data: body };
                     drop(seq);
-                    self.replay.lock().unwrap().push_back(buffered.clone());
+                    self.push_replay(buffered.clone());
                     self.fan_out(buffered);
                 }
             }
@@ -380,5 +391,56 @@ mod tests {
         let s = e.encode();
         assert!(s.starts_with("id: 3\nevent: order.submitted\nretry: 3000\ndata: {"));
         assert!(s.ends_with("\n\n"));
+    }
+
+    #[tokio::test]
+    async fn replay_ring_is_bounded() {
+        // C4 regression: the in-memory replay ring must trim to replay_size,
+        // not grow without bound.
+        let bus = Arc::new(EventBus::new(16));
+        let broker = SseBroker::new(bus, None, None, 5, 16);
+        for seq in 0..20 {
+            broker.publish(&durable(seq)).await;
+        }
+        assert_eq!(broker.replay.lock().unwrap().len(), 5, "replay ring bounded (C4)");
+    }
+
+    #[tokio::test]
+    async fn legacy_bus_path_delivers_events_to_subscribers() {
+        // C2 regression: the no-store deployment must deliver SSE events through
+        // the legacy bus fan-out (AppState now spawns run_legacy).
+        let bus = Arc::new(EventBus::new(16));
+        let broker = Arc::new(SseBroker::new(bus.clone(), None, None, 1000, 16));
+        let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
+        {
+            let broker = broker.clone();
+            tokio::spawn(async move { broker.run_legacy(stop_rx).await });
+        }
+        let (mailbox, _) = broker.subscribe(None);
+        // Let run_legacy subscribe to the bus before publishing.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let order = hypeedge_domain::models::Order::new(
+            "c1".into(),
+            "BTC".into(),
+            hypeedge_domain::enums::Side::Buy,
+            hypeedge_domain::decimal::Size::new(hypeedge_domain::decimal::Decimal::ONE),
+            None,
+            hypeedge_domain::enums::OrderType::Limit,
+            hypeedge_domain::enums::TimeInForce::Gtc,
+        );
+        bus.publish_sync(Arc::new(
+            hypeedge_domain::events::Event::new(
+                hypeedge_domain::events::DomainEvent::OrderSubmitted(order),
+            ),
+        ))
+        .expect("publish");
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !mailbox.is_empty(),
+            "legacy bus path must deliver events (C2)"
+        );
+        let _ = stop_tx;
     }
 }

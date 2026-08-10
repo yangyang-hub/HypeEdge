@@ -1,8 +1,11 @@
 //! Risk and kill-switch routes, port of `src/hypeedge/api/routes/risk.py`.
 
 use axum::extract::State;
+use axum::extract::Extension;
 use axum::response::Response;
 
+use crate::auth::{authorize, ApiRole};
+use crate::middleware::RoleGuard;
 use crate::errors::{ApiProblem, ok};
 use crate::state::AppState;
 use axum::response::IntoResponse;
@@ -41,8 +44,13 @@ pub async fn risk_status(State(state): State<AppState>) -> Response {
 /// `POST /api/v1/kill-switch` — body `{action: "trigger"|"reset", reason?}`.
 pub async fn kill_switch(
     State(state): State<AppState>,
+    Extension(guard): Extension<RoleGuard>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
+    // A23: kill-switch is admin-only.
+    if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
+        return *resp;
+    }
     let action = body.get("action").and_then(|a| a.as_str()).unwrap_or("");
     match action {
         "trigger" => {
@@ -59,10 +67,12 @@ pub async fn kill_switch(
                 return ApiProblem::new(409, "KILL_SWITCH_NOT_ACTIVE", "Kill switch is not active")
                     .into_response();
             }
-            // Reset: restore the latch. A durable reset requires reconciliation;
-            // here we flip the in-process latch.
-            let _ = state.kill_switch.is_active().await;
-            ok(serde_json::json!({ "action": "reset", "trading_enabled": false }))
+            // A22: actually clear the latch (was a no-op that reported success).
+            state.kill_switch.reset().await;
+            ok(serde_json::json!({
+                "action": "reset",
+                "trading_enabled": !state.kill_switch.is_active().await,
+            }))
         }
         other => ApiProblem::new(
             400,

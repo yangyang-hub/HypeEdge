@@ -11,7 +11,7 @@ use hypeedge_domain::models::{Candle, Fill, FundingRate, Order, OrderIntent, Pos
 use hypeedge_domain::traits::ExecutionClient;
 use hypeedge_infra::event_bus::EventBus;
 
-use super::broker::{FeeConfig, SimulatedBroker, SlippageConfig, SlippageMode};
+use super::broker::SimulatedBroker;
 use super::metrics::MetricsCalculator;
 
 /// Complete result of a single backtest run.
@@ -192,11 +192,10 @@ impl ExecutionClient for SimulatedExecutionClient {
     }
 }
 
-/// The main backtest orchestrator.
-pub struct BacktestEngine {
-    fee_config: FeeConfig,
-    slippage_config: SlippageConfig,
-}
+/// The main backtest orchestrator. Fee/slippage live on the caller-built
+/// [`SimulatedBroker`]; the engine only replays candles, fills orders from the
+/// injected [`SimulatedExecutionClient`], and computes metrics (A24).
+pub struct BacktestEngine;
 
 impl Default for BacktestEngine {
     fn default() -> Self {
@@ -206,10 +205,7 @@ impl Default for BacktestEngine {
 
 impl BacktestEngine {
     pub fn new() -> Self {
-        Self {
-            fee_config: FeeConfig::default(),
-            slippage_config: SlippageConfig::default(),
-        }
+        BacktestEngine
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -217,17 +213,9 @@ impl BacktestEngine {
         &self,
         candles: Vec<Candle>,
         funding_rates: Option<Vec<FundingRate>>,
-        execution: Arc<dyn ExecutionClient>,
+        execution: Arc<SimulatedExecutionClient>,
         initial_capital: Usd,
-        slippage_mode: SlippageMode,
     ) -> BacktestResult {
-        let bus = Arc::new(EventBus::new(10_000));
-        let broker = Arc::new(std::sync::Mutex::new(SimulatedBroker::new(
-            self.fee_config,
-            self.slippage_config,
-            slippage_mode,
-        )));
-
         let mut equity = initial_capital;
         let mut peak_equity = initial_capital;
         let mut positions: HashMap<String, Position> = HashMap::new();
@@ -236,21 +224,20 @@ impl BacktestEngine {
         let mut total_funding = Usd::ZERO;
         let mut applied_funding: std::collections::HashSet<(String, i64)> = Default::default();
         let mut realized_trade_pnls: Vec<Usd> = Vec::new();
+        let mut total_fees = Usd::ZERO;
 
-        // The execution client is the one the strategy uses. For the backtest
-        // we adapt the provided client into a simulated one if it is one;
-        // otherwise we wrap it. The strategy is driven externally.
-        let simulated = SimulatedExecutionClient::new(broker.clone(), bus.clone());
-        let _ = execution;
-
+        // A24: fill orders from the caller-supplied simulated client — the same
+        // one the strategy submits through. The pre-fix code built a private
+        // client nothing ever submitted to, so run() always returned zero fills.
         for candle in &candles {
             // 1. Fill orders submitted on earlier candles.
             let prev_fill_count = all_fills.len();
-            simulated.try_fill_orders(candle, &mut all_fills).await;
+            execution.try_fill_orders(candle, &mut all_fills).await;
 
             // 2. Apply fills to cash and positions.
             for fill in &all_fills[prev_fill_count..] {
                 equity = Usd::new(equity.inner() - fill.fee.inner());
+                total_fees = Usd::new(total_fees.inner() + fill.fee.inner().abs());
                 let realized = Self::update_position(&mut positions, fill);
                 equity = Usd::new(equity.inner() + realized.inner());
                 if !realized.is_zero() {
@@ -289,6 +276,7 @@ impl BacktestEngine {
             equity_curve.clone(),
             initial_capital,
             total_funding,
+            total_fees,
             realized_trade_pnls,
         );
         let metrics = calculator.calculate();

@@ -24,6 +24,20 @@ struct StreamState {
     after: Option<i64>,
     last_sent: i64,
     pending_replay: VecDeque<BufferedEvent>,
+    /// Unsubscribes from the broker when the stream/connection is dropped (C3).
+    _cleanup: CleanupGuard,
+}
+
+/// Unsubscribes a client mailbox when dropped (on disconnect or stream teardown).
+struct CleanupGuard {
+    broker: std::sync::Arc<SseBroker>,
+    mailbox: crate::sse_broker::ClientMailbox,
+}
+
+impl Drop for CleanupGuard {
+    fn drop(&mut self) {
+        self.broker.unsubscribe(&self.mailbox);
+    }
 }
 
 /// `GET /api/v1/events` — durable SSE stream with `Last-Event-ID` replay.
@@ -40,10 +54,14 @@ pub async fn durable_events(
     let initial = StreamState {
         first: true,
         broker: state.sse_broker.clone(),
-        mailbox,
+        mailbox: mailbox.clone(),
         after: after_sequence,
         last_sent: 0,
         pending_replay: VecDeque::new(),
+        _cleanup: CleanupGuard {
+            broker: state.sse_broker.clone(),
+            mailbox,
+        },
     };
 
     let stream = stream::unfold(initial, |mut st| async move {

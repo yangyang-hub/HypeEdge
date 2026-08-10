@@ -5,9 +5,11 @@
 //! holds instances/configs; a Postgres-backed store replaces it when the app
 //! wiring lands.
 
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::response::Response;
 
+use crate::auth::{authorize, ApiRole};
+use crate::middleware::RoleGuard;
 use crate::errors::{ApiProblem, ok};
 use crate::state::AppState;
 use axum::response::IntoResponse;
@@ -59,8 +61,13 @@ pub async fn list_strategies(State(state): State<AppState>) -> Response {
 /// `POST /api/v1/strategies` — create an instance with an initial config.
 pub async fn create_strategy(
     State(state): State<AppState>,
+    Extension(guard): Extension<RoleGuard>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
+    // A23: strategy mutations require Operator.
+    if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
+        return *resp;
+    }
     let strategy_id = body
         .get("strategy_id")
         .and_then(|v| v.as_str())
@@ -148,9 +155,14 @@ pub async fn get_strategy(
 /// `POST /api/v1/strategies/{strategy_id}/actions/{action}` — start/pause/resume/drain/stop.
 pub async fn strategy_action(
     State(state): State<AppState>,
+    Extension(guard): Extension<RoleGuard>,
     Path((strategy_id, action)): Path<(String, String)>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
+    // A23: strategy lifecycle mutations require Operator.
+    if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
+        return *resp;
+    }
     use hypeedge_domain::enums::MarketMakerLifecycle;
     if !matches!(
         action.as_str(),
@@ -254,9 +266,14 @@ pub async fn list_config_versions(
 /// header carries the expected instance revision for the optimistic lock.
 pub async fn create_config_version(
     State(state): State<AppState>,
+    Extension(guard): Extension<RoleGuard>,
     Path(strategy_id): Path<String>,
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Response {
+    // A23: config mutations require Operator.
+    if let Err(resp) = authorize(guard.0, ApiRole::Operator) {
+        return *resp;
+    }
     let Some(store) = &state.config_versions else {
         return ApiProblem::new(503, "MARKET_MAKING_STORE_UNAVAILABLE", "Config creation is unavailable")
             .with_retryable(true)
@@ -315,6 +332,7 @@ mod config_version_tests {
         let state = test_state();
         let resp = create_config_version(
             State(state),
+            Extension(RoleGuard(crate::auth::ApiRole::Admin)),
             Path("tf_1".into()),
             axum::Json(serde_json::json!({
                 "strategy_type": "trend_follow",

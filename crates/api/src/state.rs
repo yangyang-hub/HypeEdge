@@ -72,6 +72,20 @@ impl AppState {
     ) -> Self {
         let role_tokens = RoleTokens::from_settings(&settings.api);
         let sse_broker = Arc::new(SseBroker::new(event_bus.clone(), None, None, 1000, 256));
+        // C2: without a durable outbox publisher wired, drive the SSE broker
+        // from the in-process bus so `/api/v1/events` actually delivers (the
+        // broker's mailbox was never fed, so the endpoint blocked on an empty
+        // queue). The outbox publisher replaces this in the app wiring.
+        if !sse_broker.has_durable_store() {
+            let broker = sse_broker.clone();
+            tokio::spawn(async move {
+                let (stop_tx, stop_rx) = tokio::sync::mpsc::channel(1);
+                // Leak the sender: the loop runs for the bus's lifetime and
+                // exits when the bus mailbox closes at shutdown.
+                std::mem::forget(stop_tx);
+                broker.run_legacy(stop_rx).await;
+            });
+        }
         let mut registry = StrategyRegistry::new();
         // Register a no-op runtime handle factory so the supervisor can drive
         // strategy lifecycle even without a live strategy runtime wired. The
