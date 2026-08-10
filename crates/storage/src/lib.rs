@@ -10,7 +10,6 @@
 //! The ClickHouse writer and spool are added in a later Phase-1 increment.
 
 pub mod adapters;
-pub mod funding_arb_store;
 pub mod checkpoint;
 pub mod clickhouse_writer;
 pub mod command_queue;
@@ -21,6 +20,7 @@ pub mod dedup;
 pub mod duckdb_export;
 pub mod durable_order_store;
 pub mod exchange_ingestor_store;
+pub mod funding_arb_store;
 pub mod outbox;
 pub mod pg;
 pub mod quote_plan_store;

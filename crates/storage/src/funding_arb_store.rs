@@ -78,13 +78,31 @@ fn to_domain(row: CycleRow) -> Result<FundingArbCycle, HypeEdgeError> {
         base_token: row.base_token,
         quote_token: row.quote_token,
         state,
-        target_perp_size: bd_to_dec(row.target_perp_size).map_err(|e| HypeEdgeError::Postgres { message: e.to_string() })?,
-        target_spot_size: bd_to_dec(row.target_spot_size).map_err(|e| HypeEdgeError::Postgres { message: e.to_string() })?,
-        perp_open_size: bd_to_dec(row.perp_open_size).map_err(|e| HypeEdgeError::Postgres { message: e.to_string() })?,
-        spot_open_size: bd_to_dec(row.spot_open_size).map_err(|e| HypeEdgeError::Postgres { message: e.to_string() })?,
-        baseline_spot_size: bd_to_dec(row.baseline_spot_size).map_err(|e| HypeEdgeError::Postgres { message: e.to_string() })?,
-        entry_funding_rate: bd_to_dec(row.entry_funding_rate).map_err(|e| HypeEdgeError::Postgres { message: e.to_string() })?,
-        entry_basis_bps: bd_to_dec(row.entry_basis_bps).map_err(|e| HypeEdgeError::Postgres { message: e.to_string() })?,
+        target_perp_size: bd_to_dec(row.target_perp_size).map_err(|e| HypeEdgeError::Postgres {
+            message: e.to_string(),
+        })?,
+        target_spot_size: bd_to_dec(row.target_spot_size).map_err(|e| HypeEdgeError::Postgres {
+            message: e.to_string(),
+        })?,
+        perp_open_size: bd_to_dec(row.perp_open_size).map_err(|e| HypeEdgeError::Postgres {
+            message: e.to_string(),
+        })?,
+        spot_open_size: bd_to_dec(row.spot_open_size).map_err(|e| HypeEdgeError::Postgres {
+            message: e.to_string(),
+        })?,
+        baseline_spot_size: bd_to_dec(row.baseline_spot_size).map_err(|e| {
+            HypeEdgeError::Postgres {
+                message: e.to_string(),
+            }
+        })?,
+        entry_funding_rate: bd_to_dec(row.entry_funding_rate).map_err(|e| {
+            HypeEdgeError::Postgres {
+                message: e.to_string(),
+            }
+        })?,
+        entry_basis_bps: bd_to_dec(row.entry_basis_bps).map_err(|e| HypeEdgeError::Postgres {
+            message: e.to_string(),
+        })?,
         revision: row.revision as u64,
         spot_entry_cloid: row.spot_entry_cloid,
         perp_entry_cloid: row.perp_entry_cloid,
@@ -109,11 +127,7 @@ const CYCLE_COLUMNS: &str = "cycle_id, strategy_id, config_version_id, config_re
 #[async_trait]
 impl FundingArbCycleStore for PostgresFundingArbCycleStore {
     async fn create(&self, cycle: &FundingArbCycle) -> Result<FundingArbCycle, String> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| format!("begin: {e}"))?;
+        let mut tx = self.pool.begin().await.map_err(|e| format!("begin: {e}"))?;
         sqlx::query(
             &format!(
                 r#"
@@ -200,11 +214,7 @@ impl FundingArbCycleStore for PostgresFundingArbCycleStore {
         payload: Option<serde_json::Value>,
         updates: serde_json::Value,
     ) -> Result<FundingArbCycle, String> {
-        let mut tx = self
-            .pool
-            .begin()
-            .await
-            .map_err(|e| format!("begin: {e}"))?;
+        let mut tx = self.pool.begin().await.map_err(|e| format!("begin: {e}"))?;
         let new_revision = (cycle.revision as i64) + 1;
         let now = Utc::now();
 
@@ -228,8 +238,18 @@ impl FundingArbCycleStore for PostgresFundingArbCycleStore {
         )
         .bind(state.as_str())
         .bind(new_revision)
-        .bind(dec_to_bd(updates.get("perp_open_size").and_then(as_decimal).unwrap_or(cycle.perp_open_size)))
-        .bind(dec_to_bd(updates.get("spot_open_size").and_then(as_decimal).unwrap_or(cycle.spot_open_size)))
+        .bind(dec_to_bd(
+            updates
+                .get("perp_open_size")
+                .and_then(as_decimal)
+                .unwrap_or(cycle.perp_open_size),
+        ))
+        .bind(dec_to_bd(
+            updates
+                .get("spot_open_size")
+                .and_then(as_decimal)
+                .unwrap_or(cycle.spot_open_size),
+        ))
         .bind(updates.get("spot_entry_cloid").and_then(|v| v.as_str()))
         .bind(updates.get("perp_entry_cloid").and_then(|v| v.as_str()))
         .bind(updates.get("compensation_cloid").and_then(|v| v.as_str()))
@@ -305,7 +325,10 @@ impl FundingArbCycleStore for PostgresFundingArbCycleStore {
         if state == FundingArbCycleState::Open {
             updated_cycle.opened_at = Some(now);
         }
-        if matches!(state, FundingArbCycleState::Closed | FundingArbCycleState::Faulted) {
+        if matches!(
+            state,
+            FundingArbCycleState::Closed | FundingArbCycleState::Faulted
+        ) {
             updated_cycle.closed_at = Some(now);
         }
         Ok(updated_cycle)

@@ -87,10 +87,18 @@ async fn funding_arb_cycle_create_get_transition() {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("DELETE FROM strategy_config_versions")
-        .execute(&pool)
-        .await
-        .unwrap();
+    // strategy_config_versions is shared; other strategy config tables FK into it.
+    for t in [
+        "trend_follow_config_versions",
+        "market_maker_config_versions",
+        "funding_arb_config_versions",
+        "strategy_config_versions",
+    ] {
+        sqlx::query(&format!("DELETE FROM {t}"))
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
     sqlx::query("DELETE FROM strategy_instances")
         .execute(&pool)
         .await
@@ -119,7 +127,11 @@ async fn funding_arb_cycle_create_get_transition() {
     assert_eq!(created.state, FundingArbCycleState::EnteringSpot);
 
     // get_active returns the non-closed cycle.
-    let active = store.get_active("fa_test").await.unwrap().expect("active cycle");
+    let active = store
+        .get_active("fa_test")
+        .await
+        .unwrap()
+        .expect("active cycle");
     assert_eq!(active.cycle_id, c.cycle_id);
 
     // Optimistic transition Open.

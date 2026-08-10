@@ -236,9 +236,9 @@ impl StrategyControlPlane {
         ));
         // funding_arb real plugin when its deps are wired.
         if let Some(deps) = funding_arb_deps {
-            registry.register_plugin(hypeedge_trading::funding_arb::runtime::build_funding_arb_plugin(
-                Some(deps),
-            ));
+            registry.register_plugin(
+                hypeedge_trading::funding_arb::runtime::build_funding_arb_plugin(Some(deps)),
+            );
         }
         // market_maker real plugin when its runtime is wired.
         if let Some(runtime) = mm_runtime {
@@ -246,9 +246,11 @@ impl StrategyControlPlane {
                 strategy_type: "market_maker".to_string(),
                 capabilities: hypeedge_trading::strategy::market_maker_capabilities(),
                 factory: Arc::new(move |_ctx| {
-                    Arc::new(hypeedge_trading::market_maker::MarketMakerRuntimeHandle::new(
-                        runtime.clone(),
-                    ))
+                    Arc::new(
+                        hypeedge_trading::market_maker::MarketMakerRuntimeHandle::new(
+                            runtime.clone(),
+                        ),
+                    )
                 }),
             });
         }

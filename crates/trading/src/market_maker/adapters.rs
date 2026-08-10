@@ -222,7 +222,10 @@ impl QuotePlanCommandClient for EngineQuotePlanClient {
                 risk_reducing: false,
                 max_slippage_bps: 50,
             };
-            self.engine.submit_order(intent, None).await.map_err(|e| e.to_string())?;
+            self.engine
+                .submit_order(intent, None)
+                .await
+                .map_err(|e| e.to_string())?;
         }
         Ok(())
     }

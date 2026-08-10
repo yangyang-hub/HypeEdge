@@ -46,7 +46,8 @@ pub struct RuntimeWiring {
     pub safety_mode: Arc<tokio::sync::RwLock<String>>,
     pub action_budget: Option<Arc<tokio::sync::Mutex<ActionBudgetController>>>,
     /// Funding-arb runtime dependencies (wiring follow-up), when a store is wired.
-    pub funding_arb_deps: Option<Arc<hypeedge_trading::funding_arb::runtime::FundingArbRuntimeDependencies>>,
+    pub funding_arb_deps:
+        Option<Arc<hypeedge_trading::funding_arb::runtime::FundingArbRuntimeDependencies>>,
     /// The live market-maker runtime (wiring follow-up) for the WS snapshot provider.
     pub mm_runtime: Option<Arc<hypeedge_trading::market_maker::MarketMakerRuntime>>,
 }
@@ -338,18 +339,20 @@ pub async fn build_runtime(
         if !settings.features.funding_arb_execution_enabled {
             return None;
         }
-        let scanner = Arc::new(hypeedge_trading::funding_arb::live_scanner::LiveFundingArbScanner::new(
-            market_data.clone()?,
-            rest.clone(),
-        ));
+        let scanner = Arc::new(
+            hypeedge_trading::funding_arb::live_scanner::LiveFundingArbScanner::new(
+                market_data.clone()?,
+                rest.clone(),
+            ),
+        );
         let meta = Arc::new(
             hypeedge_trading::funding_arb::live_scanner::InstrumentCacheFundingArbMeta::new(
                 meta_cache.clone(),
             ),
         );
-        let cycles = Arc::new(hypeedge_storage::funding_arb_store::PostgresFundingArbCycleStore::new(
-            pool.clone(),
-        ));
+        let cycles = Arc::new(
+            hypeedge_storage::funding_arb_store::PostgresFundingArbCycleStore::new(pool.clone()),
+        );
         let tracker_ref = account_tracker.clone();
         let fa = settings.funding_arb.clone();
         Some(Arc::new(
@@ -512,7 +515,10 @@ fn build_market_maker_runtime(
     let health = Arc::new(TrackerHealthProvider::new(tracker));
     let slots = Arc::new(EngineSlotProvider::new(engine.clone()));
     let commands = Arc::new(EngineQuotePlanClient::new(engine));
-    let funding = Some(Arc::new(ProviderFundingProvider::new(market_data)) as Arc<dyn hypeedge_trading::market_maker::runtime::FundingSnapshotProvider>);
+    let funding = Some(Arc::new(ProviderFundingProvider::new(market_data))
+        as Arc<
+            dyn hypeedge_trading::market_maker::runtime::FundingSnapshotProvider,
+        >);
     let coordinator = QuoteCoordinator::new(QuoteCoordinatorConfig::default()).ok()?;
 
     // The runtime requires a strategy_id/session_id/symbol; the supervisor

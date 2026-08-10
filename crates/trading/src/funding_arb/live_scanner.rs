@@ -30,12 +30,18 @@ impl InstrumentCacheFundingArbMeta {
 impl FundingArbInstrumentMeta for InstrumentCacheFundingArbMeta {
     fn get(&self, symbol: &str) -> Option<super::runtime::InstrumentInfo> {
         let info = self.cache.get(symbol)?;
-        let base = info.base_token.clone().unwrap_or_else(|| info.symbol.clone());
+        let base = info
+            .base_token
+            .clone()
+            .unwrap_or_else(|| info.symbol.clone());
         Some(super::runtime::InstrumentInfo {
             symbol: info.symbol.clone(),
             display_name: info.display_name.clone(),
             base_token: base,
-            quote_token: info.quote_token.clone().unwrap_or_else(|| "USDC".to_string()),
+            quote_token: info
+                .quote_token
+                .clone()
+                .unwrap_or_else(|| "USDC".to_string()),
             is_spot: info.is_spot,
             tick_size: info.tick_size,
             lot_size: info.lot_size,
@@ -132,7 +138,11 @@ impl LiveFundingArbScanner {
             // On Hyperliquid the perp symbol IS the base token (e.g. "BTC").
             for (base_token, spot_symbol, display) in &base_to_spot {
                 if base_token == perp_symbol {
-                    pairs.push((perp_symbol.to_string(), spot_symbol.clone(), display.clone()));
+                    pairs.push((
+                        perp_symbol.to_string(),
+                        spot_symbol.clone(),
+                        display.clone(),
+                    ));
                 }
             }
         }
@@ -149,7 +159,11 @@ impl FundingArbMarketScanner for LiveFundingArbScanner {
         let mut out = Vec::new();
         let pairs = self.spot_map.lock().await.clone();
         for (perp, spot, display) in pairs {
-            let Some(funding_rate) = funding.iter().find(|f| f.symbol == perp).map(|f| f.funding_rate) else {
+            let Some(funding_rate) = funding
+                .iter()
+                .find(|f| f.symbol == perp)
+                .map(|f| f.funding_rate)
+            else {
                 continue;
             };
             let (Some(perp_book), Some(spot_book)) = (
