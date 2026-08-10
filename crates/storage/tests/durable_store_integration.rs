@@ -443,3 +443,110 @@ async fn system_state_transition_writes_outbox() {
     .unwrap();
     assert_eq!(outbox, 1);
 }
+
+/// Seed the minimal account + position rows the DB risk-scope check requires.
+async fn seed_account_and_position(pool: &sqlx::PgPool) {
+    sqlx::query(
+        "INSERT INTO account_state (sub_account, equity, available_balance, total_margin_used, total_unrealized_pnl, peak_equity, action_credits_remaining, exchange_updated_at, revision, updated_at) VALUES (NULL, 10000, 10000, 0, 0, 10000, 10000, now(), 1, now())",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO positions (position_id, sub_account, symbol, size, mark_price, leverage, exchange_updated_at, revision, created_at, updated_at) VALUES ($1, NULL, 'BTC', 0, 100, 5, now(), 1, now(), now())",
+    )
+    .bind(Uuid::new_v4())
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn system_order_cancel_does_not_violate_unique_command_key() {
+    // A10 regression: a system order (strategy_id None) places an
+    // execution_commands row with (actor_id='execution_engine', cloid); the
+    // cancel command must use a distinct idempotency key or the UNIQUE
+    // constraint rejects it (breaking cancel_all). A repeat cancel is idempotent.
+    let _guard = SERIAL.lock().await;
+    let Some(pool) = try_pool().await else { return };
+    let _test_lock = acquire_test_lock(&pool).await;
+    clean_tables(&pool).await;
+    seed_account_and_position(&pool).await;
+
+    let store = PostgresDurableOrderStore::default();
+    let cloid = valid_cloid(101);
+    let mut order = make_order(&cloid, Side::Buy, "0.1", Some("100"));
+    order.strategy_id = None; // system order -> actor_id 'execution_engine'
+    order.status = OrderStatus::Submitted;
+    store
+        .persist_placement(&pool, &mut order, &passing_risk(), Uuid::new_v4(), true, None)
+        .await
+        .expect("placement persists for a system order");
+
+    store
+        .persist_cancel_requested(&pool, &order, Uuid::new_v4())
+        .await
+        .expect("cancel command must not collide with the place idempotency key");
+
+    store
+        .persist_cancel_requested(&pool, &order, Uuid::new_v4())
+        .await
+        .expect("repeat cancel must be idempotent (ON CONFLICT DO NOTHING)");
+
+    let cancels: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM execution_commands WHERE command_type='cancel_order' AND idempotency_key=$1",
+    )
+    .bind(format!("cancel:{}", &cloid))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cancels, 1, "repeat cancel must not insert a second row");
+}
+
+#[tokio::test]
+async fn immediate_fill_persists_fill_fields() {
+    // A11 regression: an immediate-fill transition must persist filled_size,
+    // avg_fill_price, and filled_at — not `status='filled'` with zero fill data.
+    let _guard = SERIAL.lock().await;
+    let Some(pool) = try_pool().await else { return };
+    let _test_lock = acquire_test_lock(&pool).await;
+    clean_tables(&pool).await;
+    seed_account_and_position(&pool).await;
+
+    let store = PostgresDurableOrderStore::default();
+    let cloid = valid_cloid(102);
+    let mut order = make_order(&cloid, Side::Buy, "0.1", Some("100"));
+    order.status = OrderStatus::Submitted;
+    store
+        .persist_placement(&pool, &mut order, &passing_risk(), Uuid::new_v4(), true, None)
+        .await
+        .expect("placement persists");
+
+    // Mirror the engine's immediate-fill handling: set the fill aggregates on
+    // the order, then persist the `filled` transition.
+    let mut filled = order.clone();
+    filled.status = OrderStatus::Filled;
+    filled.filled_size = hypeedge_domain::Size::new(Decimal::from_str_strict("0.1").unwrap());
+    filled.avg_fill_price =
+        Some(hypeedge_domain::Price::new(Decimal::from_str_strict("99").unwrap()));
+    filled.filled_at = Some(Utc::now());
+    store
+        .persist_transition(&pool, &filled, "filled", Some(Uuid::new_v4()), Some("succeeded"))
+        .await
+        .expect("fill transition persists");
+
+    let (status, filled_size, avg_fill_price, filled_at): (String, String, Option<String>, Option<chrono::DateTime<Utc>>) =
+        sqlx::query_as(
+            "SELECT status, filled_size::text, avg_fill_price::text, filled_at FROM orders WHERE cloid=$1",
+        )
+        .bind(&cloid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "filled");
+    // NUMERIC(38,18) renders the full scale; the fix is that this is the real
+    // fill (not `0`), proving merge_transport_transition persists fill fields.
+    assert_eq!(filled_size, "0.100000000000000000", "filled_size must be persisted (A11)");
+    assert_eq!(avg_fill_price.as_deref(), Some("99.000000000000000000"));
+    assert!(filled_at.is_some(), "filled_at must be persisted (A11)");
+}

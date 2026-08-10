@@ -12,17 +12,20 @@
 //! analytics tables are created by the DDL but populated once the
 //! market-making runtime lands (Phase 5).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use clickhouse::{Client, Row};
 use hypeedge_domain::events::{DomainEvent, Event, EventType};
 use hypeedge_infra::event_bus::{BoundedMailbox, EventBus};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 use tokio::time::{Duration, Instant};
 
+use crate::dedup::DedupFilter;
+
 /// A row for the `l2_book` table.
-#[derive(Row, Serialize, Clone)]
+#[derive(Row, Serialize, Deserialize, Clone)]
 struct L2BookRow {
     #[serde(with = "clickhouse::serde::time::datetime64::millis")]
     ts: OffsetDateTime,
@@ -34,7 +37,7 @@ struct L2BookRow {
 }
 
 /// A row for the `trades` table.
-#[derive(Row, Serialize, Clone)]
+#[derive(Row, Serialize, Deserialize, Clone)]
 struct TradeRow {
     #[serde(with = "clickhouse::serde::time::datetime64::millis")]
     ts: OffsetDateTime,
@@ -46,7 +49,7 @@ struct TradeRow {
 }
 
 /// A row for the `candles` table.
-#[derive(Row, Serialize, Clone)]
+#[derive(Row, Serialize, Deserialize, Clone)]
 struct CandleRow {
     #[serde(with = "clickhouse::serde::time::datetime64::millis")]
     ts: OffsetDateTime,
@@ -60,7 +63,7 @@ struct CandleRow {
 }
 
 /// A row for the `funding` table.
-#[derive(Row, Serialize, Clone)]
+#[derive(Row, Serialize, Deserialize, Clone)]
 struct FundingRow {
     #[serde(with = "clickhouse::serde::time::datetime64::millis")]
     ts: OffsetDateTime,
@@ -72,7 +75,7 @@ struct FundingRow {
 }
 
 /// A row for the `mid_prices` table.
-#[derive(Row, Serialize, Clone)]
+#[derive(Row, Serialize, Deserialize, Clone)]
 struct MidPriceRow {
     #[serde(with = "clickhouse::serde::time::datetime64::millis")]
     ts: OffsetDateTime,
@@ -83,12 +86,33 @@ struct MidPriceRow {
 /// A generic row that carries a ready-to-serialize JSON payload. We serialize
 /// the domain event to a compact value string and store per-table rows
 /// separately; this enum keeps the five core tables' row types unified.
+#[derive(Clone)]
 enum PendingRow {
     L2Book(L2BookRow),
     Trade(TradeRow),
     Candle(CandleRow),
     Funding(FundingRow),
     MidPrice(MidPriceRow),
+}
+
+impl PendingRow {
+    /// The ClickHouse table this row belongs to (for per-table flush/spool).
+    fn table(&self) -> &'static str {
+        match self {
+            PendingRow::L2Book(_) => "l2_book",
+            PendingRow::Trade(_) => "trades",
+            PendingRow::Candle(_) => "candles",
+            PendingRow::Funding(_) => "funding",
+            PendingRow::MidPrice(_) => "mid_prices",
+        }
+    }
+}
+
+/// One line of the JSONL spool: `{"table": "...", "row": {...}}`.
+#[derive(Deserialize)]
+struct SpoolEntry {
+    table: String,
+    row: serde_json::Value,
 }
 
 /// The ClickHouse writer task.
@@ -102,6 +126,16 @@ pub struct ClickHouseWriter {
     flush_count: u64,
     row_count: u64,
     spooled_count: u64,
+    /// In-process dedup of redelivered market-data events (C8).
+    dedup: DedupFilter,
+}
+
+/// How a drain cycle ended (A12): `Flush` means flush-and-continue; `Closed`
+/// means the mailbox closed and the writer must flush once and exit.
+#[derive(Debug, PartialEq, Eq)]
+enum DrainResult {
+    Flush,
+    Closed,
 }
 
 impl ClickHouseWriter {
@@ -129,11 +163,13 @@ impl ClickHouseWriter {
             flush_count: 0,
             row_count: 0,
             spooled_count: 0,
+            dedup: DedupFilter::new(100_000),
         }
     }
 
     /// Run the writer task: subscribe to market-data events, batch them, and
-    /// flush on size or interval. Exits when the mailbox closes.
+    /// flush on size or interval. Replays any previously-spooled rows on
+    /// startup, then exits cleanly when the mailbox closes.
     pub async fn run(&mut self, bus: &Arc<EventBus>) -> Result<(), String> {
         let mailbox = bus.subscribe_many(&[
             EventType::L2BookUpdate,
@@ -145,49 +181,54 @@ impl ClickHouseWriter {
         self.apply_ddl()
             .await
             .map_err(|e| format!("clickhouse ddl: {e}"))?;
+        self.replay_spool().await.map_err(|e| format!("clickhouse spool replay: {e}"))?;
 
         loop {
-            let flush = self
+            match self
                 .drain_until_deadline(&mailbox, self.flush_interval)
-                .await;
-            if flush {
-                self.flush().await?;
-                self.last_flush = Instant::now();
+                .await
+            {
+                DrainResult::Flush => {
+                    self.flush().await?;
+                    self.last_flush = Instant::now();
+                }
+                DrainResult::Closed => {
+                    // A12: a closed mailbox must not busy-loop; flush once and exit.
+                    self.flush().await?;
+                    return Ok(());
+                }
             }
         }
     }
 
-    /// Receive events until the flush interval elapses (or the mailbox closes,
-    /// in which case we flush and return `true` to exit).
+    /// Receive events until the flush interval elapses (flush), the batch fills
+    /// (flush), or the mailbox closes (final flush + exit).
     async fn drain_until_deadline(
         &mut self,
         mailbox: &BoundedMailbox<Arc<Event>>,
         interval: Duration,
-    ) -> bool {
+    ) -> DrainResult {
         let deadline = Instant::now() + interval;
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return true; // interval elapsed -> flush
+                return DrainResult::Flush; // interval elapsed
             }
             match tokio::time::timeout(remaining, mailbox.recv()).await {
                 Ok(Some(event)) => {
                     self.enqueue(&event.payload);
                     if self.rows.len() >= self.batch_size {
-                        return true; // batch full -> flush
+                        return DrainResult::Flush; // batch full
                     }
                 }
-                Ok(None) => {
-                    // Mailbox closed -> flush and signal loop exit.
-                    return true;
-                }
-                Err(_) => return true, // timeout -> flush
+                Ok(None) => return DrainResult::Closed,
+                Err(_) => return DrainResult::Flush, // timeout
             }
         }
     }
 
     fn enqueue(&mut self, payload: &DomainEvent) {
-        let row = match payload {
+        match payload {
             DomainEvent::L2BookUpdate(b) => {
                 let levels = b
                     .bids
@@ -196,117 +237,111 @@ impl ClickHouseWriter {
                     .chain(b.asks.iter().map(|l| (2u8, l)))
                     .enumerate()
                     .map(|(i, (side, l))| {
-                        PendingRow::L2Book(L2BookRow {
-                            ts: dt_ms(b.timestamp),
-                            coin: b.symbol.clone(),
-                            side,
-                            level: i as u16,
-                            px: l.price.inner().to_string().parse().unwrap_or(0.0),
-                            sz: l.size.inner().to_string().parse().unwrap_or(0.0),
-                        })
+                        (
+                            format!("{}|{}|{}", b.timestamp, b.symbol, i),
+                            PendingRow::L2Book(L2BookRow {
+                                ts: dt_ms(b.timestamp),
+                                coin: b.symbol.clone(),
+                                side,
+                                level: i as u16,
+                                px: l.price.inner().to_string().parse().unwrap_or(0.0),
+                                sz: l.size.inner().to_string().parse().unwrap_or(0.0),
+                            }),
+                        )
                     })
                     .collect::<Vec<_>>();
-                self.rows.extend(levels);
-                self.row_count += b.bids.len() as u64 + b.asks.len() as u64;
-                return;
+                for (key, row) in levels {
+                    self.push_if_new("l2_book", &key, row);
+                }
             }
-            DomainEvent::TradeUpdate(t) => Some(PendingRow::Trade(TradeRow {
-                ts: dt_ms(t.timestamp),
-                coin: t.symbol.clone(),
-                px: t.price.inner().to_string().parse().unwrap_or(0.0),
-                sz: t.size.inner().to_string().parse().unwrap_or(0.0),
-                side: match t.side {
-                    hypeedge_domain::enums::Side::Buy => 1,
-                    hypeedge_domain::enums::Side::Sell => 2,
-                },
-                tid: t.tid,
-            })),
-            DomainEvent::CandleUpdate(c) => Some(PendingRow::Candle(CandleRow {
-                ts: dt_ms(c.timestamp),
-                coin: c.symbol.clone(),
-                interval: c.interval.clone(),
-                open: c.open.inner().to_string().parse().unwrap_or(0.0),
-                high: c.high.inner().to_string().parse().unwrap_or(0.0),
-                low: c.low.inner().to_string().parse().unwrap_or(0.0),
-                close: c.close.inner().to_string().parse().unwrap_or(0.0),
-                volume: c.volume.inner().to_string().parse().unwrap_or(0.0),
-            })),
-            DomainEvent::FundingUpdate(f) => Some(PendingRow::Funding(FundingRow {
-                ts: dt_ms(f.timestamp),
-                coin: f.symbol.clone(),
-                funding_rate: f.funding_rate,
-                premium: f.premium,
-                oi: f.open_interest,
-                mark_px: f.mark_price.inner().to_string().parse().unwrap_or(0.0),
-            })),
-            DomainEvent::MidPriceUpdate(m) => Some(PendingRow::MidPrice(MidPriceRow {
-                ts: dt_ms(m.timestamp),
-                coin: m.symbol.clone(),
-                px: m.price.to_string().parse().unwrap_or(0.0),
-            })),
-            _ => None,
-        };
-        if let Some(row) = row {
-            self.rows.push(row);
-            self.row_count += 1;
+            DomainEvent::TradeUpdate(t) => self.push_if_new(
+                "trades",
+                &format!("{}|{}", t.tid, t.symbol),
+                PendingRow::Trade(TradeRow {
+                    ts: dt_ms(t.timestamp),
+                    coin: t.symbol.clone(),
+                    px: t.price.inner().to_string().parse().unwrap_or(0.0),
+                    sz: t.size.inner().to_string().parse().unwrap_or(0.0),
+                    side: match t.side {
+                        hypeedge_domain::enums::Side::Buy => 1,
+                        hypeedge_domain::enums::Side::Sell => 2,
+                    },
+                    tid: t.tid,
+                }),
+            ),
+            DomainEvent::CandleUpdate(c) => self.push_if_new(
+                "candles",
+                &format!("{}|{}|{}", c.timestamp, c.symbol, c.interval),
+                PendingRow::Candle(CandleRow {
+                    ts: dt_ms(c.timestamp),
+                    coin: c.symbol.clone(),
+                    interval: c.interval.clone(),
+                    open: c.open.inner().to_string().parse().unwrap_or(0.0),
+                    high: c.high.inner().to_string().parse().unwrap_or(0.0),
+                    low: c.low.inner().to_string().parse().unwrap_or(0.0),
+                    close: c.close.inner().to_string().parse().unwrap_or(0.0),
+                    volume: c.volume.inner().to_string().parse().unwrap_or(0.0),
+                }),
+            ),
+            DomainEvent::FundingUpdate(f) => self.push_if_new(
+                "funding",
+                &format!("{}|{}", f.timestamp, f.symbol),
+                PendingRow::Funding(FundingRow {
+                    ts: dt_ms(f.timestamp),
+                    coin: f.symbol.clone(),
+                    funding_rate: f.funding_rate,
+                    premium: f.premium,
+                    oi: f.open_interest,
+                    mark_px: f.mark_price.inner().to_string().parse().unwrap_or(0.0),
+                }),
+            ),
+            DomainEvent::MidPriceUpdate(m) => self.push_if_new(
+                "mid_prices",
+                &format!("{}|{}", m.timestamp, m.symbol),
+                PendingRow::MidPrice(MidPriceRow {
+                    ts: dt_ms(m.timestamp),
+                    coin: m.symbol.clone(),
+                    px: m.price.to_string().parse().unwrap_or(0.0),
+                }),
+            ),
+            _ => {}
         }
     }
 
-    /// Flush the buffered rows per table. On failure, spool the rows and clear
-    /// the buffer so a stuck ClickHouse never blocks the event loop.
+    /// Push a row unless its natural key was already seen (C8: dedups
+    /// redelivered market-data events within the process run).
+    fn push_if_new(&mut self, table: &str, key: &str, row: PendingRow) {
+        if self.dedup.check_and_mark(table, key) {
+            return;
+        }
+        self.rows.push(row);
+        self.row_count += 1;
+    }
+
+    /// Flush the buffered rows per table. Only the tables that fail are spooled
+    /// (C5): spooling the whole batch used to lose the rows for tables that had
+    /// already been written and created a duplicate-insert hazard on replay.
     async fn flush(&mut self) -> Result<(), String> {
         if self.rows.is_empty() {
             return Ok(());
         }
         let rows = std::mem::take(&mut self.rows);
-        let mut ok = true;
-
-        let l2 = rows.iter().filter_map(|r| match r {
-            PendingRow::L2Book(r) => Some(r.clone()),
-            _ => None,
-        });
-        let trades = rows.iter().filter_map(|r| match r {
-            PendingRow::Trade(r) => Some(r.clone()),
-            _ => None,
-        });
-        let candles = rows.iter().filter_map(|r| match r {
-            PendingRow::Candle(r) => Some(r.clone()),
-            _ => None,
-        });
-        let funding = rows.iter().filter_map(|r| match r {
-            PendingRow::Funding(r) => Some(r.clone()),
-            _ => None,
-        });
-        let mids = rows.iter().filter_map(|r| match r {
-            PendingRow::MidPrice(r) => Some(r.clone()),
-            _ => None,
-        });
-
-        if let Err(e) = insert_rows(&self.client, "l2_book", l2).await {
-            ok = false;
-            tracing::warn!(table = "l2_book", error = %e, "clickhouse_flush_error");
+        let mut failed: Vec<PendingRow> = Vec::new();
+        for table in ["l2_book", "trades", "candles", "funding", "mid_prices"] {
+            let table_rows: Vec<PendingRow> =
+                rows.iter().filter(|r| r.table() == table).cloned().collect();
+            if table_rows.is_empty() {
+                continue;
+            }
+            if let Err(e) = insert_pending(&self.client, table, &table_rows).await {
+                tracing::warn!(table, error = %e, "clickhouse_flush_error");
+                failed.extend(table_rows);
+            }
         }
-        if let Err(e) = insert_rows(&self.client, "trades", trades).await {
-            ok = false;
-            tracing::warn!(table = "trades", error = %e, "clickhouse_flush_error");
-        }
-        if let Err(e) = insert_rows(&self.client, "candles", candles).await {
-            ok = false;
-            tracing::warn!(table = "candles", error = %e, "clickhouse_flush_error");
-        }
-        if let Err(e) = insert_rows(&self.client, "funding", funding).await {
-            ok = false;
-            tracing::warn!(table = "funding", error = %e, "clickhouse_flush_error");
-        }
-        if let Err(e) = insert_rows(&self.client, "mid_prices", mids).await {
-            ok = false;
-            tracing::warn!(table = "mid_prices", error = %e, "clickhouse_flush_error");
-        }
-
-        if !ok {
-            // Spool the JSON serialization of the failed batch for replay.
-            self.spooled_count += rows.len() as u64;
-            self.append_spool(&rows);
+        if !failed.is_empty() {
+            // Only the failed tables' rows are spooled (C5).
+            self.spooled_count += failed.len() as u64;
+            self.append_spool(&failed);
         }
         self.flush_count += 1;
         Ok(())
@@ -337,6 +372,61 @@ impl ClickHouseWriter {
             };
             let _ = writeln!(file, "{}", line);
         }
+    }
+
+    /// Replay rows previously spooled to the JSONL file (C5): read each line,
+    /// group by table, insert; on success remove the spool so a replayed batch
+    /// is never replayed again (dedup is also enforced by the in-memory filter).
+    async fn replay_spool(&mut self) -> Result<(), String> {
+        let content = match std::fs::read_to_string(&self.spool_path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(format!("spool read: {e}")),
+        };
+        if content.trim().is_empty() {
+            return Ok(());
+        }
+        let mut batches: HashMap<String, Vec<PendingRow>> = HashMap::new();
+        for line in content.lines() {
+            let entry: SpoolEntry = match serde_json::from_str(line) {
+                Ok(e) => e,
+                Err(_) => continue, // tolerate a torn tail line
+            };
+            let row = match entry.table.as_str() {
+                "l2_book" => serde_json::from_value::<L2BookRow>(entry.row)
+                    .ok()
+                    .map(PendingRow::L2Book),
+                "trades" => serde_json::from_value::<TradeRow>(entry.row)
+                    .ok()
+                    .map(PendingRow::Trade),
+                "candles" => serde_json::from_value::<CandleRow>(entry.row)
+                    .ok()
+                    .map(PendingRow::Candle),
+                "funding" => serde_json::from_value::<FundingRow>(entry.row)
+                    .ok()
+                    .map(PendingRow::Funding),
+                "mid_prices" => serde_json::from_value::<MidPriceRow>(entry.row)
+                    .ok()
+                    .map(PendingRow::MidPrice),
+                _ => None,
+            };
+            if let Some(row) = row {
+                batches.entry(entry.table).or_default().push(row);
+            }
+        }
+        let mut all_ok = true;
+        for (table, rows) in &batches {
+            if let Err(e) = insert_pending(&self.client, table, rows).await {
+                tracing::warn!(table, error = %e, "spool_replay_failed");
+                all_ok = false;
+            }
+        }
+        if all_ok {
+            std::fs::remove_file(&self.spool_path)
+                .map_err(|e| format!("spool cleanup: {e}"))?;
+            tracing::info!(path = %self.spool_path.display(), "spool_replayed");
+        }
+        Ok(())
     }
 
     /// Apply the ClickHouse DDL (idempotent).
@@ -382,6 +472,52 @@ async fn insert_rows<T: Row + Serialize>(
     }
     insert.end().await.map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// Dispatch a `PendingRow` batch to the matching table's `insert_rows`.
+async fn insert_pending(
+    client: &Client,
+    table: &str,
+    rows: &[PendingRow],
+) -> Result<(), String> {
+    match table {
+        "l2_book" => {
+            insert_rows(client, table, rows.iter().filter_map(|r| match r {
+                PendingRow::L2Book(r) => Some(r.clone()),
+                _ => None,
+            }))
+            .await
+        }
+        "trades" => {
+            insert_rows(client, table, rows.iter().filter_map(|r| match r {
+                PendingRow::Trade(r) => Some(r.clone()),
+                _ => None,
+            }))
+            .await
+        }
+        "candles" => {
+            insert_rows(client, table, rows.iter().filter_map(|r| match r {
+                PendingRow::Candle(r) => Some(r.clone()),
+                _ => None,
+            }))
+            .await
+        }
+        "funding" => {
+            insert_rows(client, table, rows.iter().filter_map(|r| match r {
+                PendingRow::Funding(r) => Some(r.clone()),
+                _ => None,
+            }))
+            .await
+        }
+        "mid_prices" => {
+            insert_rows(client, table, rows.iter().filter_map(|r| match r {
+                PendingRow::MidPrice(r) => Some(r.clone()),
+                _ => None,
+            }))
+            .await
+        }
+        other => Err(format!("unknown table {other}")),
+    }
 }
 
 /// Convenience: a small self-test that the row construction from a domain event
@@ -456,5 +592,119 @@ mod tests {
         writer.enqueue(&DomainEvent::L2BookUpdate(b));
         assert_eq!(writer.rows.len(), 2, "bid + ask levels enqueued");
         assert_eq!(writer.row_count, 2);
+    }
+
+    #[test]
+    fn enqueue_dedups_redelivered_trade() {
+        // C8 regression: the same trade tid redelivered on the bus must not
+        // produce a second row.
+        let t = Trade {
+            symbol: "BTC".into(),
+            price: Price::new(Decimal::from_str_strict("65000.5").unwrap()),
+            size: Size::new(Decimal::from_str_strict("0.5").unwrap()),
+            side: Side::Buy,
+            tid: 42,
+            timestamp: 1_700_000_000_123,
+            local_ts: Utc::now(),
+        };
+        let mut writer = ClickHouseWriter::new(
+            "http://localhost:8123",
+            "hypeedge",
+            "default",
+            "",
+            1000,
+            Duration::from_secs(5),
+            std::path::PathBuf::from("/tmp/ch_spool_test2.jsonl"),
+        );
+        writer.enqueue(&DomainEvent::TradeUpdate(t.clone()));
+        writer.enqueue(&DomainEvent::TradeUpdate(t));
+        assert_eq!(writer.rows.len(), 1, "duplicate tid deduped");
+        assert_eq!(writer.row_count, 1);
+    }
+
+    #[tokio::test]
+    async fn drain_closed_mailbox_returns_closed() {
+        // A12 regression: a closed mailbox must signal the loop to exit, not
+        // busy-loop flushing forever.
+        let bus = EventBus::new(16);
+        let mailbox = bus.subscribe(EventType::CandleUpdate);
+        let mut writer = ClickHouseWriter::new(
+            "http://localhost:8123",
+            "hypeedge",
+            "default",
+            "",
+            1000,
+            Duration::from_secs(5),
+            std::path::PathBuf::from("/tmp/ch_spool_test3.jsonl"),
+        );
+        mailbox.close();
+        let result = writer
+            .drain_until_deadline(&mailbox, Duration::from_secs(5))
+            .await;
+        assert!(
+            matches!(result, DrainResult::Closed),
+            "closed mailbox must yield Closed, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn pending_row_table_names_cover_all_tables() {
+        // C5 helper: the per-table dispatch in flush/spool/replay is exhaustive.
+        let l2 = PendingRow::L2Book(L2BookRow {
+            ts: millis(0),
+            coin: "BTC".into(),
+            side: 1,
+            level: 0,
+            px: 100.0,
+            sz: 1.0,
+        });
+        assert_eq!(l2.table(), "l2_book");
+        assert_eq!(
+            PendingRow::Trade(TradeRow {
+                ts: millis(0),
+                coin: "BTC".into(),
+                px: 1.0,
+                sz: 1.0,
+                side: 1,
+                tid: 1,
+            })
+            .table(),
+            "trades"
+        );
+        assert_eq!(
+            PendingRow::Candle(CandleRow {
+                ts: millis(0),
+                coin: "BTC".into(),
+                interval: "1m".into(),
+                open: 1.0,
+                high: 1.0,
+                low: 1.0,
+                close: 1.0,
+                volume: 1.0,
+            })
+            .table(),
+            "candles"
+        );
+        assert_eq!(
+            PendingRow::Funding(FundingRow {
+                ts: millis(0),
+                coin: "BTC".into(),
+                funding_rate: 0.0,
+                premium: 0.0,
+                oi: 0.0,
+                mark_px: 1.0,
+            })
+            .table(),
+            "funding"
+        );
+        assert_eq!(
+            PendingRow::MidPrice(MidPriceRow {
+                ts: millis(0),
+                coin: "BTC".into(),
+                px: 1.0,
+            })
+            .table(),
+            "mid_prices"
+        );
     }
 }

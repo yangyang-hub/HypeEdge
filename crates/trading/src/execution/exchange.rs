@@ -62,6 +62,7 @@ pub struct HyperliquidExchangeClient {
     http: reqwest::Client,
     exchange_url: String,
     info_url: String,
+    account_address: String,
 }
 
 impl HyperliquidExchangeClient {
@@ -70,6 +71,7 @@ impl HyperliquidExchangeClient {
         is_mainnet: bool,
         exchange_url: impl Into<String>,
         info_url: impl Into<String>,
+        account_address: impl Into<String>,
     ) -> Self {
         Self {
             private_key,
@@ -77,6 +79,7 @@ impl HyperliquidExchangeClient {
             http: reqwest::Client::new(),
             exchange_url: exchange_url.into(),
             info_url: info_url.into(),
+            account_address: account_address.into().to_lowercase(),
         }
     }
 
@@ -205,18 +208,30 @@ impl ExchangeClient for HyperliquidExchangeClient {
 
 impl HyperliquidExchangeClient {
     fn account_address(&self) -> &str {
-        // The phantom-agent scheme signs with the agent key; the account
-        // address is derived from it. The engine supplies the address via the
-        // credentials; for the status query we return the placeholder below.
-        // (The app wiring passes the real 0x address in a follow-up; status
-        // queries are not on the signed hot path.)
-        "0x0000000000000000000000000000000000000000"
+        &self.account_address
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_address_returns_configured_value() {
+        // A2 regression: queryOrderByCloid must use the real account address,
+        // not the zero-address placeholder.
+        let client = HyperliquidExchangeClient::new(
+            [0u8; 32],
+            false,
+            "https://exchange.test",
+            "https://info.test",
+            "0xAbCdEf1234567890AbCdEf1234567890",
+        );
+        assert_eq!(
+            client.account_address(),
+            "0xabcdef1234567890abcdef1234567890"
+        );
+    }
 
     #[test]
     fn exchange_body_matches_sdk_shape() {

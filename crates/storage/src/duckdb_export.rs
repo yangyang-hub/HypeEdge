@@ -48,10 +48,10 @@ struct TradeChRow {
 struct L2BookChRow {
     ts: f64,
     coin: String,
-    side: String,
-    price: f64,
-    size: f64,
-    level: u8,
+    side: u8,
+    level: u16,
+    px: f64,
+    sz: f64,
 }
 
 #[derive(Debug, Row, Serialize, Deserialize, Clone)]
@@ -179,8 +179,12 @@ async fn query_rows(
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
             while let Some(r) = cursor.next().await.map_err(|e| format!("clickhouse row: {e}"))? {
                 rows.push(vec![
-                    Some(r.ts.to_string()), Some(r.coin), Some(r.side),
-                    Some(r.price.to_string()), Some(r.size.to_string()), Some(r.level.to_string()),
+                    Some(r.ts.to_string()),
+                    Some(r.coin),
+                    Some(r.side.to_string()),
+                    Some(r.level.to_string()),
+                    Some(r.px.to_string()),
+                    Some(r.sz.to_string()),
                 ]);
             }
         }
@@ -207,7 +211,7 @@ fn table_columns(table: &str) -> Result<Vec<String>, String> {
         "candles" => vec!["ts", "coin", "interval", "open", "high", "low", "close", "volume"],
         "funding" => vec!["ts", "coin", "funding_rate", "premium", "oi", "mark_px"],
         "trades" => vec!["ts", "coin", "px", "sz", "side", "tid"],
-        "l2_book" => vec!["ts", "coin", "side", "price", "size", "level"],
+        "l2_book" => vec!["ts", "coin", "side", "level", "px", "sz"],
         "mid_prices" => vec!["ts", "coin", "px"],
         other => return Err(format!("unsupported export table: {other}")),
     };
@@ -225,6 +229,13 @@ mod tests {
             vec!["ts", "coin", "interval", "open", "high", "low", "close", "volume"]
         );
         assert_eq!(table_columns("mid_prices").unwrap(), vec!["ts", "coin", "px"]);
+        // C6: l2_book columns must match the CH schema (ts, coin, side, level,
+        // px, sz) — the pre-fix `price`/`size` names made the export fail with
+        // `Unknown column price`.
+        assert_eq!(
+            table_columns("l2_book").unwrap(),
+            vec!["ts", "coin", "side", "level", "px", "sz"]
+        );
         assert!(table_columns("nope").is_err());
     }
 

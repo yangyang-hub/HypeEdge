@@ -57,10 +57,9 @@ pub type ActionRunner =
 
 /// A request to run one signing action on the serial queue.
 pub struct ActionRequest {
-    pub nonce: u64,
     pub description: String,
     /// The callback that performs the sign + send. Runs inside the serial
-    /// worker (after the monotonic nonce is assigned).
+    /// worker after the monotonic nonce is assigned.
     pub run: ActionRunner,
     pub reply: oneshot::Sender<ActionResult>,
 }
@@ -68,7 +67,6 @@ pub struct ActionRequest {
 /// The serial nonce queue.
 pub struct NonceQueue {
     tx: mpsc::Sender<ActionRequest>,
-    nonce: Arc<NonceGenerator>,
 }
 
 impl NonceQueue {
@@ -79,14 +77,20 @@ impl NonceQueue {
     pub fn with_capacity(capacity: usize) -> Self {
         let nonce = Arc::new(NonceGenerator::new());
         let (tx, mut rx) = mpsc::channel::<ActionRequest>(capacity);
-        // Spawn the serial worker.
+        let worker_nonce = nonce;
+        // Spawn the serial worker. The nonce is assigned *inside* the worker,
+        // immediately before the action runs, so reservation order == execution
+        // order (B1) — two concurrent callers can no longer reserve nonces and
+        // enqueue in a different order, which would have the exchange receive
+        // a higher nonce before a lower one.
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
-                let result = (req.run)(req.nonce).await;
+                let nonce = worker_nonce.next().await;
+                let result = (req.run)(nonce).await;
                 let _ = req.reply.send(result);
             }
         });
-        Self { tx, nonce }
+        Self { tx }
     }
 
     /// Submit an action for serial signing. The nonce is assigned inside the
@@ -95,11 +99,9 @@ impl NonceQueue {
     where
         F: FnOnce(u64) -> Pin<Box<dyn Future<Output = ActionResult> + Send>> + Send + 'static,
     {
-        let nonce = self.nonce.next().await;
         let (reply_tx, reply_rx) = oneshot::channel();
         self.tx
             .send(ActionRequest {
-                nonce,
                 description: description.into(),
                 run: Box::new(run),
                 reply: reply_tx,
@@ -171,6 +173,42 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err, "boom");
+    }
+
+    #[tokio::test]
+    async fn concurrent_submits_nonces_monotonic_in_execution_order() {
+        // B1 regression: nonces are assigned inside the worker, so even under
+        // concurrent submission the *execution* order (== FIFO delivery order)
+        // sees strictly increasing nonces.
+        let queue = Arc::new(NonceQueue::new());
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut handles = Vec::new();
+        for i in 0..8u64 {
+            let q = queue.clone();
+            let seen = seen.clone();
+            handles.push(tokio::spawn(async move {
+                q.submit("conc", move |nonce| {
+                    let seen = seen.clone();
+                    Box::pin(async move {
+                        seen.lock().unwrap().push((i, nonce));
+                        Ok(serde_json::json!({ "nonce": nonce }))
+                    })
+                })
+                .await
+                .unwrap()
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let pairs = seen.lock().unwrap().clone();
+        assert_eq!(pairs.len(), 8);
+        for w in pairs.windows(2) {
+            assert!(
+                w[1].1 > w[0].1,
+                "nonces must be strictly increasing in execution order: {pairs:?}"
+            );
+        }
     }
 
     #[tokio::test]

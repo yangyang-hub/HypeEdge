@@ -241,6 +241,59 @@ async fn order_update_terminal_releases_reservation() {
 }
 
 #[tokio::test]
+async fn filled_order_does_not_regress_on_late_cancelled_update() {
+    // C7 regression: a stale/racing cancelled snapshot (WS vs REST reordering)
+    // must not regress an order that was already filled.
+    let Some(pool) = try_pool().await else { return };
+    let _guard = acquire_test_lock(&pool).await;
+    clean_tables(&pool).await;
+    let projector = PostgresExchangeFactProjector::new(pool.clone(), ACCOUNT);
+
+    let order_id = Uuid::new_v4();
+    sqlx::query(
+        r#"
+        INSERT INTO orders (order_id, cloid, exchange_oid, symbol, side, order_type, time_in_force,
+                            size, status, sub_account, is_spot, revision)
+        VALUES ($1, $2, '777', 'BTC', 'buy', 'limit', 'Gtc', 1, 'acknowledged', $3, false, 0)
+        "#,
+    )
+    .bind(order_id)
+    .bind(hl_cloid(7))
+    .bind(ACCOUNT)
+    .execute(&pool).await.unwrap();
+
+    // The fill arrives first.
+    projector
+        .ingest_order_update(&json!({
+            "order": {"oid": "777", "coin": "BTC", "side": "B", "sz": "1.0", "status": "filled"},
+            "status": "filled",
+            "statusTimestamp": 1_700_000_003_000i64
+        }))
+        .await
+        .unwrap();
+
+    // A stale cancelled snapshot with an *older* timestamp lands afterwards.
+    projector
+        .ingest_order_update(&json!({
+            "order": {"oid": "777", "coin": "BTC", "side": "B", "sz": "1.0", "status": "cancelled"},
+            "status": "cancelled",
+            "statusTimestamp": 1_700_000_001_000i64
+        }))
+        .await
+        .unwrap();
+
+    let (status,): (String,) = sqlx::query_as("SELECT status FROM orders WHERE order_id = $1")
+        .bind(order_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        status, "filled",
+        "a late cancelled snapshot must not regress a filled order (C7)"
+    );
+}
+
+#[tokio::test]
 async fn ingest_funding_records_payment() {
     let Some(pool) = try_pool().await else { return };
     let _guard = acquire_test_lock(&pool).await;

@@ -736,7 +736,12 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
         }
         let was_terminal = TERMINAL_STATUSES.contains(&order.status.as_str());
         let event_terminal = TERMINAL_STATUSES.contains(&event_status.as_str());
-        if !was_terminal || event_terminal {
+        // C7: `filled` is the most meaningful terminal state. A stale/racing
+        // cancelled/rejected snapshot (WS vs REST reordering) must never
+        // regress an order that was already filled — keep `filled`.
+        let filled_prevents_regression =
+            order.status.as_str() == "filled" && event_terminal && event_status != "filled";
+        if !filled_prevents_regression && (!was_terminal || event_terminal) {
             order.status = event_status.clone();
         }
         order.revision += 1;

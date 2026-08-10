@@ -109,6 +109,26 @@ fn tif_wire(tif: TimeInForce) -> &'static str {
     }
 }
 
+/// Canonical identity of an order intent, used as the auto-cloid key (A3): two
+/// intents are the same order iff they serialize to the same key.
+fn intent_key(intent: &OrderIntent) -> String {
+    format!(
+        "{}|{}|{}|{}|{}|{}|{}|{}|{}",
+        intent.symbol,
+        intent.side.as_str(),
+        intent.size.inner().to_exact_string(),
+        intent
+            .price
+            .map(|p| p.inner().to_exact_string())
+            .unwrap_or_default(),
+        intent.order_type.as_str(),
+        intent.time_in_force.as_str(),
+        intent.reduce_only,
+        intent.risk_reducing,
+        intent.max_slippage_bps,
+    )
+}
+
 /// Real execution engine. Clonable handle (all state is shared behind Arcs).
 #[derive(Clone)]
 pub struct ExecutionEngine {
@@ -237,12 +257,14 @@ impl ExecutionEngine {
         // Normalize against instrument rules (quantizes size/price).
         let intent = self.normalize_intent(intent).await?;
 
-        // Canonical cloid.
-        let raw_cloid = intent
-            .cloid
-            .clone()
-            .or_else(|| Some(CloidGenerator::generate(intent.strategy_id.as_deref())))
-            .expect("cloid always set");
+        // Canonical cloid. Caller-supplied cloids pass through; auto cloids are
+        // deterministic from the normalized intent (A3) so a crash/replay with
+        // the same intent reuses the same cloid and idempotency returns the
+        // original order instead of double-submitting.
+        let raw_cloid = match intent.cloid.clone() {
+            Some(c) => c,
+            None => CloidGenerator::deterministic(intent.strategy_id.as_deref(), &intent_key(&intent)),
+        };
         let cloid = CloidGenerator::to_hl_cloid(&raw_cloid);
 
         let intent = OrderIntent {
@@ -288,28 +310,37 @@ impl ExecutionEngine {
                 return Ok(order);
             }
         }
-        let reference_price = intent.price.map(|p| p.inner());
-        if reference_price.is_none() {
-            // Pull the mid from the provider for market orders and notional checks.
-            let snap = match &self.market_data_provider {
-                Some(p) => p.get_price_snapshot(&intent.symbol).await?,
-                None => None,
+        // Resolve the reference price (A1/A16). The provider snapshot is
+        // fetched for every order — not just market orders — so the risk
+        // checker's notional uses the live mid rather than the order's own
+        // limit price. Market orders *require* a fresh mid (fail-closed when
+        // the provider is absent or the price is stale); limit orders fall
+        // back to their own price.
+        let market_snap = match &self.market_data_provider {
+            Some(p) => p.get_price_snapshot(&intent.symbol).await?,
+            None => None,
+        };
+        let stale = match &market_snap {
+            Some(snap) => DateTime::from_timestamp_millis(snap.timestamp).is_some_and(|observed| {
+                let age = (Utc::now() - observed).num_milliseconds() as f64 / 1000.0;
+                age > self.market_price_stale_seconds
+            }),
+            None => false,
+        };
+        let reference_price = match &market_snap {
+            Some(snap) if !stale => Some(snap.price),
+            _ => intent.price.map(|p| p.inner()),
+        };
+        if intent.order_type == OrderType::Market && reference_price.is_none() {
+            let reason = if market_snap.is_none() {
+                "market_price_not_available"
+            } else {
+                "market_price_stale"
             };
-            if let Some(snap) = snap {
-                // Note: MidPrice carries the exchange timestamp (ms); used as a
-                // freshness proxy until a local receipt timestamp is added.
-                let observed = DateTime::from_timestamp_millis(snap.timestamp);
-                if let Some(observed) = observed {
-                    let age = (Utc::now() - observed).num_milliseconds() as f64 / 1000.0;
-                    if age > self.market_price_stale_seconds {
-                        let risk = risk_fail("market_price_stale");
-                        let order = self.rejected_order(&intent, "market_price_stale");
-                        self.persist_placement(&order, &risk, None, false, Some(snap.price))
-                            .await?;
-                        return Ok(order);
-                    }
-                }
-            }
+            let risk = risk_fail(reason);
+            let order = self.rejected_order(&intent, reason);
+            self.persist_placement(&order, &risk, None, false, reference_price).await?;
+            return Ok(order);
         }
 
         // Risk check (in-process, fail-safe timeout).
@@ -1070,7 +1101,7 @@ impl ExecutionEngine {
         let cloid = intent
             .cloid
             .clone()
-            .unwrap_or_else(|| CloidGenerator::generate(intent.strategy_id.as_deref()));
+            .unwrap_or_else(|| CloidGenerator::deterministic(intent.strategy_id.as_deref(), &intent_key(intent)));
         let order = Order {
             cloid,
             symbol: intent.symbol.clone(),
@@ -1199,7 +1230,24 @@ impl ExecutionEngine {
             return Ok(true);
         }
 
-        let reference_price = order.price.map(|p| p.inner());
+        // Resolve a market reference for market orders on replay (A1): the
+        // persisted order has no limit price, so a market order needs a fresh
+        // mid to build the aggressive IoC wire.
+        let mut reference_price = order.price.map(|p| p.inner());
+        if reference_price.is_none()
+            && let Some(snap) = match &self.market_data_provider {
+                Some(p) => p.get_price_snapshot(&order.symbol).await?,
+                None => None,
+            }
+        {
+            let fresh = DateTime::from_timestamp_millis(snap.timestamp).is_none_or(|observed| {
+                (Utc::now() - observed).num_milliseconds() as f64 / 1000.0
+                    <= self.market_price_stale_seconds
+            });
+            if fresh {
+                reference_price = Some(snap.price);
+            }
+        }
         let outcome = self.submit_to_exchange(&intent, cloid, reference_price).await;
         match outcome {
             SubmitOutcome::Response(resp) => {
@@ -1432,7 +1480,7 @@ mod tests {
     use crate::execution::exchange::ExchangeClient;
     use async_trait::async_trait;
     use hypeedge_domain::decimal::{Price, Size};
-    use hypeedge_domain::models::{AccountState, Position};
+    use hypeedge_domain::models::{AccountState, MidPrice, Position};
     use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
     struct MockExchange {
@@ -1505,6 +1553,25 @@ mod tests {
         }
     }
 
+    struct FakeMarketDataProvider {
+        mid: Option<MidPrice>,
+    }
+    #[async_trait]
+    impl MarketDataProvider for FakeMarketDataProvider {
+        async fn get_price_snapshot(
+            &self,
+            _symbol: &str,
+        ) -> Result<Option<MidPrice>, HypeEdgeError> {
+            Ok(self.mid.clone())
+        }
+        async fn get_best_bid_ask(
+            &self,
+            _symbol: &str,
+        ) -> Result<Option<(Decimal, Decimal)>, HypeEdgeError> {
+            Ok(None)
+        }
+    }
+
     /// An account facade with nothing available — the risk checker must reject.
     struct NoAccountView;
     impl crate::risk::checker::AccountView for NoAccountView {
@@ -1526,25 +1593,7 @@ mod tests {
     }
 
     fn base_engine(exchange: Arc<dyn ExchangeClient>) -> ExecutionEngine {
-        let bus = Arc::new(EventBus::new(256));
-        let ks = Arc::new(KillSwitch::new(bus.clone(), true));
-        ExecutionEngine::new(ExecutionEngineConfig {
-            nonce: Arc::new(NonceQueue::new()),
-            event_bus: bus,
-            kill_switch: ks,
-            exchange,
-            account_address: "0xabc".into(),
-            safety: None,
-            risk_checker: None,
-            rate_limiter: Some(Arc::new(rate_limiter())),
-            durable_store: None,
-            market_data_provider: None,
-            order_normalizer: None,
-            asset_index_provider: Some(Arc::new(FakeAssetIndex)),
-            deferred_execution: false,
-            market_price_stale_seconds: 5.0,
-            durable_kill_trigger: None,
-        })
+        base_engine_with_provider(exchange, None)
     }
 
     fn limit_intent() -> OrderIntent {
@@ -1564,6 +1613,50 @@ mod tests {
             risk_reducing: false,
             max_slippage_bps: 50,
         }
+    }
+
+    fn market_intent() -> OrderIntent {
+        OrderIntent {
+            symbol: "BTC".into(),
+            side: Side::Buy,
+            size: Size::new(Decimal::from_str_strict("1.0").unwrap()),
+            price: None,
+            order_type: OrderType::Market,
+            time_in_force: TimeInForce::Ioc,
+            strategy_id: Some("test".into()),
+            sub_account: None,
+            reduce_only: false,
+            cloid: None,
+            client_id: None,
+            is_spot: false,
+            risk_reducing: false,
+            max_slippage_bps: 50,
+        }
+    }
+
+    fn base_engine_with_provider(
+        exchange: Arc<dyn ExchangeClient>,
+        provider: Option<Arc<dyn MarketDataProvider>>,
+    ) -> ExecutionEngine {
+        let bus = Arc::new(EventBus::new(256));
+        let ks = Arc::new(KillSwitch::new(bus.clone(), true));
+        ExecutionEngine::new(ExecutionEngineConfig {
+            nonce: Arc::new(NonceQueue::new()),
+            event_bus: bus,
+            kill_switch: ks,
+            exchange,
+            account_address: "0xabc".into(),
+            safety: None,
+            risk_checker: None,
+            rate_limiter: Some(Arc::new(rate_limiter())),
+            durable_store: None,
+            market_data_provider: provider,
+            order_normalizer: None,
+            asset_index_provider: Some(Arc::new(FakeAssetIndex)),
+            deferred_execution: false,
+            market_price_stale_seconds: 5.0,
+            durable_kill_trigger: None,
+        })
     }
 
     #[tokio::test]
@@ -1597,6 +1690,58 @@ mod tests {
         let order = engine.submit_order(limit_intent(), None).await.unwrap();
         assert_eq!(order.status, OrderStatus::Rejected);
         assert!(order.error_message.as_deref().unwrap().contains("Invalid price"));
+    }
+
+    #[tokio::test]
+    async fn market_order_with_fresh_mid_succeeds() {
+        // A1 regression: a market order with a fresh provider mid must build
+        // the aggressive IoC wire and reach the exchange (previously rejected
+        // as `market_price_not_available`).
+        let exchange: Arc<dyn ExchangeClient> = Arc::new(MockExchange::new(vec![
+            serde_json::json!({"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 7}}]}}}),
+        ]));
+        let provider = Some(Arc::new(FakeMarketDataProvider {
+            mid: Some(MidPrice {
+                symbol: "BTC".into(),
+                price: Decimal::from_str_strict("50000").unwrap(),
+                timestamp: chrono::Utc::now().timestamp_millis(),
+            }),
+        }) as Arc<dyn MarketDataProvider>);
+        let engine = base_engine_with_provider(exchange, provider);
+        let order = engine.submit_order(market_intent(), None).await.unwrap();
+        assert_eq!(order.status, OrderStatus::Acknowledged);
+    }
+
+    #[tokio::test]
+    async fn market_order_without_provider_rejected_fail_closed() {
+        // A1 fail-closed: no provider -> market order rejected, never sent.
+        let exchange: Arc<dyn ExchangeClient> = Arc::new(MockExchange::new(vec![]));
+        let engine = base_engine(exchange); // provider: None
+        let order = engine.submit_order(market_intent(), None).await.unwrap();
+        assert_eq!(order.status, OrderStatus::Rejected);
+        assert_eq!(
+            order.error_message.as_deref(),
+            Some("market_price_not_available")
+        );
+    }
+
+    #[tokio::test]
+    async fn market_order_with_stale_mid_rejected_fail_closed() {
+        // A1 fail-closed: a stale mid (older than market_price_stale_seconds)
+        // must not be used for a market order.
+        let exchange: Arc<dyn ExchangeClient> = Arc::new(MockExchange::new(vec![]));
+        let stale_ts = chrono::Utc::now().timestamp_millis() - 60_000; // 60s old, stale limit 5s
+        let provider = Some(Arc::new(FakeMarketDataProvider {
+            mid: Some(MidPrice {
+                symbol: "BTC".into(),
+                price: Decimal::from_str_strict("50000").unwrap(),
+                timestamp: stale_ts,
+            }),
+        }) as Arc<dyn MarketDataProvider>);
+        let engine = base_engine_with_provider(exchange, provider);
+        let order = engine.submit_order(market_intent(), None).await.unwrap();
+        assert_eq!(order.status, OrderStatus::Rejected);
+        assert_eq!(order.error_message.as_deref(), Some("market_price_stale"));
     }
 
     #[tokio::test]

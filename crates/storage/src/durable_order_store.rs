@@ -692,11 +692,12 @@ impl PostgresDurableOrderStore {
                 command_id, order_id, command_type, actor_type, actor_id, idempotency_key,
                 status, payload, available_at, created_at, updated_at
             ) VALUES ($1,$2,'cancel_order','system','execution_engine',$3,'pending',$4,now(),now(),now())
+            ON CONFLICT (actor_id, idempotency_key) DO NOTHING
             "#,
         )
         .bind(command_id)
         .bind(record.order_id)
-        .bind(&order.cloid)
+        .bind(format!("cancel:{}", order.cloid))
         .bind(payload)
         .execute(&mut *tx)
         .await
@@ -964,6 +965,16 @@ fn merge_transport_transition(record: &OrderRow, order: &Order) -> Result<Order,
     if merged.acknowledged_at.is_none() {
         merged.acknowledged_at = order.acknowledged_at;
     }
+    // Fill aggregates never regress (A11): an immediate-fill response or a
+    // status-query `filled` must persist the actual fill data, not leave
+    // `status='filled'` with `filled_size=0`.
+    if order.filled_size.inner() > merged.filled_size.inner() {
+        merged.filled_size = order.filled_size;
+    }
+    if let Some(price) = order.avg_fill_price {
+        merged.avg_fill_price = Some(price);
+    }
+    merged.filled_at = order.filled_at.or(merged.filled_at);
     Ok(merged)
 }
 

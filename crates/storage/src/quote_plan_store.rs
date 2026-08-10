@@ -52,11 +52,21 @@ pub struct QuotePlanChildRow {
 /// The Postgres-backed [`QuotePlanStore`] implementation.
 pub struct PostgresQuotePlanStore {
     pool: PgPool,
+    /// Lease duration for claimed child items; expired leases are reclassified
+    /// back to `pending` so a crashed worker's items are never stuck (A13).
+    lease_seconds: i64,
 }
 
 impl PostgresQuotePlanStore {
     pub fn new(pool: PgPool) -> Self {
-        Self { pool }
+        Self::with_lease(pool, 30)
+    }
+
+    pub fn with_lease(pool: PgPool, lease_seconds: i64) -> Self {
+        Self {
+            pool,
+            lease_seconds,
+        }
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -70,6 +80,28 @@ impl PostgresQuotePlanStore {
         now: DateTime<Utc>,
     ) -> Result<Option<QuoteDispatchChild>, HypeEdgeError> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
+        let lease_cutoff = now - chrono::Duration::seconds(self.lease_seconds);
+
+        // Reap expired child leases (A13): a worker that crashed between
+        // `claim_child` and `record_attempt`/`finish_without_send` left the item
+        // `processing` forever; the claim query only matches `pending`, so
+        // nothing could ever reclaim it (parent plan never reaches terminal,
+        // slot stuck inflight). Mirror `command_queue`'s lease expiry.
+        sqlx::query(
+            r#"
+            UPDATE execution_command_items i
+            SET status = 'pending', locked_at = NULL, locked_by = NULL, updated_at = now()
+            FROM execution_commands c
+            WHERE c.command_id = i.command_id
+              AND c.command_type = 'quote_plan'
+              AND i.status = 'processing'
+              AND i.locked_at < $1
+            "#,
+        )
+        .bind(lease_cutoff)
+        .execute(&mut *tx)
+        .await
+        .map_err(map_sqlx)?;
 
         let row: Option<QuotePlanChildRow> = sqlx::query_as::<_, QuotePlanChildRow>(
             r#"

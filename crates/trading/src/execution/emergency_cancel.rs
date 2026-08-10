@@ -389,13 +389,26 @@ impl WalEmergencyCancelExecutor {
             .collect();
 
         let mut attempts = std::collections::HashMap::new();
+        let mut unresolved = Vec::new();
         for target in &targets {
-            attempts.insert(target.key(), self.dispatch(target).await?);
+            // D2: an unknown/unresolvable symbol must not abort the whole
+            // cancel-all — skip it, report it, and keep cancelling the rest.
+            match self.dispatch(target).await {
+                Ok(attempt_id) => {
+                    attempts.insert(target.key(), attempt_id);
+                }
+                Err(e) => {
+                    tracing::error!(symbol = %target.symbol, error = %e, "emergency_cancel_dispatch_failed");
+                    unresolved.push(target.clone());
+                }
+            }
         }
 
         let remaining = self.open_orders.get_open_orders().await?;
-        let mut unresolved = Vec::new();
         for target in &targets {
+            if !attempts.contains_key(&target.key()) {
+                continue; // already counted in unresolved above
+            }
             let result = self
                 .verify(target, &remaining, attempts.get(&target.key()).map(String::as_str))
                 .await?;
@@ -462,19 +475,20 @@ impl WalEmergencyCancelExecutor {
 
     /// Journal a dispatch intent, then send the signed cancel through the sole
     /// nonce queue. A transport failure is journaled, never raised, so the
-    /// attempt stays recoverable.
+    /// attempt stays recoverable. The asset index is resolved *before* the
+    /// intent is journaled (D2): an unknown symbol fails fast without leaving a
+    /// poisoned `dispatch_intent` that would abort every later recovery.
     async fn dispatch(&self, target: &EmergencyCancelTarget) -> Result<String, HypeEdgeError> {
-        let attempt_id = uuid::Uuid::new_v4().to_string();
-        self.journal
-            .append(&attempt_id, "dispatch_intent", target, None, None)
-            .await?;
-
         let asset = self
             .asset_index
             .asset_index(&target.symbol)
             .ok_or_else(|| HypeEdgeError::Execution {
                 message: format!("unknown symbol for emergency cancel: {}", target.symbol),
             })?;
+        let attempt_id = uuid::Uuid::new_v4().to_string();
+        self.journal
+            .append(&attempt_id, "dispatch_intent", target, None, None)
+            .await?;
 
         let exchange = self.exchange.clone();
         let nonce = self.nonce.clone();
@@ -592,10 +606,15 @@ fn find_target(
     candidates: &[EmergencyCancelTarget],
     target: &EmergencyCancelTarget,
 ) -> Option<EmergencyCancelTarget> {
-    candidates
-        .iter()
-        .find(|candidate| candidate.key() == target.key())
-        .cloned()
+    candidates.iter().find(|candidate| {
+        // Match by canonical identity first; also fall back to a bare oid match
+        // (D2) so an order that the exchange reports only by oid is still
+        // recognized instead of reporting a false `already_absent`.
+        candidate.key() == target.key()
+            || (target.oid.is_some()
+                && candidate.oid.is_some()
+                && candidate.oid.as_deref() == target.oid.as_deref())
+    }).cloned()
 }
 
 fn canonical_cloid(cloid: &str) -> String {
@@ -869,6 +888,19 @@ mod tests {
         assert!(EmergencyCancelTarget::new("", Some("c1".into()), None).is_err());
         assert!(EmergencyCancelTarget::new("BTC", None, None).is_err());
         assert!(EmergencyCancelTarget::new("BTC", Some("c1".into()), None).is_ok());
+    }
+
+    #[test]
+    fn find_target_falls_back_to_oid_match() {
+        // D2 regression: a target keyed by cloid must still match an
+        // authoritative order the exchange reports only by oid (otherwise
+        // `cancel` returns a false `already_absent` while the order stays live).
+        let target = EmergencyCancelTarget::new("BTC", Some("0xc1".into()), Some("123".into())).unwrap();
+        let oid_only = EmergencyCancelTarget::new("BTC", None, Some("123".into())).unwrap();
+        // Keys differ (cloid:... vs oid:BTC:123), so without the oid fallback
+        // this would return None.
+        let matched = find_target(&[oid_only], &target);
+        assert!(matched.is_some(), "oid fallback must match the live order");
     }
 
     #[tokio::test]

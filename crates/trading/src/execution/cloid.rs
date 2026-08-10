@@ -25,10 +25,27 @@ impl CloidGenerator {
         cloid
     }
 
-    /// Deterministic cloid for a strategy sequence number.
+    /// Deterministic cloid for a strategy sequence number: the same
+    /// `(strategy_id, seq)` always yields the same cloid, so a caller using it
+    /// for replay/idempotency can rely on it across restarts. No timestamp.
     pub fn generate_for_strategy(strategy_id: &str, seq: u32) -> String {
-        let ts = chrono::Utc::now().timestamp_millis();
-        let mut cloid = format!("{strategy_id}_{ts}_{seq:04}");
+        let mut cloid = format!("{strategy_id}_{seq:04}");
+        if cloid.len() > 64 {
+            cloid.truncate(64);
+        }
+        cloid
+    }
+
+    /// Deterministic cloid for a strategy intent (A3): same normalized intent
+    /// key → same cloid (idempotent replay returns the original order); a
+    /// different intent → a different cloid. Auto-generated cloids must not
+    /// embed a random suffix, or a crash between submission and persistence
+    /// would make a restart double-submit.
+    pub fn deterministic(strategy_id: Option<&str>, intent_key: &str) -> String {
+        let prefix = strategy_id.map(|s| &s[..s.len().min(20)]).unwrap_or("sys");
+        let digest = Sha256::digest(intent_key.as_bytes());
+        let hex = hex::encode(&digest[..12]);
+        let mut cloid = format!("{prefix}_{hex}");
         if cloid.len() > 64 {
             cloid.truncate(64);
         }
@@ -101,5 +118,26 @@ mod tests {
         assert!(!CloidGenerator::validate("   "));
         let long = "x".repeat(65);
         assert!(!CloidGenerator::validate(&long));
+    }
+
+    #[test]
+    fn deterministic_is_stable_per_intent_and_differs_across_intents() {
+        let key = "BTC|buy|1|100|limit|Gtc|false|false|50";
+        let a = CloidGenerator::deterministic(Some("tf_1"), key);
+        let b = CloidGenerator::deterministic(Some("tf_1"), key);
+        assert_eq!(a, b, "same intent key -> same cloid (idempotent replay)");
+        let c = CloidGenerator::deterministic(Some("tf_1"), "ETH|buy|1|100|limit|Gtc|false|false|50");
+        assert_ne!(a, c, "different intent -> different cloid");
+        assert!(CloidGenerator::validate(&a));
+        assert!(a.len() <= 64);
+    }
+
+    #[test]
+    fn generate_for_strategy_is_deterministic() {
+        // D1: no timestamp — the same (strategy_id, seq) always yields the same cloid.
+        let a = CloidGenerator::generate_for_strategy("tf_1", 7);
+        let b = CloidGenerator::generate_for_strategy("tf_1", 7);
+        assert_eq!(a, b);
+        assert_ne!(a, CloidGenerator::generate_for_strategy("tf_1", 8));
     }
 }
