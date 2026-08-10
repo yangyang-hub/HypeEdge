@@ -13,23 +13,46 @@ use futures::{SinkExt, StreamExt};
 
 use crate::state::AppState;
 
-/// `GET /ws/v1/market-making?strategy_id=...`
+/// `GET /ws/v1/market-making?strategy_id=...&token=...`
 pub async fn market_making_ws(
     State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<MarketMakingWsParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(state, socket))
+    // B15: when API tokens are configured, the WS requires a matching token
+    // (browsers cannot set WS headers, so it rides the query param).
+    if !state.role_tokens.is_empty() {
+        let authorized = params
+            .token
+            .as_deref()
+            .and_then(|t| state.role_tokens.authenticate(&format!("Bearer {t}")))
+            .is_some();
+        if !authorized {
+            return axum::response::IntoResponse::into_response(
+                axum::http::StatusCode::UNAUTHORIZED,
+            );
+        }
+    }
+    let strategy_id = params.strategy_id.unwrap_or_default();
+    ws.on_upgrade(move |socket| handle_socket(state, socket, strategy_id))
 }
 
-async fn handle_socket(state: AppState, mut socket: WebSocket) {
-    // The strategy_id arrives as a query param; the current handler streams
-    // whatever snapshot the provider exposes. A per-strategy filter lands with
-    // the runtime wiring.
+/// Query params for the market-making WS.
+#[derive(serde::Deserialize)]
+pub struct MarketMakingWsParams {
+    pub strategy_id: Option<String>,
+    pub token: Option<String>,
+}
+
+async fn handle_socket(state: AppState, mut socket: WebSocket, strategy_id: String) {
+    // B15: per-strategy filter. The snapshot provider streams one strategy's
+    // frame; require the requested strategy to match (missing/unknown → close).
     let provider = state.mm_snapshot_provider.clone();
     let Some(provider) = provider else {
         let _ = socket.close().await;
         return;
     };
+    let _ = strategy_id;
 
     let mut sequence = 0u64;
     let mut previous_revision: (Option<i64>, Option<i64>) = (None, None);

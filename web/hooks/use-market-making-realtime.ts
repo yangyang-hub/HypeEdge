@@ -103,6 +103,10 @@ export function useMarketMakingRealtime(
     let staleTimer: ReturnType<typeof setTimeout> | undefined
 
     function markFresh() {
+      // B13: a fresh message means the feed is live again — reset the state to
+      // connected before re-arming the stale timer (previously it stayed stale
+      // forever after one idle window).
+      setConnectionState("connected")
       if (staleTimer) clearTimeout(staleTimer)
       staleTimer = setTimeout(() => setConnectionState("stale"), 5000)
     }
@@ -112,6 +116,10 @@ export function useMarketMakingRealtime(
       setConnectionState("connecting")
       const url = new URL(`${configuredBase}/ws/v1/market-making`)
       url.searchParams.set("strategy_id", strategyId)
+      // B15: attach a token when one is configured (backend requires it when
+      // API auth is on; browsers cannot set WS headers).
+      const token = process.env.NEXT_PUBLIC_HYPEEDGE_MM_WS_TOKEN
+      if (token) url.searchParams.set("token", token)
       socket = new WebSocket(url)
       socket.onopen = () => {
         setConnectionState("connected")

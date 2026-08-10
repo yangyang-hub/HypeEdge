@@ -97,6 +97,10 @@ export function useMarket(symbol: string, interval: string) {
       socket.onmessage = (event) => {
         try {
           const message = JSON.parse(String(event.data)) as MarketStreamMessage
+          // B14: only apply frames for the selected symbol. The WS served the
+          // whole book for one symbol before, which polluted other symbols'
+          // caches with BTC data.
+          if (message.symbol && message.symbol !== symbol) return
           if (lastSequence > 0 && message.sequence !== lastSequence + 1) revalidate()
           lastSequence = message.sequence
           if (message.type === "snapshot") {
@@ -149,6 +153,8 @@ interface MarketStreamMessage {
   sequence: number
   type: "snapshot" | "book" | "trade" | "candle" | "funding" | "heartbeat"
   data: unknown
+  /** The symbol this frame belongs to (B14). */
+  symbol?: string
 }
 
 interface MarketSnapshot {

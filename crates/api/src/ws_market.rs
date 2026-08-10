@@ -15,16 +15,26 @@ use serde_json::json;
 use crate::state::AppState;
 
 /// `GET /ws/v1/market?symbol=BTC`.
-pub async fn market_ws(State(state): State<AppState>, ws: WebSocketUpgrade) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_socket(state, socket))
+pub async fn market_ws(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<MarketWsParams>,
+    ws: WebSocketUpgrade,
+) -> impl IntoResponse {
+    let symbol = params.symbol.unwrap_or_else(|| "BTC".to_string());
+    ws.on_upgrade(move |socket| handle_socket(state, socket, symbol))
 }
 
-async fn handle_socket(state: AppState, mut socket: WebSocket) {
-    let symbol = "BTC"; // single-symbol v1; the query param filters in a later increment.
+/// Query params for the market WS.
+#[derive(serde::Deserialize)]
+pub struct MarketWsParams {
+    pub symbol: Option<String>,
+}
+
+async fn handle_socket(state: AppState, mut socket: WebSocket, symbol: String) {
     let mut sequence = 0u64;
 
     // Snapshot frame on connect.
-    let snapshot = state.books.lock().await.get_snapshot(symbol);
+    let snapshot = state.books.lock().await.get_snapshot(&symbol);
     let frame = json!({
         "schema_version": 1,
         "sequence": sequence,

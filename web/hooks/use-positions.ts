@@ -12,7 +12,13 @@ export function usePositions() {
     fetcher,
     { refreshInterval: SWR_REFRESH_INTERVAL }
   )
-  return { positions: data ?? [], error, isLoading, refresh: mutate }
+  // B12: the backend emits is_long/is_short; the frontend contract keys on
+  // `side`. Map defensively so a long never renders as a red "卖".
+  const positions = (data ?? []).map((p) => ({
+    ...p,
+    side: p.side ?? (p.is_long ? "long" : p.is_short ? "short" : "flat"),
+  }))
+  return { positions, error, isLoading, refresh: mutate }
 }
 
 export async function closePosition(symbol: string, closeFraction: string = "1", idempotencyKey?: string) {

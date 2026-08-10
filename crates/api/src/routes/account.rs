@@ -89,6 +89,8 @@ pub async fn positions(State(state): State<AppState>) -> Response {
                 "liquidation_price": p.liquidation_price.map(|v| v.to_string()),
                 "is_long": p.is_long(),
                 "is_short": p.is_short(),
+                // B12: the frontend keys on `side`; derive it from the size sign.
+                "side": if p.is_long() { "long" } else if p.is_short() { "short" } else { "flat" },
             })
         })
         .collect();

@@ -72,6 +72,9 @@ export interface Position {
   unrealized_pnl: DecimalString
   leverage: number
   side: "long" | "short" | "flat"
+  /** Backend contract (deprecated in favor of `side`). */
+  is_long?: boolean
+  is_short?: boolean
 }
 
 // --- Orders ---

@@ -146,6 +146,52 @@ mod tests {
     use tower::ServiceExt;
 
     #[tokio::test]
+    async fn build_runtime_returns_control_plane_when_v2_disabled() {
+        // 6d/6e/6f: with the V2 chain disabled, build_runtime must return a
+        // control-plane-only wiring (no execution engine, trading disabled)
+        // without panicking.
+        let settings = dev_settings();
+        let bus = Arc::new(EventBus::new(10_000));
+        let wiring = runtime::build_runtime(&settings, bus.clone()).await.unwrap();
+        assert!(wiring.execution.is_none(), "v2 disabled → no engine");
+        assert!(!*wiring.trading_enabled.read().await, "trading disabled");
+        assert!(wiring.market_data.is_none());
+        let app = HypeEdgeApp::new(settings);
+        let router = app.router();
+        let resp = router
+            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn build_runtime_errors_without_exchange_credentials() {
+        // The runtime refuses to trade when exchange credentials are unset even
+        // if the V2 chain is enabled.
+        let mut settings = dev_settings();
+        settings.features = hypeedge_config::settings::FeatureFlagsSettings {
+            execution_v2: true,
+            durable_ledger_v2: true,
+            user_stream_v2: true,
+            reconciliation_v2: true,
+            api_v1: true,
+            strategy_runner_v2: true,
+            market_making_enabled: true,
+            funding_arb_execution_enabled: true,
+            legacy_execution: false,
+        };
+        settings.exchange.account_address = String::new();
+        settings.exchange.agent_private_key = String::new();
+        let bus = Arc::new(EventBus::new(10_000));
+        let result = runtime::build_runtime(&settings, bus).await;
+        assert!(
+            result.is_err(),
+            "trading enabled without exchange credentials must error"
+        );
+    }
+
+    #[tokio::test]
     async fn router_serves_health() {
         let settings = dev_settings();
         let app = HypeEdgeApp::new(settings);

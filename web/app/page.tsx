@@ -10,7 +10,7 @@ import { usePositions } from "@/hooks/use-positions"
 import { useRiskStatus } from "@/hooks/use-risk"
 import { useInstrumentMeta } from "@/hooks/use-system-status"
 import type { Position } from "@/lib/types"
-import { decimalToNumber, formatPct, formatPrice, formatSize, formatUsd } from "@/lib/utils"
+import { decimalToNumber, formatDateTime, formatPct, formatPrice, formatSize, formatUsd } from "@/lib/utils"
 
 export default function DashboardPage() {
   const { account, error: accountError } = useAccount()
@@ -22,7 +22,7 @@ export default function DashboardPage() {
       <main id="main-content" className="flex-1 space-y-5 overflow-y-auto p-3 md:p-5">
         <PageHeader
           title="账户总览"
-          subtitle={account?.last_update ? `最后更新 ${account.last_update}` : "等待账户数据"}
+          subtitle={account?.last_update ? `最后更新 ${formatDateTime(account.last_update)}` : "等待账户数据"}
         />
 
         {accountError || positionsError ? (
