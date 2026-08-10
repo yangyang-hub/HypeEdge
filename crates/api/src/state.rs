@@ -13,6 +13,7 @@ use hypeedge_trading::strategy::{
     InMemoryStrategyAllocationManager, InMemoryStrategyStateStore, StrategyRegistry,
     StrategySupervisor,
 };
+use hypeedge_domain::traits::ExecutionClient;
 
 use crate::auth::RoleTokens;
 use crate::sse_broker::SseBroker;
@@ -154,7 +155,7 @@ impl AppState {
         sse_outbox: Option<Arc<hypeedge_storage::outbox::PostgresOutboxStore>>,
         sse_pool: Option<sqlx::PgPool>,
     ) -> Self {
-        state.execution = execution;
+        state.execution = execution.clone();
         state.market_data = market_data;
         state.config_versions = config_versions;
         state.trading_enabled = trading_enabled;
@@ -168,7 +169,91 @@ impl AppState {
                 256,
             ));
         }
+        // 6f: when the execution engine is wired, register the real trend-follow
+        // plugin (replacing the noop) so strategy lifecycle drives actual orders.
+        if let Some(engine) = &execution {
+            state.strategies = StrategyControlPlane::with_real_plugins(
+                state.event_bus.clone(),
+                state.account_tracker.clone(),
+                engine.clone(),
+            );
+        }
         state
+    }
+}
+
+impl StrategyControlPlane {
+    /// Build a control plane whose registry registers the real strategy
+    /// runtimes (6f). Falls back to noop plugins for strategy types without a
+    /// wired runtime yet.
+    pub fn with_real_plugins(
+        event_bus: Arc<EventBus>,
+        tracker: Arc<hypeedge_trading::account::AccountTracker>,
+        execution: Arc<hypeedge_trading::execution::ExecutionEngine>,
+    ) -> Self {
+        let mut registry = StrategyRegistry::new();
+        registry.register_plugin(hypeedge_trading::strategy::build_trend_follow_plugin(
+            event_bus.clone(),
+            Some(tracker as Arc<dyn hypeedge_trading::strategy::StrategyAccountView>),
+            execution as Arc<dyn ExecutionClient>,
+        ));
+        // funding_arb / market_maker real plugins land with their provider
+        // adapters; keep the noop handles for those types so lifecycle still
+        // drives.
+        for (strategy_type, capabilities) in [
+            (
+                "market_maker",
+                hypeedge_trading::strategy::market_maker_capabilities(),
+            ),
+            (
+                "funding_arb",
+                hypeedge_trading::strategy::funding_arb_capabilities(),
+            ),
+        ] {
+            registry.register_plugin(hypeedge_trading::strategy::StrategyTypePlugin {
+                strategy_type: strategy_type.to_string(),
+                capabilities,
+                factory: Arc::new(|_ctx| {
+                    struct Noop;
+                    #[async_trait::async_trait]
+                    impl hypeedge_trading::strategy::StrategyRuntimeHandle for Noop {
+                        async fn start(&self) -> Result<(), String> {
+                            Ok(())
+                        }
+                        async fn set_mode(
+                            &self,
+                            _: hypeedge_domain::enums::MarketMakerLifecycle,
+                        ) -> Result<(), String> {
+                            Ok(())
+                        }
+                        async fn apply_config(
+                            &self,
+                            _: &hypeedge_trading::strategy::StrategyConfigSnapshot,
+                        ) -> Result<(), String> {
+                            Ok(())
+                        }
+                        async fn stop(&self) -> Result<(), String> {
+                            Ok(())
+                        }
+                    }
+                    Arc::new(Noop)
+                }),
+            });
+        }
+        let registry = Arc::new(registry);
+        let state_store = Arc::new(InMemoryStrategyStateStore::new());
+        let allocations = Arc::new(InMemoryStrategyAllocationManager::new());
+        let supervisor = Arc::new(StrategySupervisor::new(
+            registry.clone(),
+            state_store.clone(),
+            allocations.clone(),
+        ));
+        Self {
+            supervisor,
+            registry,
+            state_store,
+            allocations,
+        }
     }
 }
 
