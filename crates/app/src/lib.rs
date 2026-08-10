@@ -201,6 +201,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mainnet_trading_hard_disabled_unless_flag() {
+        // Design doc §7: mainnet live trading is hard-disabled. Without the
+        // explicit env flag, build_runtime must refuse even with credentials
+        // and the full V2 chain enabled.
+        let mut settings = dev_settings();
+        settings.environment = "mainnet".into();
+        settings.features = hypeedge_config::settings::FeatureFlagsSettings {
+            execution_v2: true,
+            durable_ledger_v2: true,
+            user_stream_v2: true,
+            reconciliation_v2: true,
+            api_v1: true,
+            strategy_runner_v2: true,
+            market_making_enabled: true,
+            funding_arb_execution_enabled: true,
+            legacy_execution: false,
+        };
+        settings.exchange.account_address = "0x0000000000000000000000000000000000000000".into();
+        settings.exchange.agent_private_key = "00".repeat(32);
+        // Clear any flag from the environment.
+        unsafe { std::env::remove_var("HYPE_MAINNET_TRADING_ENABLED") };
+        let bus = Arc::new(EventBus::new(10_000));
+        let result = runtime::build_runtime(&settings, bus).await;
+        assert!(
+            result.is_err(),
+            "mainnet trading must be hard-disabled without the flag (design doc §7)"
+        );
+    }
+
+    #[tokio::test]
     async fn router_serves_health() {
         let settings = dev_settings();
         let app = HypeEdgeApp::new(settings);

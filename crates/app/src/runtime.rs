@@ -105,6 +105,19 @@ pub async fn build_runtime(
         });
     }
 
+    // Mainnet hard-disable (design doc §7): trading components are refused on
+    // mainnet unless the operator explicitly opts in via the env flag. Without
+    // this, a `HYPE_ENV=mainnet` boot with credentials would place real orders.
+    if settings.is_mainnet()
+        && !std::env::var("HYPE_MAINNET_TRADING_ENABLED")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    {
+        return Err(
+            "mainnet live trading is hard-disabled (design doc §7); set HYPE_MAINNET_TRADING_ENABLED=1 to override".into(),
+        );
+    }
+
     // Exchange credentials gate (never trade without them).
     if !settings.exchange.is_configured() {
         return Err(
