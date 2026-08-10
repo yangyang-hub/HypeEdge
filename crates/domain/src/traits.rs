@@ -127,6 +127,10 @@ pub trait DurableOrderStore: Send + Sync {
         command_id: Uuid,
     ) -> Result<(), HypeEdgeError>;
 
+    /// Upsert an exchange-discovered order before any cancel side effect
+    /// (port of `PostgresDurableOrderStore.persist_reconciled_order`).
+    async fn persist_reconciled_order(&self, order: &Order) -> Result<(), HypeEdgeError>;
+
     /// Load all open (non-terminal) orders.
     async fn load_open_orders(&self) -> Result<Vec<Order>, HypeEdgeError>;
 

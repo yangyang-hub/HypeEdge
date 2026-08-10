@@ -28,6 +28,8 @@ use hypeedge_domain::traits::{
     DurableExecutionCommand, DurableOrderStore, ExecutionClient, MarketDataProvider,
 };
 use serde_json::Value;
+
+use super::durable_worker::DurableCommandDispatcher;
 use tokio::sync::Mutex;
 
 use crate::execution::cloid::CloidGenerator;
@@ -1244,6 +1246,16 @@ impl ExecutionEngine {
         self.store(&order).await;
     }
 
+    /// Durably import exchange truth before it can be cancelled locally (port
+    /// of `import_exchange_order_authoritative`).
+    pub async fn import_exchange_order_authoritative(&self, order: Order) -> Result<(), HypeEdgeError> {
+        if let Some(store) = &self.durable_store {
+            store.persist_reconciled_order(&order).await?;
+        }
+        self.store(&order).await;
+        Ok(())
+    }
+
     /// Refresh one committed exchange projection into process memory.
     pub async fn refresh_order_from_durable(&self, cloid: &str) -> Result<Option<Order>, HypeEdgeError> {
         match &self.durable_store {
@@ -1385,6 +1397,24 @@ impl ExecutionClient for ExecutionEngine {
             .filter(|o| symbol.is_none_or(|s| o.symbol == s))
             .cloned()
             .collect())
+    }
+}
+
+#[async_trait]
+impl DurableCommandDispatcher for ExecutionEngine {
+    async fn execute_durable_cancel_command(
+        &self,
+        command: &DurableExecutionCommand,
+    ) -> Result<bool, HypeEdgeError> {
+        ExecutionEngine::execute_durable_cancel_command(self, command).await
+    }
+
+    async fn execute_durable_command(
+        &self,
+        command: &DurableExecutionCommand,
+        after_send_hook: Option<Box<AfterSendHook>>,
+    ) -> Result<bool, HypeEdgeError> {
+        ExecutionEngine::execute_durable_command(self, command, after_send_hook).await
     }
 }
 

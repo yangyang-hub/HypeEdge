@@ -8,10 +8,17 @@
 //! [`ExchangeFactProjector`] transactional boundary. The Postgres projector
 //! lives in the `storage` crate; the trading crate stays DB-free.
 
+pub mod account_health;
 pub mod exchange_ingestor;
 pub mod reconciler;
 pub mod tracker;
 
+pub use account_health::{
+    AccountFreshnessThresholds, AccountHealthDimension, AccountHealthProvider,
+    AccountHealthSnapshot, AccountStatePoller, AccountStateSource, ClearinghouseRestClient,
+    FreshnessObservation, FreshnessResult, FreshnessStatus, LayeredAccountHealthProvider,
+    MutableAccountHealthProvider, PolledAccountSnapshot, RestAccountStateSource, RiskProximityEvaluator,
+};
 pub use exchange_ingestor::{
     CommittedFillProjection, ExchangeEventIngestor, ExchangeFactProjector, InfoClient, IngestResult,
     SOURCE, canonical_payload, fill_external_id, fill_position_after, funding_external_id,

@@ -6,6 +6,7 @@
 //! land in later Phase-5 increments.
 
 pub mod base;
+pub mod config_normalize;
 pub mod indicators;
 pub mod params;
 pub mod registry;
@@ -15,6 +16,12 @@ pub mod trend_follow;
 pub mod trend_follow_runtime;
 
 pub use base::Strategy;
+pub use config_normalize::{
+    AUTO_SPOT_MARKET, default_funding_arb_config, default_market_maker_config,
+    default_trend_follow_config_values, funding_arb_config_hash, market_maker_config_hash,
+    normalize_funding_arb_config, normalize_market_maker_config, normalize_trend_follow_config,
+    trend_follow_config_hash,
+};
 pub use indicators::{atr, ema, macd, momentum, sma};
 pub use params::TrendParams;
 pub use registry::{

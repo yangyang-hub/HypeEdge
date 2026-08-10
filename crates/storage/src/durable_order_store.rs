@@ -744,6 +744,147 @@ impl PostgresDurableOrderStore {
             .map_err(map_sqlx)?;
         row.map(to_domain).transpose()
     }
+
+    /// Upsert an exchange-discovered order before any cancel side effect (port
+    /// of `persist_reconciled_order`).
+    pub async fn persist_reconciled_order(
+        &self,
+        pool: &sqlx::PgPool,
+        order: &Order,
+    ) -> Result<(), HypeEdgeError> {
+        let mut tx = pool.begin().await.map_err(map_sqlx)?;
+        let existing: Option<OrderRow> =
+            sqlx::query_as::<_, OrderRow>("SELECT * FROM orders WHERE cloid = $1 FOR UPDATE")
+                .bind(&order.cloid)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+
+        let (order_id, revision, merged) = match existing {
+            None => {
+                let order_id = Uuid::new_v4();
+                let revision = 1i64;
+                let merged = order.clone();
+                sqlx::query(
+                    r#"
+                    INSERT INTO orders (
+                        order_id, command_id, cloid, symbol, side, order_type, time_in_force,
+                        size, price, status, strategy_id, sub_account, reduce_only, is_spot,
+                        risk_reducing, max_slippage_bps, filled_size, revision, error_message,
+                        exchange_oid, submitted_at, acknowledged_at, filled_at,
+                        created_at, updated_at
+                    ) VALUES ($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,now(),now())
+                    "#,
+                )
+                .bind(order_id)
+                .bind(&merged.cloid)
+                .bind(&merged.symbol)
+                .bind(merged.side.as_str())
+                .bind(merged.order_type.as_str())
+                .bind(merged.time_in_force.as_str())
+                .bind(dec_to_bd(merged.size.inner()))
+                .bind(merged.price.map(|p| dec_to_bd(p.inner())))
+                .bind(merged.status.as_str())
+                .bind(merged.strategy_id.clone())
+                .bind(merged.sub_account.clone())
+                .bind(merged.reduce_only)
+                .bind(merged.is_spot)
+                .bind(merged.risk_reducing)
+                .bind(merged.max_slippage_bps as i32)
+                .bind(dec_to_bd(merged.filled_size.inner()))
+                .bind(revision)
+                .bind(merged.error_message.clone())
+                .bind(merged.exchange_oid.clone())
+                .bind(merged.submitted_at.or(Some(Utc::now())))
+                .bind(merged.acknowledged_at)
+                .bind(merged.filled_at)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+                (order_id, revision, merged)
+            }
+            Some(record) => {
+                let revision = record.revision + 1;
+                let merged = merge_reconciled(&record, order)?;
+                sqlx::query(
+                    r#"
+                    UPDATE orders SET exchange_oid=$2, status=$3, filled_size=$4, avg_fill_price=$5,
+                        error_message=$6, submitted_at=$7, acknowledged_at=$8, filled_at=$9,
+                        revision=$10, updated_at=now()
+                    WHERE cloid=$1
+                    "#,
+                )
+                .bind(&merged.cloid)
+                .bind(merged.exchange_oid.clone())
+                .bind(merged.status.as_str())
+                .bind(dec_to_bd(merged.filled_size.inner()))
+                .bind(merged.avg_fill_price.map(|p| dec_to_bd(p.inner())))
+                .bind(merged.error_message.clone())
+                .bind(merged.submitted_at)
+                .bind(merged.acknowledged_at)
+                .bind(merged.filled_at)
+                .bind(revision)
+                .execute(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+                (record.order_id, revision, merged)
+            }
+        };
+
+        let payload = order_payload(&merged);
+        append_event_rows(
+            &mut tx,
+            &merged,
+            order_id,
+            revision,
+            "reconciled_import",
+            &payload,
+        )
+        .await?;
+
+        if merged.is_terminal() {
+            sqlx::query(
+                r#"
+                UPDATE risk_reservations
+                SET status = CASE WHEN $2 = 'filled' THEN 'consumed' ELSE 'released' END,
+                    released_at = now(), updated_at = now()
+                WHERE order_id = $1 AND status = 'active'
+                "#,
+            )
+            .bind(order_id)
+            .bind(merged.status.as_str())
+            .execute(&mut *tx)
+            .await
+            .map_err(map_sqlx)?;
+        }
+
+        tx.commit().await.map_err(map_sqlx)?;
+        Ok(())
+    }
+}
+
+/// Merge an exchange-reconciled order into the committed projection (port of
+/// `_update_order_record` + `merge_reconciled`). The incoming exchange truth
+/// wins for the reconcilable fields; filled-size/price never regress.
+fn merge_reconciled(record: &OrderRow, order: &Order) -> Result<Order, HypeEdgeError> {
+    let mut merged = to_domain(record.clone())?;
+    merged.exchange_oid = order.exchange_oid.clone().or(merged.exchange_oid);
+    merged.status = order.status;
+    if order.filled_size.inner() > merged.filled_size.inner() {
+        merged.filled_size = order.filled_size;
+    }
+    if let Some(price) = order.avg_fill_price {
+        merged.avg_fill_price = Some(price);
+    }
+    if order.error_message.is_some() {
+        merged.error_message = order.error_message.clone();
+    }
+    if merged.submitted_at.is_none() {
+        merged.submitted_at = order.submitted_at;
+    }
+    merged.acknowledged_at = order.acknowledged_at.or(merged.acknowledged_at).or(Some(Utc::now()));
+    merged.filled_at = order.filled_at.or(merged.filled_at);
+    Ok(merged)
 }
 
 fn risk_fail(reason: &str, checked: Vec<String>) -> RiskCheckResult {

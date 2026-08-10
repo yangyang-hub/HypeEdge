@@ -9,21 +9,27 @@
 //!
 //! The ClickHouse writer and spool are added in a later Phase-1 increment.
 
+pub mod checkpoint;
 pub mod clickhouse_writer;
 pub mod command_queue;
 pub mod config_version_pg;
 pub mod config_version_store;
 pub mod decimal_sqlx;
+pub mod dedup;
 pub mod duckdb_export;
 pub mod durable_order_store;
 pub mod exchange_ingestor_store;
 pub mod outbox;
 pub mod pg;
+pub mod quote_plan_store;
 pub mod rows;
 pub mod system_state_store;
 
+pub use checkpoint::BackfillCheckpointStore;
 pub use config_version_pg::PostgresConfigVersionStore;
 pub use config_version_store::{ConfigVersionRecord, ConfigVersionStore, config_hash};
+pub use dedup::DedupFilter;
 pub use duckdb_export::{export_all, export_table};
 pub use exchange_ingestor_store::PostgresExchangeFactProjector;
 pub use pg::{Postgres, Postgres as PostgresPool};
+pub use quote_plan_store::{PostgresQuotePlanStore, QuotePlanChildRow};

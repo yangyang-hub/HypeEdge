@@ -154,7 +154,7 @@ pub struct ExternalReferenceSnapshot {
     pub quality_reasons: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ExternalMarket {
     Spot,
     Perpetual,

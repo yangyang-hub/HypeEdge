@@ -11,6 +11,7 @@ pub mod execution;
 pub mod funding_arb;
 pub mod market_data;
 pub mod market_maker;
+pub mod monitor;
 pub mod risk;
 pub mod strategy;
 pub mod trading;
