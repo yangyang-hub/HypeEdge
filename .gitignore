@@ -1,20 +1,3 @@
-# Byte-compiled
-__pycache__/
-*.py[cod]
-*$py.class
-
-# Distribution
-dist/
-build/
-*.egg-info/
-
-# Virtual environments
-.venv/
-venv/
-
-# uv
-uv.lock
-
 # IDE
 .idea/
 .vscode/
@@ -40,13 +23,6 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
-
-# Testing
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
 
 # Node / frontend
 node_modules/

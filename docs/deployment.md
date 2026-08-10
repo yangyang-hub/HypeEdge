@@ -30,8 +30,7 @@
 ```bash
 # 仓库根
 set -a && source .env && set +a
-uv run alembic upgrade head
-uv run hypeedge
+HYPE_ENV=dev cargo run -p hypeedge_app   # 启动时自动运行 sqlx migrate
 
 # 另一终端
 cd web && pnpm dev
@@ -82,8 +81,7 @@ Next.js 仅在服务端读取以下变量：
 ## 最小启动检查
 
 ```bash
-uv run alembic upgrade head
-uv run hypeedge
+HYPE_ENV=dev cargo run -p hypeedge_app   # 启动时自动运行 sqlx migrate（crates/storage/migrations/*.sql）
 ```
 
 上线前确认：

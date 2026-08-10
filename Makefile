@@ -1,43 +1,34 @@
-.PHONY: install sync lint typecheck test test-unit test-integration run clean \
+.PHONY: lint typecheck test test-unit test-integration run clean \
 	rust-lint rust-typecheck rust-test rust-parity rust-integration rust-run
 
-# Install dependencies
-install:
-	uv sync
-
-# Update lockfile
-sync:
-	uv lock
-
-# Lint with ruff
+# Lint with cargo fmt + clippy
 lint:
-	uv run ruff check src/ tests/
-	uv run ruff format --check src/ tests/
+	cargo fmt --all --check
+	cargo clippy --workspace --all-targets -- -D warnings
 
-# Auto-fix lint issues
+# Auto-fix formatting
 lint-fix:
-	uv run ruff check --fix src/ tests/
-	uv run ruff format src/ tests/
+	cargo fmt --all
 
-# Type check
+# Type/compile check
 typecheck:
-	uv run mypy src/
+	cargo check --workspace
 
 # Run all tests
 test:
-	uv run pytest -v
+	cargo test --workspace
 
 # Run unit tests only
 test-unit:
-	uv run pytest tests/unit/ -v
+	cargo test --workspace --lib
 
 # Run integration tests (requires network/services)
 test-integration:
-	uv run pytest tests/integration/ -v
+	cargo test --workspace --tests
 
 # Run the application
 run:
-	uv run hypeedge
+	cargo run -p hypeedge_app
 
 # Emergency kill switch
 kill-switch:
@@ -48,32 +39,23 @@ kill-switch:
 
 # Clean build artifacts
 clean:
-	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
-	find . -type d -name .pytest_cache -exec rm -rf {} + 2>/dev/null || true
-	find . -type d -name .mypy_cache -exec rm -rf {} + 2>/dev/null || true
-	rm -rf build/ dist/ *.egg-info/
-	@cargo clean 2>/dev/null || true
+	@cargo clean
 
-# --- Rust rewrite targets ---
+# --- Rust target aliases (kept for compatibility) ---
 
-# Lint with cargo fmt + clippy
 rust-lint:
 	cargo fmt --all --check
 	cargo clippy --workspace --all-targets -- -D warnings
 
-# Type/compile check
 rust-typecheck:
 	cargo check --workspace
 
-# Run all Rust tests (unit + corpus parity)
 rust-test:
 	cargo test --workspace
 
-# Run the golden-corpus parity suite only
 rust-parity:
 	cargo test -p hypeedge_domain --test decimal_corpus
 	cargo test -p hypeedge_config --test config_parity
 
-# Run storage integration tests (requires the Postgres test container)
 rust-integration:
 	cargo test -p hypeedge_storage --test durable_store_integration

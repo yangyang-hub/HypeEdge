@@ -36,7 +36,7 @@ HYPE_API__ADMIN_TOKEN=<...>
 ## 2. 数据库迁移
 
 ```bash
-uv run alembic upgrade head        # 在 mainnet DB 上执行（先确认已指向 mainnet 库）
+HYPE_ENV=mainnet cargo run -p hypeedge_app   # 启动时自动运行 sqlx migrate（crates/storage/migrations/*.sql）
 ```
 
 ## 3. 重建策略实例（重要）
@@ -74,7 +74,7 @@ uv run alembic upgrade head        # 在 mainnet DB 上执行（先确认已指�
 ## 5. 启动
 
 ```bash
-uv run hypeedge
+HYPE_ENV=mainnet cargo run -p hypeedge_app
 ```
 
 ## 6. 上线前逐项确认（fail-closed 自检）

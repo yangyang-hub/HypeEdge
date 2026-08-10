@@ -2,59 +2,53 @@
 
 ## 项目概述
 
-HypeEdge 是一个面向 Hyperliquid 永续合约交易所的个人量化交易系统。采用 Python asyncio 单进程模块化单体架构，分三阶段实现：数据采集 → 实盘策略 → 做市/HFT。
-
-设计文档：`docs/design.md`（所有架构决策的权威来源，修改前必读）。
+HypeEdge 是一个面向 Hyperliquid 永续合约交易所的个人量化交易系统。**后端已全部重写为 Rust**（tokio + axum + sqlx），Python 代码已彻底移除。设计文档：`docs/design.md`（架构决策的权威来源，修改前必读）。
 
 ## 技术栈
 
-- **语言**：Python 3.12+（异步，类型注解）
-- **包管理**：uv（`uv sync` 安装依赖，`uv run` 执行命令）
-- **异步框架**：asyncio（单事件循环，禁止为业务逻辑引入线程）
-- **存储**：ClickHouse（行情时序数据）、Postgres（订单/持仓事务数据，SQLAlchemy 2.0 async + asyncpg）
-- **配置**：pydantic-settings + YAML 文件（`configs/{dev,testnet,mainnet}.yaml`）
-- **日志**：structlog（JSON 结构化，生产用 JSONRenderer，开发用 ConsoleRenderer）
-- **监控**：prometheus-client + Grafana
-- **Lint**：ruff（format + lint，line-length=120）
-- **类型检查**：mypy --strict
-- **测试**：pytest + pytest-asyncio（asyncio_mode="auto"）
+- **语言**：Rust 1.93（edition 2024），workspace 多 crate
+- **异步**：tokio（rt-multi-thread），业务逻辑不引入线程
+- **API**：axum 0.8 + tower/tower-http（CORS、request-id、trace）
+- **存储**：ClickHouse（行情时序，`clickhouse` crate）、Postgres（订单/持仓事务，sqlx 0.8 原始 SQL + 迁移 `crates/storage/migrations/*.sql`）、DuckDB（离线研究）
+- **数值**：手写 i128 定点 `Decimal`（scale 18，ethnum::I256 中间值），见 `crates/domain/src/decimal.rs`
+- **签名**：EIP-712/L1 phantom agent 签名，k256 + sha3/hex + rmp-serde（非社区 HL SDK）
+- **配置**：分层加载（env > .env > YAML > 默认），`crates/config`
+- **日志**：tracing + tracing-subscriber（JSON 结构化）
+- **监控**：prometheus
+- **Lint**：cargo fmt + cargo clippy（-D warnings）
+- **测试**：cargo test（单元 + 黄金语料 parity + 集成）
 
 ## 项目结构
 
 ```
-src/hypeedge/
-├── core/          # 共享基础：类型(types)、枚举(enums)、模型(models)、EventBus(events)、异常(exceptions)
-├── config/        # 配置加载：settings(pydantic-settings)、loader(YAML)
-├── market_data/   # WS行情(ws_feed)、REST回填(rest_client)、限速器(rate_limiter)、订单簿(book)、数据供应接口(provider)
-├── storage/       # ClickHouse写入(clickhouse)、Postgres ORM + PostgresWriter(postgres)、数据质量(data_quality)、去重(dedup)
-├── monitor/       # Prometheus指标(metrics)、告警(alerts, 骨架)
-├── strategy/      # 策略基类(base)、趋势跟随(trend_follow)、技术指标(indicators)、参数管理(params + 热更新)
-├── risk/          # 风控检查(checker)、Kill Switch(kill_switch) — 触发时自动撤单
-├── execution/     # 执行引擎(engine)、Nonce管理(nonce, SDK集成)、订单状态机(order_state)、Cloid生成(cloid)
-├── account/       # 账户追踪(tracker)、对账(reconciler) — 启动门控
-├── backtest/      # 模拟撮合(broker)、回测引擎(engine)、绩效指标(metrics)、Walk-Forward/Monte Carlo(walk_forward)
-├── app.py         # HypeEdgeApp 主类（全链路串联、启动对账门控、策略热更新、优雅停机）
-└── __main__.py    # CLI 入口
-configs/           # 环境配置文件 + 策略参数文件(strategy_trend.yaml)
-tests/             # 单元测试(unit/)、集成测试(integration/)
+crates/
+├── domain/       # 纯类型：Decimal、enums、models、events、error、durable traits（无 IO）
+├── config/       # 配置加载：settings（分层优先级）、loader
+├── infra/        # EventBus（事件总线）、共享基础设施
+├── storage/      # Postgres 事务存储（durable order store、command queue、outbox、
+│                 #   config version、quote plan store、system state）、ClickHouse writer、
+│                 #   DuckDB 导出、去重、检查点
+├── trading/      # 交易核心：market_data、execution、risk、account、strategy、backtest、
+│                 #   monitor、trading（quote/command service）、funding_arb、market_maker
+├── api/          # axum 路由：system/risk/market/account/strategies、SSE、WebSocket
+└── app/          # 二进制入口：配置装配、kill switch、HTTP 服务器
+docs/             # 设计文档
+configs/          # 环境配置文件
+web/              # Next.js 前端仪表盘
 ```
 
-**实现状态**：
-- **Phase 1 完成**：market_data、storage(clickhouse)、backtest
-- **Phase 2 完成**：execution、risk、account、strategy(trend_follow)、app.py 全链路串联
-- **骨架**：monitor/alerts.py（Telegram/钉钉告警未实现）、backtest round-trip PnL 简化版
+**依赖方向**：`domain ← infra ← storage/trading ← api ← app`，trading 只依赖 domain 的 trait，不依赖具体存储实现（通过 trait 注入，内存 fake 可测）。
 
 ## 常用命令
 
 ```bash
-uv sync                    # 安装依赖
-uv run pytest tests/unit/  # 运行单元测试
-uv run pytest tests/ -v    # 运行全部测试（含集成测试，需网络/服务）
-uv run ruff check src/ tests/    # Lint 检查
-uv run ruff format src/ tests/   # 格式化
-uv run mypy src/           # 类型检查
-uv run hypeedge            # 启动应用
-make lint && make test     # 一键检查
+cargo check --workspace           # 编译检查
+cargo test --workspace            # 全部测试（单元 + parity）
+cargo clippy --workspace --all-targets -- -D warnings   # Lint
+cargo fmt --all                   # 格式化
+cargo run -p hypeedge_app         # 启动应用（HYPE_ENV=dev|testnet|mainnet）
+cargo test -p hypeedge_domain --test decimal_corpus    # Decimal 黄金语料
+make lint && make test            # 一键检查
 ```
 
 ## 编码规范
@@ -62,28 +56,27 @@ make lint && make test     # 一键检查
 ### 通用
 
 - 遵循现有代码风格：注释密度、命名习惯、import 顺序。
-- 所有公共函数和类必须带类型注解。
-- 使用 `from __future__ import annotations` 在每个模块顶部。
-- 日志使用 `structlog.get_logger(__name__)`，关键操作绑定 contextvars（cloid、strategy_id）。
-- 错误使用自定义异常层级（`core/exceptions.py`），不抛裸 Exception。
-- 私有属性用 `_` 前缀，类型注解用 `ClassVar` 或实例属性。
+- 所有公共函数和类型必须带类型注解（Rust 类型系统自带）。
+- 文档注释用 `//!`（模块）和 `///`（item），引用 `[`Type`]` 链接。
+- 错误用 `HypeEdgeError`（`crates/domain/src/error.rs`，thiserror），不 panic（库代码），`.unwrap()` 仅限编译期不变量或测试。
+- 关键操作绑定 contextvars（cloid、strategy_id）到 tracing span。
 
 ### 异步
 
-- 所有 I/O 操作使用 async/await，禁止在业务逻辑中使用 `threading`。
-- 长时间运行的任务用 `asyncio.create_task()` 在事件循环中并发。
-- 阻塞操作（如 ClickHouse 写入）使用 `run_in_executor()`。
+- 所有 I/O 用 async/await，业务逻辑不引入 `std::thread`。
+- 长时间任务用 `tokio::spawn`，CPU 密集用 `spawn_blocking`。
+- 数据保护优先 `std::sync::Mutex`，仅在跨 `.await` 持锁时用 `tokio::sync::Mutex`。
 
 ### 数据模型
 
-- 使用 `core/types.py` 的语义类型（`Symbol`, `Price`, `Size`, `Cloid` 等），不直接用裸 str/float。
-- 领域模型定义在 `core/models.py`，用 `@dataclass` 或 pydantic。
-- 枚举定义在 `core/enums.py`。
-- 模块间通信通过 EventBus 事件（`core/events.py` 的常量），不直接调用其他模块方法。
+- 用 `crates/domain/src/decimal.rs` 的语义类型（`Decimal`、`Price`、`Size`、`Usd`），不直接用裸 f64/i128。
+- 领域模型在 `crates/domain/src/models.rs`，用 `#[derive(Debug, Clone, PartialEq)]` 结构体。
+- 枚举在 `crates/domain/src/enums.rs`，带 `as_str()` 和状态机校验。
+- 模块间通信通过 EventBus（`crates/infra/src/event_bus.rs`）的 `DomainEvent`，不直接调用其他模块方法。
 
 ### 配置
 
-- 新增配置项在 `config/settings.py` 对应的 Settings 类中添加，带 Field 约束（ge/le）和默认值。
+- 新增配置项在 `crates/config/src/settings.rs` 对应 Settings 结构体添加，带默认值和校验（`validate()`）。
 - 三个环境配置文件 `configs/*.yaml` 须同步更新。
 - 密钥/私钥只通过环境变量传入，不写进代码或 YAML。
 
@@ -104,10 +97,10 @@ market_data ──publish──▶ EventBus ──queue──▶ strategy
                               account/reconciler ◀── 交易所对账
 ```
 
-- **EventBus** 是唯一的模块间通信通道（发布/订阅，asyncio.Queue per subscriber）。
-- 策略通过注入的 `ExecutionClient` 提交订单意图，不直接访问 ExecutionEngine。
+- **EventBus** 是唯一的模块间通信通道（发布/订阅，bounded mailbox per subscriber）。
+- 策略通过注入的 `ExecutionClient` trait 提交订单意图，不直接访问 ExecutionEngine。
 - 风控在执行路径中同步内联，超时 = 拒绝（fail-safe）。
-- 所有签名操作汇聚到 NonceManager 的单队列串行处理。
+- 所有签名操作汇聚到 NonceQueue 的单队列串行处理。
 
 ## Hyperliquid 平台关键约束（必须遵守）
 
@@ -122,8 +115,9 @@ market_data ──publish──▶ EventBus ──queue──▶ strategy
 ## 测试要求
 
 - 每个 bug fix 和新功能必须有对应测试。
-- 单元测试放 `tests/unit/`，集成测试放 `tests/integration/`。
-- 测试异步代码用 `@pytest.mark.asyncio`（已在 pyproject.toml 开启 auto 模式）。
+- 单元测试用 `#[cfg(test)] mod tests` 内联在模块内，或 `crates/*/tests/` 集成测试。
+- 黄金语料 parity 测试：`crates/domain/tests/decimal_corpus.rs`、`crates/config/tests/config_parity.rs`，fixtures 在 `crates/domain/tests/fixtures/`。
+- 测试异步代码用 `#[tokio::test]`。
 - 测试风控逻辑用已知输入/输出覆盖边界条件。
 - 测试订单状态机验证每个状态转换的合法性。
 - 核心逻辑覆盖率目标 ≥ 90%。
@@ -138,12 +132,12 @@ market_data ──publish──▶ EventBus ──queue──▶ strategy
 
 ## 修改时的注意事项
 
-- 修改 `core/enums.py` 的枚举值时，同步更新 `ORDER_TRANSITIONS` 字典。
-  - 注意 `WsChannel` 中的 `USER_FILLS` 和 `ORDER_UPDATES` 为 Phase 2 预留（需认证），Phase 1 不使用。
-- 新增 EventBus 事件类型时，在 `core/events.py` 的 `ALL_EVENT_TYPES` 集合中注册。
-- 修改 ClickHouse 表结构时，同步更新 `storage/clickhouse.py` 的 DDL_STATEMENTS 和 `docs/design.md` §5.2。
-- 新增模块接口时，先定义 Protocol/ABC，在骨架文件中占位，再实现。
-- 修改配置结构后，运行 `uv run pytest tests/unit/test_config.py` 验证。
+- 修改 `crates/domain/src/enums.rs` 的枚举值时，同步更新其 `as_str()` 和任何状态机转移逻辑。
+- 新增 EventBus 事件类型时，在 `DomainEvent` 枚举、`EventType` 及 `ALL_EVENT_TYPES` 中注册。
+- 修改 ClickHouse 表结构时，同步更新 `crates/storage/src/clickhouse_writer.rs` 的 DDL 和 `docs/design.md` §5.2。
+- 修改 Postgres 表结构时，更新 `crates/storage/migrations/*.sql`（sqlx migrate）。
+- 新增模块接口时，先定义 trait（domain 层），在骨架文件中占位，再实现。
+- 修改配置结构后，运行 `cargo test -p hypeedge_config` 验证。
 
 ---
 
@@ -151,7 +145,7 @@ market_data ──publish──▶ EventBus ──queue──▶ strategy
 
 详细的编码规范存放在 `rules/` 目录下，按前后端分离：
 
-- **后端规范**：[`rules/backend.md`](rules/backend.md) — Python 后端的架构约束、类型系统、异步模式、EventBus、风控、执行引擎、存储层、配置、日志、错误处理、测试规范。
+- **后端规范**：[`rules/backend.md`](rules/backend.md) — Rust 后端的架构约束、类型系统、异步模式、EventBus、风控、执行引擎、存储层、配置、日志、错误处理、测试规范。
 - **前端规范**：[`rules/frontend.md`](rules/frontend.md) — Next.js + React + shadcn/ui 的组件设计、类型系统、数据获取、样式、性能、API 契约、测试规范。
 
 ### 前后端共享约束
@@ -159,7 +153,7 @@ market_data ──publish──▶ EventBus ──queue──▶ strategy
 #### 通用原则
 
 - **先设计文档，后写代码**：新功能先更新 `docs/design.md`，再实现。
-- **先接口，后实现**：Protocol/ABC/interface 先定义，测试可 mock。
+- **先接口，后实现**：trait 先定义，测试可 mock。
 - **先测试，后上线**：单元测试通过 → 集成测试通过 → testnet 验证 → mainnet。
 - **最小变更原则**：每次 commit 只做一件事，方便回滚和 review。
 

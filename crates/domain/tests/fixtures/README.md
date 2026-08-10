@@ -1,13 +1,10 @@
 # Golden parity fixtures
 
-The Rust rewrite verifies behavior parity by replaying fixtures recorded from
-the running Python backend. The Python process is deleted at cutover, so these
-recorded outputs ARE the cross-check. Regenerate with:
-
-```bash
-uv run python scripts/record_golden.py            # decimal + HTTP (offline-safe)
-uv run python scripts/record_golden.py --signing  # needs testnet creds
-```
+These fixtures are the authoritative cross-check for the Rust rewrite. They
+were recorded from the now-deleted Python backend; with the Python process
+removed at cutover, these recorded outputs ARE the reference. They are consumed
+by the Rust golden-corpus tests (`crates/domain/tests/decimal_corpus.rs`,
+`crates/config/tests/config_parity.rs`, and the HTTP/WS router tests).
 
 Every fixture is JSONL (one JSON object per line) unless noted.
 
