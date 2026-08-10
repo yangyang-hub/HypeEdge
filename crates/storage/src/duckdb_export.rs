@@ -116,9 +116,7 @@ async fn query_rows(
     start_sec: f64,
     end_sec: f64,
 ) -> Result<Vec<Vec<Option<String>>>, String> {
-    let sql = format!(
-        "SELECT ?fields FROM {table} WHERE coin = ? AND ts BETWEEN ? AND ?"
-    );
+    let sql = format!("SELECT ?fields FROM {table} WHERE coin = ? AND ts BETWEEN ? AND ?");
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
     match table {
         "candles" => {
@@ -129,11 +127,20 @@ async fn query_rows(
                 .bind(end_sec)
                 .fetch::<CandleChRow>()
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
-            while let Some(r) = cursor.next().await.map_err(|e| format!("clickhouse row: {e}"))? {
+            while let Some(r) = cursor
+                .next()
+                .await
+                .map_err(|e| format!("clickhouse row: {e}"))?
+            {
                 rows.push(vec![
-                    Some(r.ts.to_string()), Some(r.coin), Some(r.interval),
-                    Some(r.open.to_string()), Some(r.high.to_string()), Some(r.low.to_string()),
-                    Some(r.close.to_string()), Some(r.volume.to_string()),
+                    Some(r.ts.to_string()),
+                    Some(r.coin),
+                    Some(r.interval),
+                    Some(r.open.to_string()),
+                    Some(r.high.to_string()),
+                    Some(r.low.to_string()),
+                    Some(r.close.to_string()),
+                    Some(r.volume.to_string()),
                 ]);
             }
         }
@@ -145,11 +152,18 @@ async fn query_rows(
                 .bind(end_sec)
                 .fetch::<FundingChRow>()
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
-            while let Some(r) = cursor.next().await.map_err(|e| format!("clickhouse row: {e}"))? {
+            while let Some(r) = cursor
+                .next()
+                .await
+                .map_err(|e| format!("clickhouse row: {e}"))?
+            {
                 rows.push(vec![
-                    Some(r.ts.to_string()), Some(r.coin),
-                    Some(r.funding_rate.to_string()), Some(r.premium.to_string()),
-                    Some(r.oi.to_string()), Some(r.mark_px.to_string()),
+                    Some(r.ts.to_string()),
+                    Some(r.coin),
+                    Some(r.funding_rate.to_string()),
+                    Some(r.premium.to_string()),
+                    Some(r.oi.to_string()),
+                    Some(r.mark_px.to_string()),
                 ]);
             }
         }
@@ -161,11 +175,18 @@ async fn query_rows(
                 .bind(end_sec)
                 .fetch::<TradeChRow>()
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
-            while let Some(r) = cursor.next().await.map_err(|e| format!("clickhouse row: {e}"))? {
+            while let Some(r) = cursor
+                .next()
+                .await
+                .map_err(|e| format!("clickhouse row: {e}"))?
+            {
                 rows.push(vec![
-                    Some(r.ts.to_string()), Some(r.coin),
-                    Some(r.px.to_string()), Some(r.sz.to_string()),
-                    Some(r.side.to_string()), Some(r.tid.to_string()),
+                    Some(r.ts.to_string()),
+                    Some(r.coin),
+                    Some(r.px.to_string()),
+                    Some(r.sz.to_string()),
+                    Some(r.side.to_string()),
+                    Some(r.tid.to_string()),
                 ]);
             }
         }
@@ -177,7 +198,11 @@ async fn query_rows(
                 .bind(end_sec)
                 .fetch::<L2BookChRow>()
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
-            while let Some(r) = cursor.next().await.map_err(|e| format!("clickhouse row: {e}"))? {
+            while let Some(r) = cursor
+                .next()
+                .await
+                .map_err(|e| format!("clickhouse row: {e}"))?
+            {
                 rows.push(vec![
                     Some(r.ts.to_string()),
                     Some(r.coin),
@@ -196,8 +221,16 @@ async fn query_rows(
                 .bind(end_sec)
                 .fetch::<MidPriceChRow>()
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
-            while let Some(r) = cursor.next().await.map_err(|e| format!("clickhouse row: {e}"))? {
-                rows.push(vec![Some(r.ts.to_string()), Some(r.coin), Some(r.px.to_string())]);
+            while let Some(r) = cursor
+                .next()
+                .await
+                .map_err(|e| format!("clickhouse row: {e}"))?
+            {
+                rows.push(vec![
+                    Some(r.ts.to_string()),
+                    Some(r.coin),
+                    Some(r.px.to_string()),
+                ]);
             }
         }
         other => return Err(format!("unsupported export table: {other}")),
@@ -208,7 +241,9 @@ async fn query_rows(
 /// The column names for each exported table (matches the CH table schemas).
 fn table_columns(table: &str) -> Result<Vec<String>, String> {
     let cols = match table {
-        "candles" => vec!["ts", "coin", "interval", "open", "high", "low", "close", "volume"],
+        "candles" => vec![
+            "ts", "coin", "interval", "open", "high", "low", "close", "volume",
+        ],
         "funding" => vec!["ts", "coin", "funding_rate", "premium", "oi", "mark_px"],
         "trades" => vec!["ts", "coin", "px", "sz", "side", "tid"],
         "l2_book" => vec!["ts", "coin", "side", "level", "px", "sz"],
@@ -226,9 +261,14 @@ mod tests {
     fn table_columns_match_schema() {
         assert_eq!(
             table_columns("candles").unwrap(),
-            vec!["ts", "coin", "interval", "open", "high", "low", "close", "volume"]
+            vec![
+                "ts", "coin", "interval", "open", "high", "low", "close", "volume"
+            ]
         );
-        assert_eq!(table_columns("mid_prices").unwrap(), vec!["ts", "coin", "px"]);
+        assert_eq!(
+            table_columns("mid_prices").unwrap(),
+            vec!["ts", "coin", "px"]
+        );
         // C6: l2_book columns must match the CH schema (ts, coin, side, level,
         // px, sz) — the pre-fix `price`/`size` names made the export fail with
         // `Unknown column price`.
@@ -241,6 +281,9 @@ mod tests {
 
     #[test]
     fn export_tables_matches_python() {
-        assert_eq!(EXPORT_TABLES, &["candles", "funding", "trades", "l2_book", "mid_prices"]);
+        assert_eq!(
+            EXPORT_TABLES,
+            &["candles", "funding", "trades", "l2_book", "mid_prices"]
+        );
     }
 }

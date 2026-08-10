@@ -8,9 +8,9 @@
 use axum::extract::{Extension, Path, State};
 use axum::response::Response;
 
-use crate::auth::{authorize, ApiRole};
-use crate::middleware::RoleGuard;
+use crate::auth::{ApiRole, authorize};
 use crate::errors::{ApiProblem, ok};
+use crate::middleware::RoleGuard;
 use crate::state::AppState;
 use axum::response::IntoResponse;
 use hypeedge_trading::strategy::StrategyStateStore;
@@ -245,18 +245,27 @@ pub async fn list_config_versions(
     Path(strategy_id): Path<String>,
 ) -> Response {
     let Some(store) = &state.config_versions else {
-        return ApiProblem::new(503, "MARKET_MAKING_STORE_UNAVAILABLE", "Config versions are unavailable")
-            .with_retryable(true)
-            .into_response();
+        return ApiProblem::new(
+            503,
+            "MARKET_MAKING_STORE_UNAVAILABLE",
+            "Config versions are unavailable",
+        )
+        .with_retryable(true)
+        .into_response();
     };
     match store.list_config_versions(&strategy_id).await {
         Ok(versions) => {
-            let payloads: Vec<serde_json::Value> = versions.iter().map(config_version_payload).collect();
+            let payloads: Vec<serde_json::Value> =
+                versions.iter().map(config_version_payload).collect();
             ok(serde_json::json!(payloads))
         }
-        Err(e) => ApiProblem::new(503, "MARKET_MAKING_STORE_UNAVAILABLE", format!("config versions unavailable: {e}"))
-            .with_retryable(true)
-            .into_response(),
+        Err(e) => ApiProblem::new(
+            503,
+            "MARKET_MAKING_STORE_UNAVAILABLE",
+            format!("config versions unavailable: {e}"),
+        )
+        .with_retryable(true)
+        .into_response(),
     }
 }
 
@@ -275,9 +284,13 @@ pub async fn create_config_version(
         return *resp;
     }
     let Some(store) = &state.config_versions else {
-        return ApiProblem::new(503, "MARKET_MAKING_STORE_UNAVAILABLE", "Config creation is unavailable")
-            .with_retryable(true)
-            .into_response();
+        return ApiProblem::new(
+            503,
+            "MARKET_MAKING_STORE_UNAVAILABLE",
+            "Config creation is unavailable",
+        )
+        .with_retryable(true)
+        .into_response();
     };
     let strategy_type = body
         .get("strategy_type")
@@ -286,7 +299,12 @@ pub async fn create_config_version(
         .to_string();
     let config = body.get("config").cloned().unwrap_or(serde_json::json!({}));
     if strategy_type.is_empty() {
-        return ApiProblem::new(422, "REQUEST_VALIDATION_FAILED", "strategy_type is required").into_response();
+        return ApiProblem::new(
+            422,
+            "REQUEST_VALIDATION_FAILED",
+            "strategy_type is required",
+        )
+        .into_response();
     }
     match store
         .create_config_version(&strategy_id, &strategy_type, &config, "api", None)
@@ -300,9 +318,9 @@ pub async fn create_config_version(
 #[cfg(test)]
 mod config_version_tests {
     use super::*;
-    use std::sync::Arc;
     use axum::body::Body;
     use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
     use tower::ServiceExt;
 
     fn test_state() -> AppState {
@@ -313,7 +331,9 @@ mod config_version_tests {
             settings,
             ks,
             bus,
-            Arc::new(tokio::sync::Mutex::new(hypeedge_trading::market_data::BookManager::new(20))),
+            Arc::new(tokio::sync::Mutex::new(
+                hypeedge_trading::market_data::BookManager::new(20),
+            )),
         )
     }
 
@@ -322,9 +342,14 @@ mod config_version_tests {
         let state = test_state();
         // No config_versions wired → 503 MARKET_MAKING_STORE_UNAVAILABLE.
         let resp = list_config_versions(State(state), Path("tf_1".into())).await;
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let text = String::from_utf8_lossy(&body).to_string();
-        assert!(text.contains("MARKET_MAKING_STORE_UNAVAILABLE"), "body: {text}");
+        assert!(
+            text.contains("MARKET_MAKING_STORE_UNAVAILABLE"),
+            "body: {text}"
+        );
     }
 
     #[tokio::test]
@@ -340,9 +365,14 @@ mod config_version_tests {
             })),
         )
         .await;
-        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let text = String::from_utf8_lossy(&body).to_string();
-        assert!(text.contains("MARKET_MAKING_STORE_UNAVAILABLE"), "body: {text}");
+        assert!(
+            text.contains("MARKET_MAKING_STORE_UNAVAILABLE"),
+            "body: {text}"
+        );
     }
 
     #[tokio::test]

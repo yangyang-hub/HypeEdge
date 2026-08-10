@@ -181,7 +181,9 @@ impl ClickHouseWriter {
         self.apply_ddl()
             .await
             .map_err(|e| format!("clickhouse ddl: {e}"))?;
-        self.replay_spool().await.map_err(|e| format!("clickhouse spool replay: {e}"))?;
+        self.replay_spool()
+            .await
+            .map_err(|e| format!("clickhouse spool replay: {e}"))?;
 
         loop {
             match self
@@ -328,8 +330,11 @@ impl ClickHouseWriter {
         let rows = std::mem::take(&mut self.rows);
         let mut failed: Vec<PendingRow> = Vec::new();
         for table in ["l2_book", "trades", "candles", "funding", "mid_prices"] {
-            let table_rows: Vec<PendingRow> =
-                rows.iter().filter(|r| r.table() == table).cloned().collect();
+            let table_rows: Vec<PendingRow> = rows
+                .iter()
+                .filter(|r| r.table() == table)
+                .cloned()
+                .collect();
             if table_rows.is_empty() {
                 continue;
             }
@@ -422,8 +427,7 @@ impl ClickHouseWriter {
             }
         }
         if all_ok {
-            std::fs::remove_file(&self.spool_path)
-                .map_err(|e| format!("spool cleanup: {e}"))?;
+            std::fs::remove_file(&self.spool_path).map_err(|e| format!("spool cleanup: {e}"))?;
             tracing::info!(path = %self.spool_path.display(), "spool_replayed");
         }
         Ok(())
@@ -475,45 +479,61 @@ async fn insert_rows<T: Row + Serialize>(
 }
 
 /// Dispatch a `PendingRow` batch to the matching table's `insert_rows`.
-async fn insert_pending(
-    client: &Client,
-    table: &str,
-    rows: &[PendingRow],
-) -> Result<(), String> {
+async fn insert_pending(client: &Client, table: &str, rows: &[PendingRow]) -> Result<(), String> {
     match table {
         "l2_book" => {
-            insert_rows(client, table, rows.iter().filter_map(|r| match r {
-                PendingRow::L2Book(r) => Some(r.clone()),
-                _ => None,
-            }))
+            insert_rows(
+                client,
+                table,
+                rows.iter().filter_map(|r| match r {
+                    PendingRow::L2Book(r) => Some(r.clone()),
+                    _ => None,
+                }),
+            )
             .await
         }
         "trades" => {
-            insert_rows(client, table, rows.iter().filter_map(|r| match r {
-                PendingRow::Trade(r) => Some(r.clone()),
-                _ => None,
-            }))
+            insert_rows(
+                client,
+                table,
+                rows.iter().filter_map(|r| match r {
+                    PendingRow::Trade(r) => Some(r.clone()),
+                    _ => None,
+                }),
+            )
             .await
         }
         "candles" => {
-            insert_rows(client, table, rows.iter().filter_map(|r| match r {
-                PendingRow::Candle(r) => Some(r.clone()),
-                _ => None,
-            }))
+            insert_rows(
+                client,
+                table,
+                rows.iter().filter_map(|r| match r {
+                    PendingRow::Candle(r) => Some(r.clone()),
+                    _ => None,
+                }),
+            )
             .await
         }
         "funding" => {
-            insert_rows(client, table, rows.iter().filter_map(|r| match r {
-                PendingRow::Funding(r) => Some(r.clone()),
-                _ => None,
-            }))
+            insert_rows(
+                client,
+                table,
+                rows.iter().filter_map(|r| match r {
+                    PendingRow::Funding(r) => Some(r.clone()),
+                    _ => None,
+                }),
+            )
             .await
         }
         "mid_prices" => {
-            insert_rows(client, table, rows.iter().filter_map(|r| match r {
-                PendingRow::MidPrice(r) => Some(r.clone()),
-                _ => None,
-            }))
+            insert_rows(
+                client,
+                table,
+                rows.iter().filter_map(|r| match r {
+                    PendingRow::MidPrice(r) => Some(r.clone()),
+                    _ => None,
+                }),
+            )
             .await
         }
         other => Err(format!("unknown table {other}")),

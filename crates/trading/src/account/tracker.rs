@@ -128,7 +128,9 @@ impl AccountTracker {
                         new_size = %new_size,
                         "position_flipped"
                     );
-                } else if (old_size > Decimal::ZERO && is_buy) || (old_size < Decimal::ZERO && !is_buy) {
+                } else if (old_size > Decimal::ZERO && is_buy)
+                    || (old_size < Decimal::ZERO && !is_buy)
+                {
                     // Adding in the same direction — update VWAP entry price.
                     let entry = pos.entry_price.unwrap_or(fill.price).inner();
                     let old_notional = old_size.abs() * entry;
@@ -165,10 +167,15 @@ impl AccountTracker {
         position: Option<&Position>,
     ) -> bool {
         let mut st = self.inner.lock().unwrap();
-        if st.authoritative_fill_ids.iter().any(|id| id == external_event_id) {
+        if st
+            .authoritative_fill_ids
+            .iter()
+            .any(|id| id == external_event_id)
+        {
             return false;
         }
-        st.authoritative_fill_ids.push(external_event_id.to_string());
+        st.authoritative_fill_ids
+            .push(external_event_id.to_string());
 
         if fill.is_spot {
             if position.is_some() {
@@ -184,14 +191,16 @@ impl AccountTracker {
             if position.is_flat() {
                 st.positions.remove(&position.symbol);
             } else {
-                st.positions.insert(position.symbol.clone(), position.clone());
+                st.positions
+                    .insert(position.symbol.clone(), position.clone());
             }
         }
 
         let authoritative_fee = fill.fee.inner().abs();
         match st.provisional_fill_fees.remove(&fill.cloid) {
             Some(provisional) => {
-                st.total_fees = Usd::new(st.total_fees.inner() + authoritative_fee - provisional.inner());
+                st.total_fees =
+                    Usd::new(st.total_fees.inner() + authoritative_fee - provisional.inner());
             }
             None => {
                 st.total_fees = Usd::new(st.total_fees.inner() + authoritative_fee);
@@ -227,14 +236,22 @@ impl AccountTracker {
         tracing::debug!(
             equity = state.equity.to_string(),
             peak_equity = st.peak_equity.to_string(),
-            drawdown_pct = st.account_state.as_ref().map(|s| s.drawdown_pct()).unwrap_or(0.0),
+            drawdown_pct = st
+                .account_state
+                .as_ref()
+                .map(|s| s.drawdown_pct())
+                .unwrap_or(0.0),
             "tracker_account_updated"
         );
     }
 
     /// Replace local position with exchange-truth (used by the reconciler).
     pub fn update_position_from_exchange(&self, symbol: &str, position: Position) {
-        self.inner.lock().unwrap().positions.insert(symbol.to_string(), position);
+        self.inner
+            .lock()
+            .unwrap()
+            .positions
+            .insert(symbol.to_string(), position);
     }
 
     /// Remove a position (used when the reconciler finds it closed on exchange).
@@ -263,7 +280,13 @@ impl AccountTracker {
     }
 
     pub fn get_all_spot_balances(&self) -> Vec<SpotBalance> {
-        self.inner.lock().unwrap().spot_balances.values().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .spot_balances
+            .values()
+            .cloned()
+            .collect()
     }
 
     // --- Funding tracking ---
@@ -281,7 +304,13 @@ impl AccountTracker {
     }
 
     pub fn get_all_positions(&self) -> Vec<Position> {
-        self.inner.lock().unwrap().positions.values().cloned().collect()
+        self.inner
+            .lock()
+            .unwrap()
+            .positions
+            .values()
+            .cloned()
+            .collect()
     }
 
     pub fn get_account_state(&self) -> Option<AccountState> {
@@ -293,13 +322,22 @@ impl AccountTracker {
     }
 
     pub fn current_equity(&self) -> Usd {
-        self.inner.lock().unwrap().account_state.as_ref().map(|s| s.equity).unwrap_or(Usd::ZERO)
+        self.inner
+            .lock()
+            .unwrap()
+            .account_state
+            .as_ref()
+            .map(|s| s.equity)
+            .unwrap_or(Usd::ZERO)
     }
 
     /// Current drawdown from peak equity as a fraction (0.0 = at peak).
     pub fn drawdown_pct(&self) -> f64 {
         let st = self.inner.lock().unwrap();
-        st.account_state.as_ref().map(|s| s.drawdown_pct()).unwrap_or(0.0)
+        st.account_state
+            .as_ref()
+            .map(|s| s.drawdown_pct())
+            .unwrap_or(0.0)
     }
 
     pub fn total_fees(&self) -> Usd {
@@ -459,10 +497,15 @@ impl crate::funding_arb::runtime::FundingArbAccountView for AccountTracker {
     fn get_position(&self, symbol: &str) -> Option<Position> {
         AccountTracker::get_position(self, symbol)
     }
-    fn get_spot_balance(&self, token: &str) -> Option<crate::funding_arb::runtime::SpotBalanceView> {
-        AccountTracker::get_spot_balance(self, token).map(|b| crate::funding_arb::runtime::SpotBalanceView {
-            total: b.total.inner(),
-            hold: b.hold.inner(),
+    fn get_spot_balance(
+        &self,
+        token: &str,
+    ) -> Option<crate::funding_arb::runtime::SpotBalanceView> {
+        AccountTracker::get_spot_balance(self, token).map(|b| {
+            crate::funding_arb::runtime::SpotBalanceView {
+                total: b.total.inner(),
+                hold: b.hold.inner(),
+            }
         })
     }
     fn get_account_available_balance(&self) -> Option<Decimal> {
@@ -514,7 +557,11 @@ mod tests {
         t.update_fill(&fill("BTC", Side::Sell, "1.0", "55000", "c2"), false);
         let pos = t.get_position("BTC").unwrap();
         assert_eq!(pos.size.to_string(), "1");
-        assert_eq!(pos.entry_price.unwrap().to_string(), "50000", "reduction must not re-weight cost basis");
+        assert_eq!(
+            pos.entry_price.unwrap().to_string(),
+            "50000",
+            "reduction must not re-weight cost basis"
+        );
     }
 
     #[test]
@@ -604,7 +651,11 @@ mod tests {
         t.update_account_state(&state("10000"));
         assert_eq!(t.peak_equity().to_string(), "10000");
         t.update_account_state(&state("9000"));
-        assert_eq!(t.peak_equity().to_string(), "10000", "peak equity never decreases");
+        assert_eq!(
+            t.peak_equity().to_string(),
+            "10000",
+            "peak equity never decreases"
+        );
         assert!((t.drawdown_pct() - 0.1).abs() < 1e-6);
     }
 
@@ -632,8 +683,14 @@ mod tests {
         };
         let ts = Utc::now();
         t.update_spot_balances(&[b("USDC", "1000", "0"), b("BTC", "1", "0.5")], ts);
-        assert_eq!(t.get_spot_balance("USDC").unwrap().available().to_string(), "1000");
-        assert_eq!(t.get_spot_balance("BTC").unwrap().available().to_string(), "0.5");
+        assert_eq!(
+            t.get_spot_balance("USDC").unwrap().available().to_string(),
+            "1000"
+        );
+        assert_eq!(
+            t.get_spot_balance("BTC").unwrap().available().to_string(),
+            "0.5"
+        );
         // Zero-balance tokens are filtered out.
         t.update_spot_balances(&[b("USDC", "0", "0")], ts);
         assert!(t.get_spot_balance("USDC").is_none());

@@ -883,7 +883,10 @@ fn merge_reconciled(record: &OrderRow, order: &Order) -> Result<Order, HypeEdgeE
     if merged.submitted_at.is_none() {
         merged.submitted_at = order.submitted_at;
     }
-    merged.acknowledged_at = order.acknowledged_at.or(merged.acknowledged_at).or(Some(Utc::now()));
+    merged.acknowledged_at = order
+        .acknowledged_at
+        .or(merged.acknowledged_at)
+        .or(Some(Utc::now()));
     merged.filled_at = order.filled_at.or(merged.filled_at);
     Ok(merged)
 }

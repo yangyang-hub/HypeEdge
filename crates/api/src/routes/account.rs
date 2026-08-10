@@ -9,9 +9,9 @@
 use axum::extract::{Extension, State};
 use axum::response::Response;
 
-use crate::auth::{authorize, ApiRole};
-use crate::middleware::RoleGuard;
+use crate::auth::{ApiRole, authorize};
 use crate::errors::{ApiProblem, ok};
+use crate::middleware::RoleGuard;
 use crate::state::AppState;
 use axum::response::IntoResponse;
 use hypeedge_domain::traits::ExecutionClient;
@@ -148,12 +148,8 @@ pub async fn close_position(
             "cloid": order.cloid,
             "status": order.status.as_str(),
         })),
-        Err(e) => ApiProblem::new(
-            502,
-            "ORDER_SUBMIT_FAILED",
-            format!("close failed: {e}"),
-        )
-        .into_response(),
+        Err(e) => ApiProblem::new(502, "ORDER_SUBMIT_FAILED", format!("close failed: {e}"))
+            .into_response(),
     }
 }
 
@@ -163,16 +159,11 @@ pub async fn orders(State(state): State<AppState>) -> Response {
         return ok(serde_json::json!([]));
     };
     match execution.get_open_orders(None).await {
-        Ok(orders) => ok(serde_json::json!(orders
-            .into_iter()
-            .map(order_payload)
-            .collect::<Vec<_>>())),
-        Err(e) => ApiProblem::new(
-            502,
-            "ORDER_QUERY_FAILED",
-            format!("orders failed: {e}"),
-        )
-        .into_response(),
+        Ok(orders) => ok(serde_json::json!(
+            orders.into_iter().map(order_payload).collect::<Vec<_>>()
+        )),
+        Err(e) => ApiProblem::new(502, "ORDER_QUERY_FAILED", format!("orders failed: {e}"))
+            .into_response(),
     }
 }
 
@@ -206,12 +197,8 @@ pub async fn submit_order(
             "status": order.status.as_str(),
             "symbol": order.symbol,
         })),
-        Err(e) => ApiProblem::new(
-            502,
-            "ORDER_SUBMIT_FAILED",
-            format!("submit failed: {e}"),
-        )
-        .into_response(),
+        Err(e) => ApiProblem::new(502, "ORDER_SUBMIT_FAILED", format!("submit failed: {e}"))
+            .into_response(),
     }
 }
 
@@ -235,18 +222,16 @@ pub async fn cancel_order(
     };
     match execution.cancel_order(&cloid).await {
         Ok(accepted) => ok(serde_json::json!({ "accepted": accepted, "cloid": cloid })),
-        Err(e) => ApiProblem::new(
-            502,
-            "ORDER_CANCEL_FAILED",
-            format!("cancel failed: {e}"),
-        )
-        .into_response(),
+        Err(e) => ApiProblem::new(502, "ORDER_CANCEL_FAILED", format!("cancel failed: {e}"))
+            .into_response(),
     }
 }
 
 /// Build an `OrderIntent` from the JSON body contract:
 /// `{ symbol, side, size, price?, order_type, time_in_force? }`.
-fn intent_from_json(body: &serde_json::Value) -> Result<hypeedge_domain::models::OrderIntent, String> {
+fn intent_from_json(
+    body: &serde_json::Value,
+) -> Result<hypeedge_domain::models::OrderIntent, String> {
     use hypeedge_domain::decimal::{Price, Size};
     use hypeedge_domain::enums::{OrderType, Side, TimeInForce};
     let symbol = body
@@ -322,10 +307,10 @@ fn order_payload(order: hypeedge_domain::models::Order) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use hypeedge_domain::decimal::{Decimal as D, Price, Size, Usd};
     use hypeedge_domain::enums::Side;
     use hypeedge_domain::models::{AccountState, Fill, Position};
+    use std::sync::Arc;
 
     fn make_state() -> AppState {
         let settings = Arc::new(hypeedge_config::settings::AppSettings::default());
@@ -335,7 +320,9 @@ mod tests {
             settings,
             ks,
             bus,
-            Arc::new(tokio::sync::Mutex::new(hypeedge_trading::market_data::BookManager::new(20))),
+            Arc::new(tokio::sync::Mutex::new(
+                hypeedge_trading::market_data::BookManager::new(20),
+            )),
         )
     }
 
@@ -390,7 +377,9 @@ mod tests {
         seed_tracker(&state);
         *state.trading_enabled.write().await = true;
         let body = account(State(state)).await;
-        let body = axum::body::to_bytes(body.into_body(), 64 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(body.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let text = String::from_utf8_lossy(&body).to_string();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         let data = &json["data"];
@@ -407,7 +396,9 @@ mod tests {
     async fn account_returns_zeros_when_empty() {
         let state = make_state();
         let body = account(State(state)).await;
-        let body = axum::body::to_bytes(body.into_body(), 64 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(body.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let text = String::from_utf8_lossy(&body).to_string();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         let data = &json["data"];
@@ -421,7 +412,9 @@ mod tests {
         let state = make_state();
         seed_tracker(&state);
         let body = positions(State(state)).await;
-        let body = axum::body::to_bytes(body.into_body(), 64 * 1024).await.unwrap();
+        let body = axum::body::to_bytes(body.into_body(), 64 * 1024)
+            .await
+            .unwrap();
         let text = String::from_utf8_lossy(&body).to_string();
         let json: serde_json::Value = serde_json::from_str(&text).unwrap();
         let data = json["data"].as_array().unwrap();

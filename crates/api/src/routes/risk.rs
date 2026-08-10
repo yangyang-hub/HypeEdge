@@ -1,12 +1,12 @@
 //! Risk and kill-switch routes, port of `src/hypeedge/api/routes/risk.py`.
 
-use axum::extract::State;
 use axum::extract::Extension;
+use axum::extract::State;
 use axum::response::Response;
 
-use crate::auth::{authorize, ApiRole};
-use crate::middleware::RoleGuard;
+use crate::auth::{ApiRole, authorize};
 use crate::errors::{ApiProblem, ok};
+use crate::middleware::RoleGuard;
 use crate::state::AppState;
 use axum::response::IntoResponse;
 

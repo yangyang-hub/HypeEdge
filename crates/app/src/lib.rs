@@ -152,14 +152,21 @@ mod tests {
         // without panicking.
         let settings = dev_settings();
         let bus = Arc::new(EventBus::new(10_000));
-        let wiring = runtime::build_runtime(&settings, bus.clone()).await.unwrap();
+        let wiring = runtime::build_runtime(&settings, bus.clone())
+            .await
+            .unwrap();
         assert!(wiring.execution.is_none(), "v2 disabled → no engine");
         assert!(!*wiring.trading_enabled.read().await, "trading disabled");
         assert!(wiring.market_data.is_none());
         let app = HypeEdgeApp::new(settings);
         let router = app.router();
         let resp = router
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);

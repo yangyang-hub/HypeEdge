@@ -31,7 +31,11 @@ pub struct EmergencyCancelTarget {
 }
 
 impl EmergencyCancelTarget {
-    pub fn new(symbol: impl Into<String>, cloid: Option<String>, oid: Option<String>) -> Result<Self, String> {
+    pub fn new(
+        symbol: impl Into<String>,
+        cloid: Option<String>,
+        oid: Option<String>,
+    ) -> Result<Self, String> {
         let symbol = symbol.into();
         if symbol.is_empty() {
             return Err("emergency cancel target requires a symbol".into());
@@ -78,8 +82,14 @@ impl EmergencyCancelBatchResult {
 /// Strict cancel-only execution boundary used during DB failure/halting.
 #[async_trait]
 pub trait EmergencyCancelExecutor: Send + Sync {
-    async fn cancel(&self, target: EmergencyCancelTarget) -> Result<EmergencyCancelResult, HypeEdgeError>;
-    async fn cancel_all(&self, symbol: Option<&str>) -> Result<EmergencyCancelBatchResult, HypeEdgeError>;
+    async fn cancel(
+        &self,
+        target: EmergencyCancelTarget,
+    ) -> Result<EmergencyCancelResult, HypeEdgeError>;
+    async fn cancel_all(
+        &self,
+        symbol: Option<&str>,
+    ) -> Result<EmergencyCancelBatchResult, HypeEdgeError>;
     async fn recover_pending(&self) -> Result<EmergencyCancelBatchResult, HypeEdgeError>;
 }
 
@@ -157,8 +167,9 @@ impl EmergencyCancelJournal {
             outcome: outcome.map(|s| s.to_string()),
             error: error.map(|s| s.to_string()),
         };
-        let mut payload = serde_json::to_vec(&record)
-            .map_err(|e| HypeEdgeError::Execution { message: e.to_string() })?;
+        let mut payload = serde_json::to_vec(&record).map_err(|e| HypeEdgeError::Execution {
+            message: e.to_string(),
+        })?;
         payload.push(b'\n');
         let path = self.path.clone();
         let _guard = self.lock.lock().await;
@@ -218,19 +229,25 @@ fn append_sync(path: &Path, payload: &[u8]) -> Result<(), HypeEdgeError> {
     use std::os::unix::fs::OpenOptionsExt;
 
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| HypeEdgeError::Execution { message: e.to_string() })?;
+        std::fs::create_dir_all(parent).map_err(|e| HypeEdgeError::Execution {
+            message: e.to_string(),
+        })?;
     }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .open(path)
-        .map_err(|e| HypeEdgeError::Execution { message: e.to_string() })?;
+        .map_err(|e| HypeEdgeError::Execution {
+            message: e.to_string(),
+        })?;
     file.write_all(payload)
-        .map_err(|e| HypeEdgeError::Execution { message: e.to_string() })?;
-    file.sync_all()
-        .map_err(|e| HypeEdgeError::Execution { message: e.to_string() })?;
+        .map_err(|e| HypeEdgeError::Execution {
+            message: e.to_string(),
+        })?;
+    file.sync_all().map_err(|e| HypeEdgeError::Execution {
+        message: e.to_string(),
+    })?;
     Ok(())
 }
 
@@ -243,10 +260,13 @@ fn read_records_sync(path: &Path) -> Result<Vec<EmergencyJournalRecord>, HypeEdg
         Err(e) => {
             return Err(HypeEdgeError::Execution {
                 message: e.to_string(),
-            })
+            });
         }
     };
-    let lines: Vec<&[u8]> = data.split(|b| *b == b'\n').filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&[u8]> = data
+        .split(|b| *b == b'\n')
+        .filter(|l| !l.is_empty())
+        .collect();
     let mut records = Vec::new();
     for (index, line) in lines.iter().enumerate() {
         match serde_json::from_slice::<EmergencyJournalRecord>(line) {
@@ -254,8 +274,7 @@ fn read_records_sync(path: &Path) -> Result<Vec<EmergencyJournalRecord>, HypeEdg
             Err(_) => {
                 // Torn tail: the final line has no trailing newline and is
                 // incomplete JSON — a crash mid-write. Ignore it.
-                let is_torn_tail =
-                    index == lines.len() - 1 && !data.ends_with(b"\n");
+                let is_torn_tail = index == lines.len() - 1 && !data.ends_with(b"\n");
                 if is_torn_tail {
                     tracing::warn!(path = %path.display(), "emergency_journal_torn_tail_ignored");
                     break;
@@ -358,7 +377,10 @@ impl WalEmergencyCancelExecutor {
 
 impl WalEmergencyCancelExecutor {
     /// Cancel one target after checking it is still authoritatively open.
-    pub async fn cancel(&self, target: EmergencyCancelTarget) -> Result<EmergencyCancelResult, HypeEdgeError> {
+    pub async fn cancel(
+        &self,
+        target: EmergencyCancelTarget,
+    ) -> Result<EmergencyCancelResult, HypeEdgeError> {
         let _guard = self.operation_lock.lock().await;
         let authoritative = self.open_orders.get_open_orders().await?;
         let Some(matched) = find_target(&authoritative, &target) else {
@@ -376,11 +398,15 @@ impl WalEmergencyCancelExecutor {
         };
         let attempt_id = self.dispatch(&matched).await?;
         let remaining = self.open_orders.get_open_orders().await?;
-        self.verify(&matched, &remaining, Some(attempt_id.as_str())).await
+        self.verify(&matched, &remaining, Some(attempt_id.as_str()))
+            .await
     }
 
     /// Cancel all open orders, optionally filtered by symbol.
-    pub async fn cancel_all(&self, symbol: Option<&str>) -> Result<EmergencyCancelBatchResult, HypeEdgeError> {
+    pub async fn cancel_all(
+        &self,
+        symbol: Option<&str>,
+    ) -> Result<EmergencyCancelBatchResult, HypeEdgeError> {
         let _guard = self.operation_lock.lock().await;
         let authoritative = self.open_orders.get_open_orders().await?;
         let targets: Vec<EmergencyCancelTarget> = authoritative
@@ -410,7 +436,11 @@ impl WalEmergencyCancelExecutor {
                 continue; // already counted in unresolved above
             }
             let result = self
-                .verify(target, &remaining, attempts.get(&target.key()).map(String::as_str))
+                .verify(
+                    target,
+                    &remaining,
+                    attempts.get(&target.key()).map(String::as_str),
+                )
                 .await?;
             if !result.success {
                 unresolved.push(target.clone());
@@ -512,11 +542,14 @@ impl WalEmergencyCancelExecutor {
                     HypeEdgeError::Execution { message: msg }
                 })
         } else {
-            let oid = target.oid.as_deref().unwrap_or_default().parse::<i64>().map_err(|_| {
-                HypeEdgeError::Execution {
+            let oid = target
+                .oid
+                .as_deref()
+                .unwrap_or_default()
+                .parse::<i64>()
+                .map_err(|_| HypeEdgeError::Execution {
                     message: format!("emergency cancel oid is not numeric: {:?}", target.oid),
-                }
-            })?;
+                })?;
             let target_key = target.key();
             nonce
                 .submit("emergency_cancel", move |nonce| {
@@ -538,7 +571,13 @@ impl WalEmergencyCancelExecutor {
         match result {
             Ok(outcome) => {
                 self.journal
-                    .append(&attempt_id, "transport_result", target, Some(&outcome), None)
+                    .append(
+                        &attempt_id,
+                        "transport_result",
+                        target,
+                        Some(&outcome),
+                        None,
+                    )
                     .await?;
             }
             Err(e) => {
@@ -577,7 +616,13 @@ impl WalEmergencyCancelExecutor {
         };
         if find_target(remaining, target).is_none() {
             self.journal
-                .append(&resolved_attempt_id, "verified_absent", target, Some("cancelled"), None)
+                .append(
+                    &resolved_attempt_id,
+                    "verified_absent",
+                    target,
+                    Some("cancelled"),
+                    None,
+                )
                 .await?;
             Ok(EmergencyCancelResult {
                 target: target.clone(),
@@ -588,7 +633,13 @@ impl WalEmergencyCancelExecutor {
             })
         } else {
             self.journal
-                .append(&resolved_attempt_id, "verified_open", target, Some("still_open"), None)
+                .append(
+                    &resolved_attempt_id,
+                    "verified_open",
+                    target,
+                    Some("still_open"),
+                    None,
+                )
                 .await?;
             Ok(EmergencyCancelResult {
                 target: target.clone(),
@@ -606,15 +657,18 @@ fn find_target(
     candidates: &[EmergencyCancelTarget],
     target: &EmergencyCancelTarget,
 ) -> Option<EmergencyCancelTarget> {
-    candidates.iter().find(|candidate| {
-        // Match by canonical identity first; also fall back to a bare oid match
-        // (D2) so an order that the exchange reports only by oid is still
-        // recognized instead of reporting a false `already_absent`.
-        candidate.key() == target.key()
-            || (target.oid.is_some()
-                && candidate.oid.is_some()
-                && candidate.oid.as_deref() == target.oid.as_deref())
-    }).cloned()
+    candidates
+        .iter()
+        .find(|candidate| {
+            // Match by canonical identity first; also fall back to a bare oid match
+            // (D2) so an order that the exchange reports only by oid is still
+            // recognized instead of reporting a false `already_absent`.
+            candidate.key() == target.key()
+                || (target.oid.is_some()
+                    && candidate.oid.is_some()
+                    && candidate.oid.as_deref() == target.oid.as_deref())
+        })
+        .cloned()
 }
 
 fn canonical_cloid(cloid: &str) -> String {
@@ -697,10 +751,18 @@ mod tests {
 
     #[async_trait]
     impl ExchangeClient for FakeExchangeClient {
-        async fn order(&self, _orders: Vec<super::super::signing::OrderWire>, _nonce: u64) -> Result<serde_json::Value, String> {
+        async fn order(
+            &self,
+            _orders: Vec<super::super::signing::OrderWire>,
+            _nonce: u64,
+        ) -> Result<serde_json::Value, String> {
             unreachable!()
         }
-        async fn cancel(&self, cancels: Vec<CancelWire>, nonce: u64) -> Result<serde_json::Value, String> {
+        async fn cancel(
+            &self,
+            cancels: Vec<CancelWire>,
+            nonce: u64,
+        ) -> Result<serde_json::Value, String> {
             let mut calls = self.0.cancel_calls.lock().unwrap();
             for c in cancels {
                 calls.push((c.a, c.o));
@@ -708,7 +770,11 @@ mod tests {
             let _ = nonce;
             Ok(serde_json::json!({ "status": "ok" }))
         }
-        async fn cancel_by_cloid(&self, cancels: Vec<CancelByCloidWire>, nonce: u64) -> Result<serde_json::Value, String> {
+        async fn cancel_by_cloid(
+            &self,
+            cancels: Vec<CancelByCloidWire>,
+            nonce: u64,
+        ) -> Result<serde_json::Value, String> {
             let mut calls = self.0.cancel_by_cloid_calls.lock().unwrap();
             for c in cancels {
                 calls.push((c.asset, c.cloid.clone()));
@@ -716,17 +782,29 @@ mod tests {
             let _ = nonce;
             Ok(serde_json::json!({ "status": "ok" }))
         }
-        async fn update_leverage(&self, _asset: i64, _is_cross: bool, _leverage: i64, _nonce: u64) -> Result<serde_json::Value, String> {
+        async fn update_leverage(
+            &self,
+            _asset: i64,
+            _is_cross: bool,
+            _leverage: i64,
+            _nonce: u64,
+        ) -> Result<serde_json::Value, String> {
             unreachable!()
         }
-        async fn query_order_by_cloid(&self, _cloid: &str) -> Result<Option<serde_json::Value>, String> {
+        async fn query_order_by_cloid(
+            &self,
+            _cloid: &str,
+        ) -> Result<Option<serde_json::Value>, String> {
             Ok(None)
         }
     }
 
     fn temp_journal(tag: &str) -> (PathBuf, Arc<EmergencyCancelJournal>) {
         let dir = std::env::temp_dir();
-        let path = dir.join(format!("hypeedge_emergency_{tag}_{}.jsonl", uuid::Uuid::new_v4()));
+        let path = dir.join(format!(
+            "hypeedge_emergency_{tag}_{}.jsonl",
+            uuid::Uuid::new_v4()
+        ));
         (path.clone(), Arc::new(EmergencyCancelJournal::new(path)))
     }
 
@@ -895,7 +973,8 @@ mod tests {
         // D2 regression: a target keyed by cloid must still match an
         // authoritative order the exchange reports only by oid (otherwise
         // `cancel` returns a false `already_absent` while the order stays live).
-        let target = EmergencyCancelTarget::new("BTC", Some("0xc1".into()), Some("123".into())).unwrap();
+        let target =
+            EmergencyCancelTarget::new("BTC", Some("0xc1".into()), Some("123".into())).unwrap();
         let oid_only = EmergencyCancelTarget::new("BTC", None, Some("123".into())).unwrap();
         // Keys differ (cloid:... vs oid:BTC:123), so without the oid fallback
         // this would return None.

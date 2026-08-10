@@ -43,7 +43,7 @@ pub fn interval_to_ms(interval: &str) -> Result<i64, HypeEdgeError> {
         _ => {
             return Err(HypeEdgeError::MarketData(format!(
                 "Unsupported candle interval: {interval}"
-            )))
+            )));
         }
     };
     Ok(ms)
@@ -58,7 +58,11 @@ pub struct RestClient {
 }
 
 impl RestClient {
-    pub fn new(base_url: &str, rate_limiter: Arc<RateLimiter>, backfill_batch_size: u32) -> Result<Self, HypeEdgeError> {
+    pub fn new(
+        base_url: &str,
+        rate_limiter: Arc<RateLimiter>,
+        backfill_batch_size: u32,
+    ) -> Result<Self, HypeEdgeError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
@@ -103,17 +107,16 @@ impl RestClient {
                 Ok(resp) => {
                     let status = resp.status();
                     if status.is_success() {
-                        return resp.json::<Value>().await.map_err(|e| {
-                            HypeEdgeError::MarketData(format!("info decode: {e}"))
-                        });
+                        return resp
+                            .json::<Value>()
+                            .await
+                            .map_err(|e| HypeEdgeError::MarketData(format!("info decode: {e}")));
                     }
                     let retryable = status == reqwest::StatusCode::TOO_MANY_REQUESTS
                         || status.is_server_error();
                     last_error = Some(format!("info {} status {}", request_type, status));
                     if !retryable || attempt >= MAX_INFO_RETRIES - 1 {
-                        return Err(HypeEdgeError::MarketData(
-                            last_error.unwrap_or_default(),
-                        ));
+                        return Err(HypeEdgeError::MarketData(last_error.unwrap_or_default()));
                     }
                 }
                 Err(e) => {
@@ -135,7 +138,8 @@ impl RestClient {
     }
 
     pub async fn get_l2_book(&self, coin: &str) -> Result<Value, HypeEdgeError> {
-        self.post_info("l2Book", Some(&json!({ "coin": coin })), 1).await
+        self.post_info("l2Book", Some(&json!({ "coin": coin })), 1)
+            .await
     }
 
     pub async fn get_meta(&self) -> Result<Value, HypeEdgeError> {
@@ -161,17 +165,23 @@ impl RestClient {
     }
 
     /// Fetch one authoritative quota snapshot and update the shared limiter.
-    pub async fn poll_action_credit_snapshot(&self, user: &str) -> Result<Option<Value>, HypeEdgeError> {
+    pub async fn poll_action_credit_snapshot(
+        &self,
+        user: &str,
+    ) -> Result<Option<Value>, HypeEdgeError> {
         match self.get_user_rate_limit(user).await {
             Ok(data) => {
-                let remaining = data
-                    .get("remaining")
-                    .and_then(|v| v.as_i64())
-                    .or_else(|| {
-                        let used = data.get("nRequestsUsed").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let cap = data.get("nRequestsCap").and_then(|v| v.as_i64()).unwrap_or(0);
-                        Some((cap - used).max(0))
-                    });
+                let remaining = data.get("remaining").and_then(|v| v.as_i64()).or_else(|| {
+                    let used = data
+                        .get("nRequestsUsed")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let cap = data
+                        .get("nRequestsCap")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    Some((cap - used).max(0))
+                });
                 if let Some(remaining) = remaining {
                     self.rate_limiter.update_action_credits(remaining);
                 }
@@ -186,13 +196,17 @@ impl RestClient {
             .poll_action_credit_snapshot(user)
             .await?
             .and_then(|data| {
-                data.get("remaining")
-                    .and_then(|v| v.as_i64())
-                    .or_else(|| {
-                        let used = data.get("nRequestsUsed").and_then(|v| v.as_i64()).unwrap_or(0);
-                        let cap = data.get("nRequestsCap").and_then(|v| v.as_i64()).unwrap_or(0);
-                        Some((cap - used).max(0))
-                    })
+                data.get("remaining").and_then(|v| v.as_i64()).or_else(|| {
+                    let used = data
+                        .get("nRequestsUsed")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    let cap = data
+                        .get("nRequestsCap")
+                        .and_then(|v| v.as_i64())
+                        .unwrap_or(0);
+                    Some((cap - used).max(0))
+                })
             })
             .unwrap_or(-1))
     }
@@ -237,21 +251,22 @@ impl CandleHistoryClient for RestClient {
                 .send()
                 .await;
             let data: Value = match response {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.json::<Value>().await {
-                        Ok(v) => v,
-                        Err(_) => {
-                            consecutive_failures += 1;
-                            if consecutive_failures >= 3 {
-                                return Err(HypeEdgeError::MarketData(format!(
-                                    "Candle backfill failed after {consecutive_failures} attempts: coin={coin} interval={interval}"
-                                )));
-                            }
-                            tokio::time::sleep(Duration::from_millis(500 * (1 << (consecutive_failures - 1)))).await;
-                            continue;
+                Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                    Ok(v) => v,
+                    Err(_) => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 3 {
+                            return Err(HypeEdgeError::MarketData(format!(
+                                "Candle backfill failed after {consecutive_failures} attempts: coin={coin} interval={interval}"
+                            )));
                         }
+                        tokio::time::sleep(Duration::from_millis(
+                            500 * (1 << (consecutive_failures - 1)),
+                        ))
+                        .await;
+                        continue;
                     }
-                }
+                },
                 Ok(resp) => {
                     consecutive_failures += 1;
                     if consecutive_failures >= 3 {
@@ -260,7 +275,10 @@ impl CandleHistoryClient for RestClient {
                             resp.status()
                         )));
                     }
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << (consecutive_failures - 1)))).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        500 * (1 << (consecutive_failures - 1)),
+                    ))
+                    .await;
                     continue;
                 }
                 Err(e) => {
@@ -270,7 +288,10 @@ impl CandleHistoryClient for RestClient {
                             "Candle backfill failed after {consecutive_failures} attempts: coin={coin} interval={interval}: {e}"
                         )));
                     }
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << (consecutive_failures - 1)))).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        500 * (1 << (consecutive_failures - 1)),
+                    ))
+                    .await;
                     continue;
                 }
             };
@@ -327,7 +348,8 @@ impl CandleHistoryClient for RestClient {
 
         while cursor < end_time {
             let page_end = end_time.min(cursor + (batch_size * funding_interval_ms));
-            let estimated_items = ((page_end - cursor) / funding_interval_ms).clamp(1, batch_size) as u64;
+            let estimated_items =
+                ((page_end - cursor) / funding_interval_ms).clamp(1, batch_size) as u64;
             self.rate_limiter
                 .acquire("fundingHistory", 0, estimated_items)
                 .await
@@ -346,21 +368,22 @@ impl CandleHistoryClient for RestClient {
                 .send()
                 .await;
             let data: Value = match response {
-                Ok(resp) if resp.status().is_success() => {
-                    match resp.json::<Value>().await {
-                        Ok(v) => v,
-                        Err(e) => {
-                            consecutive_failures += 1;
-                            if consecutive_failures >= 3 {
-                                return Err(HypeEdgeError::MarketData(format!(
-                                    "Funding backfill failed after {consecutive_failures} attempts: coin={coin}: {e}"
-                                )));
-                            }
-                            tokio::time::sleep(Duration::from_millis(500 * (1 << (consecutive_failures - 1)))).await;
-                            continue;
+                Ok(resp) if resp.status().is_success() => match resp.json::<Value>().await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        if consecutive_failures >= 3 {
+                            return Err(HypeEdgeError::MarketData(format!(
+                                "Funding backfill failed after {consecutive_failures} attempts: coin={coin}: {e}"
+                            )));
                         }
+                        tokio::time::sleep(Duration::from_millis(
+                            500 * (1 << (consecutive_failures - 1)),
+                        ))
+                        .await;
+                        continue;
                     }
-                }
+                },
                 Ok(resp) => {
                     consecutive_failures += 1;
                     if consecutive_failures >= 3 {
@@ -369,7 +392,10 @@ impl CandleHistoryClient for RestClient {
                             resp.status()
                         )));
                     }
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << (consecutive_failures - 1)))).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        500 * (1 << (consecutive_failures - 1)),
+                    ))
+                    .await;
                     continue;
                 }
                 Err(e) => {
@@ -379,7 +405,10 @@ impl CandleHistoryClient for RestClient {
                             "Funding backfill failed after {consecutive_failures} attempts: coin={coin}: {e}"
                         )));
                     }
-                    tokio::time::sleep(Duration::from_millis(500 * (1 << (consecutive_failures - 1)))).await;
+                    tokio::time::sleep(Duration::from_millis(
+                        500 * (1 << (consecutive_failures - 1)),
+                    ))
+                    .await;
                     continue;
                 }
             };
@@ -443,7 +472,9 @@ impl crate::account::InfoClient for RestClient {
             .post_info("historicalOrders", Some(&json!({ "user": account })), 1)
             .await
             .map_err(|e| e.to_string())?;
-        resp.as_array().cloned().ok_or_else(|| "historicalOrders: expected array".into())
+        resp.as_array()
+            .cloned()
+            .ok_or_else(|| "historicalOrders: expected array".into())
     }
 
     async fn user_fills_by_time(
@@ -460,7 +491,9 @@ impl crate::account::InfoClient for RestClient {
             )
             .await
             .map_err(|e| e.to_string())?;
-        resp.as_array().cloned().ok_or_else(|| "userFillsByTime: expected array".into())
+        resp.as_array()
+            .cloned()
+            .ok_or_else(|| "userFillsByTime: expected array".into())
     }
 
     async fn user_funding_history(
@@ -477,10 +510,16 @@ impl crate::account::InfoClient for RestClient {
             )
             .await
             .map_err(|e| e.to_string())?;
-        resp.as_array().cloned().ok_or_else(|| "userFunding: expected array".into())
+        resp.as_array()
+            .cloned()
+            .ok_or_else(|| "userFunding: expected array".into())
     }
 
-    async fn query_order_by_oid(&self, account: &str, exchange_oid: i64) -> Result<Option<Value>, String> {
+    async fn query_order_by_oid(
+        &self,
+        account: &str,
+        exchange_oid: i64,
+    ) -> Result<Option<Value>, String> {
         let resp = self
             .post_info(
                 "orderStatus",
@@ -516,14 +555,22 @@ fn number_of(row: &Value, key: &str) -> hypeedge_domain::Decimal {
 fn float_of(row: &Value, key: &str) -> f64 {
     row.get(key)
         .and_then(|v| v.as_f64())
-        .or_else(|| row.get(key).and_then(|v| v.as_str()).and_then(|s| s.parse().ok()))
+        .or_else(|| {
+            row.get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+        })
         .unwrap_or(0.0)
 }
 
 fn int_of(row: &Value, key: &str) -> i64 {
     row.get(key)
         .and_then(|v| v.as_i64())
-        .or_else(|| row.get(key).and_then(|v| v.as_str()).and_then(|s| s.parse().ok()))
+        .or_else(|| {
+            row.get(key)
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse().ok())
+        })
         .unwrap_or(0)
 }
 
@@ -541,7 +588,8 @@ mod tests {
 
     #[test]
     fn row_parsing_handles_numbers_and_strings() {
-        let row = json!({ "o": "50000", "h": 50100.5, "l": 49900, "c": 50050, "v": "1.5", "t": 123 });
+        let row =
+            json!({ "o": "50000", "h": 50100.5, "l": 49900, "c": 50050, "v": "1.5", "t": 123 });
         assert_eq!(float_of(&row, "o"), 50000.0);
         assert_eq!(float_of(&row, "h"), 50100.5);
         assert_eq!(int_of(&row, "t"), 123);

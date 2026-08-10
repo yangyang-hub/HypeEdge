@@ -41,7 +41,6 @@ fn hl_cloid(n: u64) -> String {
     format!("0x{n:032x}")
 }
 
-
 /// Cross-binary serialization: every integration test binary shares one DB, so
 /// each test holds a Postgres advisory lock to stop concurrent `clean_tables`
 /// calls from clobbering another test's rows. The connection is returned; the
@@ -105,7 +104,10 @@ async fn ingest_fill_creates_fact_chain() {
     clean_tables(&pool).await;
     let projector = PostgresExchangeFactProjector::new(pool.clone(), ACCOUNT);
 
-    let result = projector.ingest_fill(&fill_payload()).await.expect("ingest fill");
+    let result = projector
+        .ingest_fill(&fill_payload())
+        .await
+        .expect("ingest fill");
     assert!(result.processed);
     let projection = result.fill_projection.expect("fill projection");
     assert_eq!(projection.cloid, hl_cloid(1));
@@ -117,21 +119,37 @@ async fn ingest_fill_creates_fact_chain() {
     assert_eq!(projection.order_status, "filled");
 
     // The fact chain: order + fill + position + 2 ledger entries + outbox.
-    let (orders,): (i64,) = sqlx::query_as("SELECT count(*) FROM orders WHERE exchange_oid = '12345'")
-        .fetch_one(&pool).await.unwrap();
+    let (orders,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM orders WHERE exchange_oid = '12345'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(orders, 1);
-    let (fills,): (i64,) = sqlx::query_as("SELECT count(*) FROM fills WHERE exchange_fill_id = 'fill:42'")
-        .fetch_one(&pool).await.unwrap();
+    let (fills,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM fills WHERE exchange_fill_id = 'fill:42'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(fills, 1);
-    let (positions,): (i64,) = sqlx::query_as("SELECT count(*) FROM positions WHERE symbol = 'BTC'")
-        .fetch_one(&pool).await.unwrap();
+    let (positions,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM positions WHERE symbol = 'BTC'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(positions, 1);
-    let (ledger,): (i64,) = sqlx::query_as("SELECT count(*) FROM ledger_entries WHERE fill_id = $1")
-        .bind(projection_cloid_fill(&pool).await)
-        .fetch_one(&pool).await.unwrap();
+    let (ledger,): (i64,) =
+        sqlx::query_as("SELECT count(*) FROM ledger_entries WHERE fill_id = $1")
+            .bind(projection_cloid_fill(&pool).await)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(ledger, 2, "realized_pnl + fee ledger entries");
-    let (outbox,): (i64,) = sqlx::query_as("SELECT count(*) FROM outbox_events WHERE event_type = 'exchange.fill.ingested'")
-        .fetch_one(&pool).await.unwrap();
+    let (outbox,): (i64,) = sqlx::query_as(
+        "SELECT count(*) FROM outbox_events WHERE event_type = 'exchange.fill.ingested'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(outbox, 1);
     // Cursor advanced.
     let cursor = projector.cursor("fills").await.unwrap();
@@ -140,7 +158,9 @@ async fn ingest_fill_creates_fact_chain() {
 
 async fn projection_cloid_fill(pool: &PgPool) -> Uuid {
     let (fill_id,): (Uuid,) = sqlx::query_as("SELECT fill_id FROM fills LIMIT 1")
-        .fetch_one(pool).await.unwrap();
+        .fetch_one(pool)
+        .await
+        .unwrap();
     fill_id
 }
 
@@ -154,9 +174,14 @@ async fn duplicate_fill_is_idempotent() {
     let first = projector.ingest_fill(&fill_payload()).await.unwrap();
     let second = projector.ingest_fill(&fill_payload()).await.unwrap();
     assert!(first.processed);
-    assert!(!second.processed, "same external id must dedupe via the inbox");
+    assert!(
+        !second.processed,
+        "same external id must dedupe via the inbox"
+    );
     let (fills,): (i64,) = sqlx::query_as("SELECT count(*) FROM fills")
-        .fetch_one(&pool).await.unwrap();
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(fills, 1);
 }
 
@@ -183,13 +208,17 @@ async fn ingest_order_update_creates_projection() {
     });
     let result = projector.ingest_order_update(&update).await.unwrap();
     assert!(result.processed);
-    assert_eq!(result.external_event_id, "order:98765:acknowledged:1700000000500");
+    assert_eq!(
+        result.external_event_id,
+        "order:98765:acknowledged:1700000000500"
+    );
 
     // Order bound + cursor.
-    let (status, side,): (String, String) = sqlx::query_as(
-        "SELECT status, side FROM orders WHERE exchange_oid = '98765'",
-    )
-    .fetch_one(&pool).await.unwrap();
+    let (status, side): (String, String) =
+        sqlx::query_as("SELECT status, side FROM orders WHERE exchange_oid = '98765'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(status, "acknowledged");
     assert_eq!(side, "sell");
     let cursor = projector.cursor("orders").await.unwrap();
@@ -215,7 +244,9 @@ async fn order_update_terminal_releases_reservation() {
     .bind(order_id)
     .bind(hl_cloid(3))
     .bind(ACCOUNT)
-    .execute(&pool).await.unwrap();
+    .execute(&pool)
+    .await
+    .unwrap();
     sqlx::query(
         r#"
         INSERT INTO risk_reservations (reservation_id, command_id, order_id, symbol, side,
@@ -226,7 +257,9 @@ async fn order_update_terminal_releases_reservation() {
     .bind(Uuid::new_v4())
     .bind(Uuid::new_v4())
     .bind(order_id)
-    .execute(&pool).await.unwrap();
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let update = json!({
         "order": {"oid": "555", "coin": "BTC", "side": "B", "sz": "1.0", "status": "cancelled"},
@@ -235,9 +268,16 @@ async fn order_update_terminal_releases_reservation() {
     });
     projector.ingest_order_update(&update).await.unwrap();
 
-    let (status,): (String,) = sqlx::query_as("SELECT status FROM risk_reservations WHERE order_id = $1")
-        .bind(order_id).fetch_one(&pool).await.unwrap();
-    assert_eq!(status, "released", "terminal order update must release the reservation");
+    let (status,): (String,) =
+        sqlx::query_as("SELECT status FROM risk_reservations WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        status, "released",
+        "terminal order update must release the reservation"
+    );
 }
 
 #[tokio::test]
@@ -260,7 +300,9 @@ async fn filled_order_does_not_regress_on_late_cancelled_update() {
     .bind(order_id)
     .bind(hl_cloid(7))
     .bind(ACCOUNT)
-    .execute(&pool).await.unwrap();
+    .execute(&pool)
+    .await
+    .unwrap();
 
     // The fill arrives first.
     projector
@@ -309,8 +351,11 @@ async fn ingest_funding_records_payment() {
     assert!(result.processed);
     assert_eq!(result.funding_amount.unwrap().to_string(), "-1.2345");
 
-    let (amount,): (bigdecimal::BigDecimal,) = sqlx::query_as("SELECT amount FROM funding_payments LIMIT 1")
-        .fetch_one(&pool).await.unwrap();
+    let (amount,): (bigdecimal::BigDecimal,) =
+        sqlx::query_as("SELECT amount FROM funding_payments LIMIT 1")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(amount.to_string(), "-1.2345");
     let cursor = projector.cursor("funding").await.unwrap();
     assert_eq!(cursor, 1_700_000_002_000);

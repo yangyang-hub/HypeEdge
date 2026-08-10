@@ -443,7 +443,9 @@ impl FundingArbRuntimeHandle {
     // --- Two-leg execution (design doc §7.2; mirrors `_execute_leg` … `_close_cycle`) ---
 
     fn require_deps(&self) -> Result<Arc<FundingArbRuntimeDependencies>, String> {
-        self.deps.clone().ok_or_else(|| "funding-arb live dependencies are unavailable".into())
+        self.deps
+            .clone()
+            .ok_or_else(|| "funding-arb live dependencies are unavailable".into())
     }
 
     /// Submit one MARKET/IOC leg and wait for its authoritative outcome.
@@ -484,7 +486,10 @@ impl FundingArbRuntimeHandle {
         let deps = self.require_deps()?;
         let deadline = Instant::now() + Duration::from_secs(timeout_seconds as u64);
         let poll = deps.deployment.order_status_poll_interval_seconds.max(0.01);
-        let settle_seconds = (poll * 2.0).clamp(0.0, 1.0).max((timeout_seconds as f64) / 4.0).min(1.0);
+        let settle_seconds = (poll * 2.0)
+            .clamp(0.0, 1.0)
+            .max((timeout_seconds as f64) / 4.0)
+            .min(1.0);
         let mut terminal_since: Option<(Instant, Decimal)> = None;
         let mut last: Option<Order> = None;
         while Instant::now() < deadline {
@@ -539,7 +544,10 @@ impl FundingArbRuntimeHandle {
             }
             tokio::time::sleep(Duration::from_secs_f64(poll)).await;
         }
-        let filled = last.as_ref().map(|o| o.filled_size.inner()).unwrap_or(Decimal::ZERO);
+        let filled = last
+            .as_ref()
+            .map(|o| o.filled_size.inner())
+            .unwrap_or(Decimal::ZERO);
         let status = last.as_ref().map(|o| o.status.as_str().to_string());
         Ok(OrderOutcome {
             cloid: cloid.into(),
@@ -604,7 +612,10 @@ impl FundingArbRuntimeHandle {
             if outcome.unknown {
                 self.fault(
                     &format!("{event_prefix}_unknown"),
-                    &format!("risk-reducing order outcome is unresolved: cloid={}", outcome.cloid),
+                    &format!(
+                        "risk-reducing order outcome is unresolved: cloid={}",
+                        outcome.cloid
+                    ),
                 )
                 .await?;
                 return Ok(filled_total);
@@ -745,7 +756,11 @@ impl FundingArbRuntimeHandle {
 
     /// Align the two legs after entry: refresh authoritative exposure, reduce
     /// the larger leg, and open when the hedge matches.
-    pub async fn align_and_open(&self, spot_size: Decimal, perp_size: Decimal) -> Result<(), String> {
+    pub async fn align_and_open(
+        &self,
+        spot_size: Decimal,
+        perp_size: Decimal,
+    ) -> Result<(), String> {
         if self.cycle.lock().await.is_none() {
             return Ok(());
         }
@@ -757,8 +772,11 @@ impl FundingArbRuntimeHandle {
         )
         .await?;
         if !self.refresh_authoritative_account().await {
-            self.fault("entry_reconciliation_failed", "authoritative reconciliation failed before alignment")
-                .await?;
+            self.fault(
+                "entry_reconciliation_failed",
+                "authoritative reconciliation failed before alignment",
+            )
+            .await?;
             return Ok(());
         }
         // Reduce whichever leg is oversized; the authoritative refresh below
@@ -766,8 +784,11 @@ impl FundingArbRuntimeHandle {
         let (spot, perp) = self.actual_exposure().await;
         self.reduce_larger_leg(spot, perp, "entry").await?;
         if !self.refresh_authoritative_account().await {
-            self.fault("entry_reconciliation_failed", "authoritative reconciliation failed after alignment")
-                .await?;
+            self.fault(
+                "entry_reconciliation_failed",
+                "authoritative reconciliation failed after alignment",
+            )
+            .await?;
             return Ok(());
         }
         let (spot, perp) = self.actual_exposure().await;
@@ -784,8 +805,11 @@ impl FundingArbRuntimeHandle {
             return Ok(());
         }
         if !self.hedge_matches(spot, perp, spot_lot) {
-            self.fault("entry_compensation_incomplete", "two legs could not be aligned")
-                .await?;
+            self.fault(
+                "entry_compensation_incomplete",
+                "two legs could not be aligned",
+            )
+            .await?;
             return Ok(());
         }
         self.transition(
@@ -807,15 +831,19 @@ impl FundingArbRuntimeHandle {
         )
         .await?;
         if !self.refresh_authoritative_account().await {
-            self.fault("compensation_reconciliation_failed", reason).await?;
+            self.fault("compensation_reconciliation_failed", reason)
+                .await?;
             return Ok(());
         }
         let (actual_spot, actual_perp) = self.actual_exposure().await;
         let perp_lot = self.lot_size(false).await;
         let spot_lot = self.lot_size(true).await;
         if actual_perp > perp_lot / Decimal::from_i128(2) {
-            self.fault("unexpected_perp_during_spot_compensation", &format!("perp={actual_perp}"))
-                .await?;
+            self.fault(
+                "unexpected_perp_during_spot_compensation",
+                &format!("perp={actual_perp}"),
+            )
+            .await?;
             return Ok(());
         }
         if actual_spot <= spot_lot / Decimal::from_i128(2) {
@@ -829,12 +857,27 @@ impl FundingArbRuntimeHandle {
             self.release_cycle_binding().await;
             return Ok(());
         }
-        let spot_symbol = self.cycle.lock().await.as_ref().map(|c| c.spot_symbol.clone());
-        let Some(spot_symbol) = spot_symbol else { return Ok(()) };
-        self.execute_reducing(spot_symbol, Side::Sell, actual_spot, true, "spot_compensation", false)
-            .await?;
+        let spot_symbol = self
+            .cycle
+            .lock()
+            .await
+            .as_ref()
+            .map(|c| c.spot_symbol.clone());
+        let Some(spot_symbol) = spot_symbol else {
+            return Ok(());
+        };
+        self.execute_reducing(
+            spot_symbol,
+            Side::Sell,
+            actual_spot,
+            true,
+            "spot_compensation",
+            false,
+        )
+        .await?;
         if !self.refresh_authoritative_account().await {
-            self.fault("compensation_reconciliation_failed", reason).await?;
+            self.fault("compensation_reconciliation_failed", reason)
+                .await?;
             return Ok(());
         }
         let (remaining_spot, remaining_perp) = self.actual_exposure().await;
@@ -876,7 +919,10 @@ impl FundingArbRuntimeHandle {
         // left a naked long behind.
         if self.perp_leg_inverted(&cycle.perp_symbol) {
             return self
-                .fault("inverted_perp_leg", "perp position is long (expected short)")
+                .fault(
+                    "inverted_perp_leg",
+                    "perp position is long (expected short)",
+                )
                 .await;
         }
         self.transition(
@@ -893,7 +939,8 @@ impl FundingArbRuntimeHandle {
                 .await?;
         }
         if !self.refresh_authoritative_account().await {
-            self.fault("perp_exit_reconciliation_failed", reason).await?;
+            self.fault("perp_exit_reconciliation_failed", reason)
+                .await?;
             return Ok(());
         }
         let (spot_size, perp_size) = self.actual_exposure().await;
@@ -956,12 +1003,14 @@ impl FundingArbRuntimeHandle {
         // anomaly — fault rather than let rebalancing act on a phantom short.
         if self.perp_leg_inverted(&cycle.perp_symbol) {
             return self
-                .fault("inverted_perp_leg", "perp position is long (expected short)")
+                .fault(
+                    "inverted_perp_leg",
+                    "perp position is long (expected short)",
+                )
                 .await;
         }
-        let deviation_bps =
-            (spot_size - perp_size * self.params.hedge_ratio).abs() / denominator
-                * Decimal::from_str_lenient("10000").unwrap();
+        let deviation_bps = (spot_size - perp_size * self.params.hedge_ratio).abs() / denominator
+            * Decimal::from_str_lenient("10000").unwrap();
         if deviation_bps <= Decimal::from_i128(self.params.rebalance_threshold_bps as i128) {
             return Ok(());
         }
@@ -972,17 +1021,24 @@ impl FundingArbRuntimeHandle {
             serde_json::json!({ "spot_open_size": spot_size, "perp_open_size": perp_size }),
         )
         .await?;
-        self.reduce_larger_leg(spot_size, perp_size, "rebalance").await?;
+        self.reduce_larger_leg(spot_size, perp_size, "rebalance")
+            .await?;
         if !self.refresh_authoritative_account().await {
-            self.fault("rebalance_reconciliation_failed", "authoritative reconciliation failed after rebalance")
-                .await?;
+            self.fault(
+                "rebalance_reconciliation_failed",
+                "authoritative reconciliation failed after rebalance",
+            )
+            .await?;
             return Ok(());
         }
         let (spot_size, perp_size) = self.actual_exposure().await;
         let spot_lot = self.lot_size(true).await;
         if !self.hedge_matches(spot_size, perp_size, spot_lot) {
-            self.fault("rebalance_incomplete", &format!("spot={spot_size} perp={perp_size}"))
-                .await?;
+            self.fault(
+                "rebalance_incomplete",
+                &format!("spot={spot_size} perp={perp_size}"),
+            )
+            .await?;
             return Ok(());
         }
         self.transition(
@@ -1009,10 +1065,22 @@ impl FundingArbRuntimeHandle {
         if spot_size > target_spot {
             let excess = Self::floor(spot_size - target_spot, spot_lot);
             if excess > Decimal::ZERO {
-                let spot_symbol = self.cycle.lock().await.as_ref().map(|c| c.spot_symbol.clone());
+                let spot_symbol = self
+                    .cycle
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|c| c.spot_symbol.clone());
                 if let Some(sym) = spot_symbol {
                     let filled = self
-                        .execute_reducing(sym, Side::Sell, excess, true, &format!("{event_prefix}_spot_reduce"), false)
+                        .execute_reducing(
+                            sym,
+                            Side::Sell,
+                            excess,
+                            true,
+                            &format!("{event_prefix}_spot_reduce"),
+                            false,
+                        )
                         .await?;
                     spot_size = (spot_size - filled).max(Decimal::ZERO);
                 }
@@ -1021,10 +1089,22 @@ impl FundingArbRuntimeHandle {
             let target_perp = Self::floor(spot_size / self.params.hedge_ratio, perp_lot);
             let excess = Self::floor(perp_size - target_perp, perp_lot);
             if excess > Decimal::ZERO {
-                let perp_symbol = self.cycle.lock().await.as_ref().map(|c| c.perp_symbol.clone());
+                let perp_symbol = self
+                    .cycle
+                    .lock()
+                    .await
+                    .as_ref()
+                    .map(|c| c.perp_symbol.clone());
                 if let Some(sym) = perp_symbol {
                     let filled = self
-                        .execute_reducing(sym, Side::Buy, excess, false, &format!("{event_prefix}_perp_reduce"), true)
+                        .execute_reducing(
+                            sym,
+                            Side::Buy,
+                            excess,
+                            false,
+                            &format!("{event_prefix}_perp_reduce"),
+                            true,
+                        )
                         .await?;
                     perp_size = (perp_size - filled).max(Decimal::ZERO);
                 }
@@ -1131,7 +1211,11 @@ impl FundingArbRuntimeHandle {
             )
             .await?;
         *self.cycle.lock().await = Some(updated);
-        tracing::error!(error_code = code, error_message = message, "funding_arb_cycle_faulted");
+        tracing::error!(
+            error_code = code,
+            error_message = message,
+            "funding_arb_cycle_faulted"
+        );
         Ok(())
     }
 
@@ -1143,8 +1227,11 @@ impl FundingArbRuntimeHandle {
             self.reduce_larger_leg(spot_size, perp_size, "unknown_compensation")
                 .await?;
         }
-        self.fault(code, &format!("unresolved order outcome; spot={spot_size} perp={perp_size}"))
-            .await
+        self.fault(
+            code,
+            &format!("unresolved order outcome; spot={spot_size} perp={perp_size}"),
+        )
+        .await
     }
 
     async fn release_cycle_binding(&self) {
@@ -1930,8 +2017,14 @@ mod tests {
             },
             account_address: "0xabc".into(),
         });
-        FundingArbRuntimeHandle::new("fa_1".into(), FundingArbParams::default(), 1, "0xabc".into(), Some(deps))
-            .unwrap()
+        FundingArbRuntimeHandle::new(
+            "fa_1".into(),
+            FundingArbParams::default(),
+            1,
+            "0xabc".into(),
+            Some(deps),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -1945,10 +2038,18 @@ mod tests {
         // SPOT leg buy → spot total 1.0; PERP leg sell → short 1.0.
         assert_eq!(st.spot_total.to_string(), "1");
         assert_eq!(st.perp_position.to_string(), "-1");
-        assert!(st.leverage_updated, "leverage must be set before the perp leg");
+        assert!(
+            st.leverage_updated,
+            "leverage must be set before the perp leg"
+        );
         // Cycle ends OPEN.
         let last = st.cycle_states.last().cloned().unwrap();
-        assert_eq!(last.0, FundingArbCycleState::Open, "states: {:?}", st.cycle_states);
+        assert_eq!(
+            last.0,
+            FundingArbCycleState::Open,
+            "states: {:?}",
+            st.cycle_states
+        );
         let cycle = st.current_cycle.as_ref().unwrap();
         assert_eq!(cycle.spot_open_size.to_string(), "1");
         assert_eq!(cycle.perp_open_size.to_string(), "1");
@@ -1963,7 +2064,12 @@ mod tests {
 
         let st = env.state.lock().unwrap();
         let last = st.cycle_states.last().cloned().unwrap();
-        assert_eq!(last.0, FundingArbCycleState::Closed, "states: {:?}", st.cycle_states);
+        assert_eq!(
+            last.0,
+            FundingArbCycleState::Closed,
+            "states: {:?}",
+            st.cycle_states
+        );
         // Both legs flattened: spot back to baseline 0, perp position 0.
         assert_eq!(st.spot_total.to_string(), "0");
         assert_eq!(st.perp_position.to_string(), "0");
@@ -1996,10 +2102,7 @@ mod tests {
         assert_eq!(outcome.status.as_deref(), Some("filled"));
 
         // Unknown order: no durable record → times out as unknown.
-        let outcome = handle
-            .wait_authoritative_order("c_ghost", 1)
-            .await
-            .unwrap();
+        let outcome = handle.wait_authoritative_order("c_ghost", 1).await.unwrap();
         assert!(outcome.unknown);
         assert_eq!(outcome.filled_size.to_string(), "0");
     }
@@ -2025,7 +2128,10 @@ mod tests {
         order.cloid = "c_partial".into();
         env.state.lock().unwrap().orders.push(order);
 
-        let outcome = handle.wait_authoritative_order("c_partial", 2).await.unwrap();
+        let outcome = handle
+            .wait_authoritative_order("c_partial", 2)
+            .await
+            .unwrap();
         assert!(!outcome.unknown, "IOC partial fill must be settled (A18)");
         assert_eq!(outcome.filled_size.to_string(), "1");
     }
@@ -2091,7 +2197,9 @@ mod tests {
         adapter2.start().await.unwrap();
         let states = env2.state.lock().unwrap().cycle_states.clone();
         assert!(
-            states.iter().any(|(s, _)| *s == FundingArbCycleState::Faulted),
+            states
+                .iter()
+                .any(|(s, _)| *s == FundingArbCycleState::Faulted),
             "an unresumable cycle state must be faulted on recovery (A19): {states:?}"
         );
     }
@@ -2105,7 +2213,10 @@ mod tests {
         handle.open_cycle(&ScriptedEnv::plan()).await.unwrap();
 
         let ops = env.state.lock().unwrap().ops.clone();
-        let leverage_at = ops.iter().position(|o| o == "leverage").expect("leverage op");
+        let leverage_at = ops
+            .iter()
+            .position(|o| o == "leverage")
+            .expect("leverage op");
         let spot_at = ops.iter().position(|o| o == "spot_leg").expect("spot op");
         assert!(
             leverage_at < spot_at,
@@ -2125,11 +2236,17 @@ mod tests {
         env.state.lock().unwrap().spot_total = Decimal::from_str_strict("1").unwrap();
         let handle = scripted_runtime(&env);
         // Bind the Open cycle into the handle (the env's get_active returns it).
-        handle.cycle.lock().await.replace(cycle_in_state(FundingArbCycleState::Open));
+        handle
+            .cycle
+            .lock()
+            .await
+            .replace(cycle_in_state(FundingArbCycleState::Open));
         handle.close_cycle("test").await.unwrap();
         let states = env.state.lock().unwrap().cycle_states.clone();
         assert!(
-            states.iter().any(|(s, _)| *s == FundingArbCycleState::Faulted),
+            states
+                .iter()
+                .any(|(s, _)| *s == FundingArbCycleState::Faulted),
             "inverted perp leg must fault the cycle (A21): {states:?}"
         );
     }

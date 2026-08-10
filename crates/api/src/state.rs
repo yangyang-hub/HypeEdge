@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use hypeedge_config::settings::AppSettings;
+use hypeedge_domain::traits::ExecutionClient;
 use hypeedge_infra::event_bus::EventBus;
 use hypeedge_trading::market_data::BookManager;
 use hypeedge_trading::risk::KillSwitch;
@@ -13,7 +14,6 @@ use hypeedge_trading::strategy::{
     InMemoryStrategyAllocationManager, InMemoryStrategyStateStore, StrategyRegistry,
     StrategySupervisor,
 };
-use hypeedge_domain::traits::ExecutionClient;
 
 use crate::auth::RoleTokens;
 use crate::sse_broker::SseBroker;

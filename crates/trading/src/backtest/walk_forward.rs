@@ -180,8 +180,13 @@ pub fn run_monte_carlo(
     sim_drawdowns.sort_by(|a, b| a.partial_cmp(b).unwrap());
 
     let lower_idx = ((alpha * n_simulations as f64) as usize).max(0);
-    let upper_idx = (((1.0 - alpha) * n_simulations as f64) as usize).min(n_simulations.saturating_sub(1));
-    let p_value = sim_returns.iter().filter(|r| **r >= observed_total_return).count() as f64 / n_simulations as f64;
+    let upper_idx =
+        (((1.0 - alpha) * n_simulations as f64) as usize).min(n_simulations.saturating_sub(1));
+    let p_value = sim_returns
+        .iter()
+        .filter(|r| **r >= observed_total_return)
+        .count() as f64
+        / n_simulations as f64;
 
     MonteCarloResult {
         n_simulations,
@@ -316,7 +321,9 @@ mod tests {
 
     #[test]
     fn monte_carlo_runs_deterministically() {
-        let curve: Vec<(i64, f64)> = (0..50).map(|i| (i, 100.0 * (1.0 + i as f64 * 0.002))).collect();
+        let curve: Vec<(i64, f64)> = (0..50)
+            .map(|i| (i, 100.0 * (1.0 + i as f64 * 0.002)))
+            .collect();
         let r1 = run_monte_carlo(&curve, 200, 0.95, 42);
         let r2 = run_monte_carlo(&curve, 200, 0.95, 42);
         assert_eq!(r1.return_ci_lower, r2.return_ci_lower);

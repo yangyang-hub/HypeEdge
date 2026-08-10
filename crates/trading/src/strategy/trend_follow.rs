@@ -236,7 +236,12 @@ impl TrendFollowStrategy {
             self.params.slow_ema_period,
             self.params.signal_ema_period,
         );
-        let atr_values = atr(&self.highs, &self.lows, &self.closes, self.params.atr_period);
+        let atr_values = atr(
+            &self.highs,
+            &self.lows,
+            &self.closes,
+            self.params.atr_period,
+        );
         let mom_values = momentum(&self.closes, self.params.momentum_period);
 
         let macd_val = macd_line.last().copied().unwrap_or(f64::NAN);
@@ -515,21 +520,27 @@ mod tests {
         // A7 regression: a paused strategy holding an open position must still
         // run its stop-loss.
         let exec = Arc::new(MockExecution::new());
-        let mut strategy = TrendFollowStrategy::new(
-            "tf_1".into(),
-            TrendParams::default(),
-            exec.clone(),
-            None,
-        );
+        let mut strategy =
+            TrendFollowStrategy::new("tf_1".into(), TrendParams::default(), exec.clone(), None);
         strategy.status = StrategyStatus::Paused;
         strategy.position_size = 1.0;
         strategy.stop_price = Some(50000.0);
 
-        strategy.on_event(&wrap(DomainEvent::CandleUpdate(candle("49000")))).await.unwrap();
+        strategy
+            .on_event(&wrap(DomainEvent::CandleUpdate(candle("49000"))))
+            .await
+            .unwrap();
 
         let submitted = exec.submitted.lock().unwrap();
-        assert!(!submitted.is_empty(), "stop-loss must fire while paused (A7)");
-        assert_eq!(submitted[0].side, Side::Sell, "long stop closes with a sell");
+        assert!(
+            !submitted.is_empty(),
+            "stop-loss must fire while paused (A7)"
+        );
+        assert_eq!(
+            submitted[0].side,
+            Side::Sell,
+            "long stop closes with a sell"
+        );
     }
 
     #[tokio::test]
@@ -537,18 +548,17 @@ mod tests {
         // A6 regression: a flip queues a reversal after the close order; only a
         // *filled* close keeps it active, a rejected/cancelled close cancels it.
         let exec = Arc::new(MockExecution::new());
-        let mut strategy = TrendFollowStrategy::new(
-            "tf_1".into(),
-            TrendParams::default(),
-            exec.clone(),
-            None,
-        );
+        let mut strategy =
+            TrendFollowStrategy::new("tf_1".into(), TrendParams::default(), exec.clone(), None);
 
         strategy.working_order_cloid = Some("close_c1".into());
         strategy.working_order_is_close = true;
         strategy.pending_reverse = Some(Side::Buy);
         strategy
-            .on_event(&wrap(DomainEvent::OrderFilled(order_for("close_c1", Side::Sell))))
+            .on_event(&wrap(DomainEvent::OrderFilled(order_for(
+                "close_c1",
+                Side::Sell,
+            ))))
             .await
             .unwrap();
         assert_eq!(
@@ -562,12 +572,14 @@ mod tests {
         strategy.working_order_is_close = true;
         strategy.pending_reverse = Some(Side::Sell);
         strategy
-            .on_event(&wrap(DomainEvent::OrderRejected(order_for("close_c2", Side::Buy))))
+            .on_event(&wrap(DomainEvent::OrderRejected(order_for(
+                "close_c2",
+                Side::Buy,
+            ))))
             .await
             .unwrap();
         assert_eq!(
-            strategy.pending_reverse,
-            None,
+            strategy.pending_reverse, None,
             "a rejected close cancels the queued reversal (A6)"
         );
     }
@@ -577,12 +589,8 @@ mod tests {
         // A6 regression: once the close fill is reflected (position flat), the
         // queued reversal position actually opens.
         let exec = Arc::new(MockExecution::new());
-        let mut strategy = TrendFollowStrategy::new(
-            "tf_1".into(),
-            TrendParams::default(),
-            exec.clone(),
-            None,
-        );
+        let mut strategy =
+            TrendFollowStrategy::new("tf_1".into(), TrendParams::default(), exec.clone(), None);
         // Warm up indicators with a mildly-varying series so ATR > 0.
         strategy.candle_count = 80;
         for i in 0..80 {

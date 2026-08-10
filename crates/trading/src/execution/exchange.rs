@@ -142,7 +142,14 @@ impl ExchangeClient for HyperliquidExchangeClient {
             grouping: "na",
         };
         let bytes = pack_action(&action)?;
-        let sig = sign_l1_action(&self.private_key, &bytes, None, nonce, None, self.is_mainnet)?;
+        let sig = sign_l1_action(
+            &self.private_key,
+            &bytes,
+            None,
+            nonce,
+            None,
+            self.is_mainnet,
+        )?;
         let body = Self::exchange_body(&action, &sig, nonce, None, None)?;
         self.post_exchange(body).await
     }
@@ -153,7 +160,14 @@ impl ExchangeClient for HyperliquidExchangeClient {
             cancels,
         };
         let bytes = pack_action(&action)?;
-        let sig = sign_l1_action(&self.private_key, &bytes, None, nonce, None, self.is_mainnet)?;
+        let sig = sign_l1_action(
+            &self.private_key,
+            &bytes,
+            None,
+            nonce,
+            None,
+            self.is_mainnet,
+        )?;
         let body = Self::exchange_body(&action, &sig, nonce, None, None)?;
         self.post_exchange(body).await
     }
@@ -168,7 +182,14 @@ impl ExchangeClient for HyperliquidExchangeClient {
             cancels,
         };
         let bytes = pack_action(&action)?;
-        let sig = sign_l1_action(&self.private_key, &bytes, None, nonce, None, self.is_mainnet)?;
+        let sig = sign_l1_action(
+            &self.private_key,
+            &bytes,
+            None,
+            nonce,
+            None,
+            self.is_mainnet,
+        )?;
         let body = Self::exchange_body(&action, &sig, nonce, None, None)?;
         self.post_exchange(body).await
     }
@@ -187,7 +208,14 @@ impl ExchangeClient for HyperliquidExchangeClient {
             leverage,
         };
         let bytes = pack_action(&action)?;
-        let sig = sign_l1_action(&self.private_key, &bytes, None, nonce, None, self.is_mainnet)?;
+        let sig = sign_l1_action(
+            &self.private_key,
+            &bytes,
+            None,
+            nonce,
+            None,
+            self.is_mainnet,
+        )?;
         let body = Self::exchange_body(&action, &sig, nonce, None, None)?;
         self.post_exchange(body).await
     }

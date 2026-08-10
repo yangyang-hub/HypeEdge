@@ -126,7 +126,8 @@ mod tests {
         let a = CloidGenerator::deterministic(Some("tf_1"), key);
         let b = CloidGenerator::deterministic(Some("tf_1"), key);
         assert_eq!(a, b, "same intent key -> same cloid (idempotent replay)");
-        let c = CloidGenerator::deterministic(Some("tf_1"), "ETH|buy|1|100|limit|Gtc|false|false|50");
+        let c =
+            CloidGenerator::deterministic(Some("tf_1"), "ETH|buy|1|100|limit|Gtc|false|false|50");
         assert_ne!(a, c, "different intent -> different cloid");
         assert!(CloidGenerator::validate(&a));
         assert!(a.len() <= 64);

@@ -173,7 +173,11 @@ impl LiveMarketDataProvider {
                 let series = candles
                     .entry((candle.symbol.clone(), candle.interval.clone()))
                     .or_default();
-                LiveMarketDataProvider::upsert_candle(series, candle.clone(), self.max_candles_per_series);
+                LiveMarketDataProvider::upsert_candle(
+                    series,
+                    candle.clone(),
+                    self.max_candles_per_series,
+                );
             }
             _ => {}
         }
@@ -187,10 +191,15 @@ impl LiveMarketDataProvider {
             *last = candle;
             return;
         }
-        if series.is_empty() || series.last().is_some_and(|c| candle.timestamp > c.timestamp) {
+        if series.is_empty()
+            || series
+                .last()
+                .is_some_and(|c| candle.timestamp > c.timestamp)
+        {
             series.push(candle);
         } else {
-            let mut by_ts: HashMap<i64, Candle> = series.iter().map(|c| (c.timestamp, c.clone())).collect();
+            let mut by_ts: HashMap<i64, Candle> =
+                series.iter().map(|c| (c.timestamp, c.clone())).collect();
             by_ts.insert(candle.timestamp, candle);
             let mut merged: Vec<Candle> = by_ts.into_values().collect();
             merged.sort_by_key(|c| c.timestamp);
@@ -253,7 +262,9 @@ impl LiveMarketDataProvider {
     pub async fn get_candles(&self, symbol: &str, interval: &str, limit: usize) -> Vec<Candle> {
         let candles = self.candles.lock().await;
         let series = candles.get(&(symbol.to_string(), interval.to_string()));
-        let Some(series) = series else { return Vec::new() };
+        let Some(series) = series else {
+            return Vec::new();
+        };
         let start = series.len().saturating_sub(limit);
         series[start..].to_vec()
     }
@@ -282,9 +293,7 @@ impl LiveMarketDataProvider {
         for candle in history {
             LiveMarketDataProvider::upsert_candle(series, candle, self.max_candles_per_series);
         }
-        Ok(self
-            .get_candles(symbol, interval, limit)
-            .await)
+        Ok(self.get_candles(symbol, interval, limit).await)
     }
 
     pub async fn backfill_candles(
@@ -313,15 +322,14 @@ impl LiveMarketDataProvider {
 
 #[async_trait]
 impl MarketDataProvider for LiveMarketDataProvider {
-    async fn get_price_snapshot(
-        &self,
-        symbol: &str,
-    ) -> Result<Option<MidPrice>, HypeEdgeError> {
+    async fn get_price_snapshot(&self, symbol: &str) -> Result<Option<MidPrice>, HypeEdgeError> {
         let snapshot = self.get_price_snapshot_full(symbol).await;
         Ok(snapshot.map(|s| MidPrice {
             symbol: symbol.to_string(),
             price: Decimal::from_f64(s.price).unwrap_or_default(),
-            timestamp: s.exchange_ts.unwrap_or_else(|| Utc::now().timestamp_millis()),
+            timestamp: s
+                .exchange_ts
+                .unwrap_or_else(|| Utc::now().timestamp_millis()),
         }))
     }
 
@@ -331,8 +339,12 @@ impl MarketDataProvider for LiveMarketDataProvider {
     ) -> Result<Option<(Decimal, Decimal)>, HypeEdgeError> {
         let book = self.get_book(symbol).await;
         let Some(book) = book else { return Ok(None) };
-        let Some(bid) = book.bids.first() else { return Ok(None) };
-        let Some(ask) = book.asks.first() else { return Ok(None) };
+        let Some(bid) = book.bids.first() else {
+            return Ok(None);
+        };
+        let Some(ask) = book.asks.first() else {
+            return Ok(None);
+        };
         Ok(Some((bid.price.inner(), ask.price.inner())))
     }
 }
@@ -516,7 +528,11 @@ mod tests {
         p.handle_event(&Event::new(DomainEvent::L2BookUpdate(snapshot)))
             .await;
 
-        let shared = books.lock().await.get_snapshot("BTC").expect("book populated");
+        let shared = books
+            .lock()
+            .await
+            .get_snapshot("BTC")
+            .expect("book populated");
         assert_eq!(shared.bids.len(), 1);
         assert_eq!(shared.bids[0].price.to_string(), "99");
         assert_eq!(shared.asks[0].price.to_string(), "101");

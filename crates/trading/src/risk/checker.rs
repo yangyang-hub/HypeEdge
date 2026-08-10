@@ -51,7 +51,11 @@ impl RiskChecker {
     }
 
     /// Run the risk check with a fail-safe timeout: timeout or error = reject.
-    pub async fn check(&self, intent: &OrderIntent, reference_price: Option<Decimal>) -> RiskCheckResult {
+    pub async fn check(
+        &self,
+        intent: &OrderIntent,
+        reference_price: Option<Decimal>,
+    ) -> RiskCheckResult {
         self.check_count.fetch_add(1, AtomicOrdering::Relaxed);
         let timeout_ms = self.limits.timeout_ms.max(1);
         match timeout(

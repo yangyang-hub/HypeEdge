@@ -43,7 +43,10 @@ impl KillSwitch {
     /// orders on the exchange, not just blocks new placements (A14).
     pub fn with_cancel_all(
         mut self,
-        cancel_all: impl Fn() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>> + Send + Sync + 'static,
+        cancel_all: impl Fn() -> Pin<Box<dyn Future<Output = ()> + Send + 'static>>
+        + Send
+        + Sync
+        + 'static,
     ) -> Self {
         self.cancel_all = Some(Arc::new(cancel_all));
         self
@@ -75,7 +78,9 @@ impl KillSwitch {
             drop(active);
             drop(reason_guard);
             if let Some(store) = &self.state_store
-                && let Err(e) = store.transition("halted", Some(reason), true, "kill_switch").await
+                && let Err(e) = store
+                    .transition("halted", Some(reason), true, "kill_switch")
+                    .await
             {
                 tracing::error!(error = %e, "kill_switch_durable_persist_failed");
             }

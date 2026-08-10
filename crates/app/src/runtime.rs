@@ -13,9 +13,7 @@ use hypeedge_domain::enums::SafetyMode;
 use hypeedge_domain::models::RiskLimits;
 use hypeedge_domain::traits::{DurableOrderStore, ExecutionClient, SystemStateStore};
 use hypeedge_infra::event_bus::EventBus;
-use hypeedge_storage::adapters::{
-    PooledDurableOrderStore, PooledExecutionCommandQueue,
-};
+use hypeedge_storage::adapters::{PooledDurableOrderStore, PooledExecutionCommandQueue};
 use hypeedge_storage::exchange_ingestor_store::PostgresExchangeFactProjector;
 use hypeedge_storage::system_state_store::PooledSystemStateStore;
 use hypeedge_trading::account::{
@@ -23,8 +21,8 @@ use hypeedge_trading::account::{
     LayeredAccountHealthProvider, RestAccountStateSource,
 };
 use hypeedge_trading::execution::{
-    ExecutionEngine, ExecutionEngineConfig, HyperliquidExchangeClient, NonceQueue,
-    OrderNormalizer, SignedActionExecutor,
+    ExecutionEngine, ExecutionEngineConfig, HyperliquidExchangeClient, NonceQueue, OrderNormalizer,
+    SignedActionExecutor,
 };
 use hypeedge_trading::market_data::{
     BookManager, InstrumentMetaCache, LiveMarketDataProvider, RateLimiter, RestClient,
@@ -61,8 +59,12 @@ pub async fn build_runtime(
     ));
     let api_url = settings.exchange.api_url.trim_end_matches('/').to_string();
     let rest = Arc::new(
-        RestClient::new(&api_url, rate_limiter.clone(), settings.market_data.backfill_batch_size)
-            .map_err(|e| format!("rest client: {e}"))?,
+        RestClient::new(
+            &api_url,
+            rate_limiter.clone(),
+            settings.market_data.backfill_batch_size,
+        )
+        .map_err(|e| format!("rest client: {e}"))?,
     );
     let meta_cache = Arc::new(InstrumentMetaCache::new(
         rest.clone(),
@@ -152,15 +154,19 @@ pub async fn build_runtime(
 
     // ---------- Account chain (6d) ----------
     let health = Arc::new(LayeredAccountHealthProvider::default());
-    let state_source = Arc::new(
-        RestAccountStateSource::new(rest.clone(), &account, account_tracker.clone())?,
-    );
+    let state_source = Arc::new(RestAccountStateSource::new(
+        rest.clone(),
+        &account,
+        account_tracker.clone(),
+    )?);
     let poller = AccountStatePoller::new(
         state_source,
         account_tracker.clone(),
         health.clone(),
         settings.market_making.account_poll_interval_seconds,
-        settings.market_making.near_risk_account_poll_interval_seconds,
+        settings
+            .market_making
+            .near_risk_account_poll_interval_seconds,
         None,
         None,
     )?;
@@ -174,50 +180,53 @@ pub async fn build_runtime(
     }
 
     // Ingestor + reconciler require Postgres (durable projector).
-    let (_pg, config_versions, sse_outbox, sse_pool, durable_order_store) =
-        match &settings.postgres {
-            _ if settings.postgres.url.trim().is_empty() => (None, None, None, None, None),
-            _ => {
-                let storage = hypeedge_storage::Postgres::connect(
-                    &settings.postgres.url,
-                    settings.postgres.pool_size,
-                )
-                .await
-                .map_err(|e| format!("postgres connect: {e}"))?;
-                let pool = storage.pool.clone();
-                let projector = Arc::new(PostgresExchangeFactProjector::new(
-                    pool.clone(),
-                    &account,
-                ));
-                let info: Arc<dyn InfoClient> = rest.clone();
-                let mut ingestor = ExchangeEventIngestor::new(
-                    &account,
-                    projector.clone(),
-                    info,
-                    Some(account_tracker.clone()),
-                    settings.market_making.account_poll_interval_seconds,
-                );
-                if let Err(e) = ingestor.recover_history().await {
-                    tracing::warn!(error = %e, "ingestor_history_recovery_failed");
-                }
-                tokio::spawn(async move {
-                    ingestor.run_until_closed().await;
-                });
-                let cfg_versions = Arc::new(
-                    hypeedge_storage::PostgresConfigVersionStore::new(pool.clone()),
-                ) as Arc<dyn hypeedge_storage::ConfigVersionStore>;
-                let outbox = Arc::new(hypeedge_storage::outbox::PostgresOutboxStore::new(
-                    settings.postgres.command_lease_seconds as i64,
-                ));
-                let order_store = Arc::new(PooledDurableOrderStore::new(
-                    pool.clone(),
-                    None,
-                    30.0,
-                    settings.postgres.risk_reservation_ttl_seconds as i64,
-                )) as Arc<dyn DurableOrderStore>;
-                (Some(storage), Some(cfg_versions), Some(outbox), Some(pool), Some(order_store))
+    let (_pg, config_versions, sse_outbox, sse_pool, durable_order_store) = match &settings.postgres
+    {
+        _ if settings.postgres.url.trim().is_empty() => (None, None, None, None, None),
+        _ => {
+            let storage = hypeedge_storage::Postgres::connect(
+                &settings.postgres.url,
+                settings.postgres.pool_size,
+            )
+            .await
+            .map_err(|e| format!("postgres connect: {e}"))?;
+            let pool = storage.pool.clone();
+            let projector = Arc::new(PostgresExchangeFactProjector::new(pool.clone(), &account));
+            let info: Arc<dyn InfoClient> = rest.clone();
+            let mut ingestor = ExchangeEventIngestor::new(
+                &account,
+                projector.clone(),
+                info,
+                Some(account_tracker.clone()),
+                settings.market_making.account_poll_interval_seconds,
+            );
+            if let Err(e) = ingestor.recover_history().await {
+                tracing::warn!(error = %e, "ingestor_history_recovery_failed");
             }
-        };
+            tokio::spawn(async move {
+                ingestor.run_until_closed().await;
+            });
+            let cfg_versions = Arc::new(hypeedge_storage::PostgresConfigVersionStore::new(
+                pool.clone(),
+            )) as Arc<dyn hypeedge_storage::ConfigVersionStore>;
+            let outbox = Arc::new(hypeedge_storage::outbox::PostgresOutboxStore::new(
+                settings.postgres.command_lease_seconds as i64,
+            ));
+            let order_store = Arc::new(PooledDurableOrderStore::new(
+                pool.clone(),
+                None,
+                30.0,
+                settings.postgres.risk_reservation_ttl_seconds as i64,
+            )) as Arc<dyn DurableOrderStore>;
+            (
+                Some(storage),
+                Some(cfg_versions),
+                Some(outbox),
+                Some(pool),
+                Some(order_store),
+            )
+        }
+    };
 
     // ---------- Risk (6e) ----------
     let risk_limits = RiskLimits {
@@ -226,7 +235,8 @@ pub async fn build_runtime(
         max_drawdown_pct: settings.risk.max_drawdown_pct,
         max_leverage: settings.risk.max_leverage,
         timeout_ms: settings.risk.risk_check_timeout_ms as u64,
-        account_stale_seconds: (settings.market_making.account_poll_interval_seconds * 2.0).max(5.0),
+        account_stale_seconds: (settings.market_making.account_poll_interval_seconds * 2.0)
+            .max(5.0),
     };
     let risk_checker = Arc::new(RiskChecker::new(account_tracker.clone(), risk_limits));
     let safety = Arc::new(tokio::sync::Mutex::new(SafetyController::new(
@@ -254,9 +264,8 @@ pub async fn build_runtime(
         });
     }
     if let Some(pool) = &sse_pool {
-        kill_switch = kill_switch.with_state_store(Arc::new(PooledSystemStateStore::new(
-            pool.clone(),
-        )));
+        kill_switch =
+            kill_switch.with_state_store(Arc::new(PooledSystemStateStore::new(pool.clone())));
     }
     // Restore a persisted kill switch latch across restarts (A15).
     if let Some(pool) = &sse_pool {
@@ -282,7 +291,9 @@ pub async fn build_runtime(
         risk_checker: Some(risk_checker.clone()),
         rate_limiter: Some(rate_limiter.clone()),
         durable_store: durable_order_store,
-        market_data_provider: market_data.clone().map(|p| p as Arc<dyn hypeedge_domain::traits::MarketDataProvider>),
+        market_data_provider: market_data
+            .clone()
+            .map(|p| p as Arc<dyn hypeedge_domain::traits::MarketDataProvider>),
         order_normalizer: Some(Arc::new(OrderNormalizer::new(meta_cache.clone()))),
         asset_index_provider: Some(meta_cache.clone()),
         deferred_execution: true,
@@ -367,7 +378,9 @@ pub fn build_control_plane(settings: &AppSettings, event_bus: Arc<EventBus>) -> 
 fn parse_private_key(hex_key: &str) -> Result<[u8; 32], String> {
     let raw = hex_key.strip_prefix("0x").unwrap_or(hex_key);
     let bytes = hex::decode(raw).map_err(|e| format!("private key hex: {e}"))?;
-    bytes.try_into().map_err(|_| "private key must be 32 bytes".into())
+    bytes
+        .try_into()
+        .map_err(|_| "private key must be 32 bytes".into())
 }
 
 /// Map the config action-budget settings onto the trading crate's struct.

@@ -18,8 +18,8 @@ use hypeedge_domain::error::HypeEdgeError;
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::durable_order_store::map_sqlx;
 use crate::decimal_sqlx::bd_to_dec;
+use crate::durable_order_store::map_sqlx;
 use hypeedge_trading::execution::batch::{ChildActionType, GuardDecision};
 use hypeedge_trading::execution::quote_plan_worker::{QuoteDispatchChild, QuotePlanStore};
 
@@ -197,7 +197,7 @@ impl PostgresQuotePlanStore {
             other => {
                 return Err(HypeEdgeError::Storage {
                     message: format!("invalid quote-plan item side: {other}"),
-                })
+                });
             }
         };
         let action = match row.action_type.as_str() {
@@ -207,20 +207,24 @@ impl PostgresQuotePlanStore {
             other => {
                 return Err(HypeEdgeError::Storage {
                     message: format!("invalid quote-plan item action: {other}"),
-                })
+                });
             }
         };
         let price = row
             .desired_price
             .map(bd_to_dec)
             .transpose()
-            .map_err(|e| HypeEdgeError::Storage { message: e.to_string() })?
+            .map_err(|e| HypeEdgeError::Storage {
+                message: e.to_string(),
+            })?
             .map(Price::new);
         let size = row
             .desired_size
             .map(bd_to_dec)
             .transpose()
-            .map_err(|e| HypeEdgeError::Storage { message: e.to_string() })?
+            .map_err(|e| HypeEdgeError::Storage {
+                message: e.to_string(),
+            })?
             .map(Size::new);
 
         Ok(Some(QuoteDispatchChild {
@@ -266,13 +270,12 @@ impl PostgresQuotePlanStore {
     ) -> Result<bool, HypeEdgeError> {
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
 
-        let item_exists: Option<i64> = sqlx::query_scalar(
-            "SELECT id FROM execution_command_items WHERE id = $1 FOR UPDATE",
-        )
-        .bind(child.item_id)
-        .fetch_optional(&mut *tx)
-        .await
-        .map_err(map_sqlx)?;
+        let item_exists: Option<i64> =
+            sqlx::query_scalar("SELECT id FROM execution_command_items WHERE id = $1 FOR UPDATE")
+                .bind(child.item_id)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
         let Some(item_id) = item_exists else {
             tx.commit().await.map_err(map_sqlx)?;
             return Ok(false);
@@ -408,13 +411,12 @@ impl PostgresQuotePlanStore {
                 .map_err(map_sqlx)?,
             None => None,
         };
-        let plan_item_id: Option<i64> = sqlx::query_scalar(
-            "SELECT plan_item_id FROM execution_command_items WHERE id = $1",
-        )
-        .bind(child.item_id)
-        .fetch_optional(&mut **tx)
-        .await
-        .map_err(map_sqlx)?;
+        let plan_item_id: Option<i64> =
+            sqlx::query_scalar("SELECT plan_item_id FROM execution_command_items WHERE id = $1")
+                .bind(child.item_id)
+                .fetch_optional(&mut **tx)
+                .await
+                .map_err(map_sqlx)?;
 
         if let (Some(order_id), Some(plan_item_id)) = (target_order_id, plan_item_id) {
             sqlx::query(
@@ -623,15 +625,16 @@ impl QuotePlanStore for PostgresQuotePlanStore {
         decision: GuardDecision,
         completed_at: DateTime<Utc>,
     ) -> Result<(), HypeEdgeError> {
-        self.finish_without_send_inner(child, decision, completed_at).await
+        self.finish_without_send_inner(child, decision, completed_at)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bigdecimal::BigDecimal;
     use crate::decimal_sqlx::dec_to_bd;
+    use bigdecimal::BigDecimal;
 
     #[test]
     fn row_types_are_from_row() {

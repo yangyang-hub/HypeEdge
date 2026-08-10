@@ -109,11 +109,15 @@ impl RemoteActionSnapshot {
         let cap = payload
             .get("nRequestsCap")
             .and_then(|v| v.as_i64())
-            .ok_or_else(|| "userRateLimit response lacks valid nRequestsCap/nRequestsUsed".to_string())?;
+            .ok_or_else(|| {
+                "userRateLimit response lacks valid nRequestsCap/nRequestsUsed".to_string()
+            })?;
         let used = payload
             .get("nRequestsUsed")
             .and_then(|v| v.as_i64())
-            .ok_or_else(|| "userRateLimit response lacks valid nRequestsCap/nRequestsUsed".to_string())?;
+            .ok_or_else(|| {
+                "userRateLimit response lacks valid nRequestsCap/nRequestsUsed".to_string()
+            })?;
         let normalized = quota_owner_address.to_lowercase();
         if !is_canonical_address(&normalized) {
             return Err("quota_owner_address must be a canonical 20-byte hex address".into());
@@ -160,7 +164,10 @@ impl NetworkAttemptDebit {
         self.child_actions.len() as i64
     }
     pub fn cancel_cost(&self) -> i64 {
-        self.child_actions.iter().filter(|a| **a == BudgetAction::Cancel).count() as i64
+        self.child_actions
+            .iter()
+            .filter(|a| **a == BudgetAction::Cancel)
+            .count() as i64
     }
 }
 
@@ -322,7 +329,8 @@ impl ActionBudgetController {
     }
 
     pub fn release_allocation(&mut self, strategy_id: &str, symbol: &str) {
-        self.allocations.remove(&(strategy_id.to_string(), symbol.to_string()));
+        self.allocations
+            .remove(&(strategy_id.to_string(), symbol.to_string()));
     }
 
     pub fn update_possible_live_orders(&mut self, count: i64) {
@@ -494,15 +502,23 @@ impl ActionBudgetController {
 
         let view = self.snapshot();
         if action == BudgetAction::Close && emergency {
-            let allowed = view.address_remaining >= child_actions && view.ip_weight_remaining >= ip_weight;
+            let allowed =
+                view.address_remaining >= child_actions && view.ip_weight_remaining >= ip_weight;
             return Ok(BudgetPermission {
                 allowed,
                 mode: current_mode,
-                reason: if allowed { "emergency close reserve".into() } else { "quota exhausted".into() },
+                reason: if allowed {
+                    "emergency close reserve".into()
+                } else {
+                    "quota exhausted".into()
+                },
             });
         }
 
-        if matches!(current_mode, ActionBudgetMode::CancelOnly | ActionBudgetMode::Exhausted) {
+        if matches!(
+            current_mode,
+            ActionBudgetMode::CancelOnly | ActionBudgetMode::Exhausted
+        ) {
             return Ok(BudgetPermission {
                 allowed: false,
                 mode: current_mode,
@@ -558,13 +574,21 @@ impl ActionBudgetController {
     }
 
     /// Gate info requests without mixing them into address-action quota.
-    pub fn ip_request_permission(&self, ip_weight: i64, emergency: bool) -> Result<BudgetPermission, String> {
+    pub fn ip_request_permission(
+        &self,
+        ip_weight: i64,
+        emergency: bool,
+    ) -> Result<BudgetPermission, String> {
         if ip_weight <= 0 {
             return Err("ip_weight must be positive".into());
         }
         let current_mode = self.mode();
         let remaining = self.ip_remaining(Utc::now());
-        let required_after = if emergency { 0 } else { self.settings.ip_emergency_reserve as i64 };
+        let required_after = if emergency {
+            0
+        } else {
+            self.settings.ip_emergency_reserve as i64
+        };
         let allowed = remaining >= ip_weight && remaining - ip_weight >= required_after;
         Ok(BudgetPermission {
             allowed,
@@ -583,9 +607,9 @@ impl ActionBudgetController {
 
     pub fn next_remote_poll_interval_seconds(&self) -> f64 {
         match self.mode() {
-            ActionBudgetMode::Critical | ActionBudgetMode::CancelOnly | ActionBudgetMode::Exhausted => {
-                self.settings.remote_poll_interval_critical_seconds
-            }
+            ActionBudgetMode::Critical
+            | ActionBudgetMode::CancelOnly
+            | ActionBudgetMode::Exhausted => self.settings.remote_poll_interval_critical_seconds,
             ActionBudgetMode::Conserve => self.settings.remote_poll_interval_conserve_seconds,
             ActionBudgetMode::Normal => self.settings.remote_poll_interval_normal_seconds,
         }
@@ -596,7 +620,9 @@ impl ActionBudgetController {
         let cancel = &self.cancel_snapshot;
         let address_remaining = self.address_remaining();
         let required_cancel = self.required_cancel_reserve();
-        let placement_available = (address_remaining - required_cancel - self.settings.close_action_reserve as i64).max(0);
+        let placement_available =
+            (address_remaining - required_cancel - self.settings.close_action_reserve as i64)
+                .max(0);
         let now = Utc::now();
         let windows = STAT_WINDOWS_HOURS
             .iter()
@@ -614,7 +640,10 @@ impl ActionBudgetController {
             cancel_headroom_remaining: self.cancel_remaining(),
             ip_weight_remaining: self.ip_remaining(now),
             possible_live_orders: self.possible_live_orders,
-            remote_fresh: remote.as_ref().map(|s| self.is_fresh(s.observed_at, now)).unwrap_or(false),
+            remote_fresh: remote
+                .as_ref()
+                .map(|s| self.is_fresh(s.observed_at, now))
+                .unwrap_or(false),
             cancel_headroom_fresh: cancel
                 .as_ref()
                 .map(|s| self.is_fresh(s.observed_at, now))
@@ -631,7 +660,10 @@ impl ActionBudgetController {
     // --- Internal math (mirrors the Python private helpers) ---
 
     fn calculate_mode(&self, now: DateTime<Utc>) -> ActionBudgetMode {
-        if self.forced_cancel_only || self.remote_snapshot.is_none() || self.cancel_snapshot.is_none() {
+        if self.forced_cancel_only
+            || self.remote_snapshot.is_none()
+            || self.cancel_snapshot.is_none()
+        {
             return ActionBudgetMode::CancelOnly;
         }
         let (Some(remote), Some(cancel)) = (&self.remote_snapshot, &self.cancel_snapshot) else {
@@ -674,7 +706,8 @@ impl ActionBudgetController {
         if stats.burned_actions >= self.settings.minimum_actions_for_economic_gate as i64
             && stats.marginal_usdc_per_action.is_some()
             && stats.marginal_usdc_per_action.unwrap()
-                < Decimal::from_f64(self.settings.minimum_marginal_usdc_per_action).unwrap_or(Decimal::ZERO)
+                < Decimal::from_f64(self.settings.minimum_marginal_usdc_per_action)
+                    .unwrap_or(Decimal::ZERO)
         {
             return ActionBudgetMode::Conserve;
         }
@@ -694,8 +727,11 @@ impl ActionBudgetController {
             .filter(|f| cutoff < f.occurred_at && f.occurred_at <= now)
             .collect();
         let burned: i64 = attempts.iter().map(|a| a.address_cost()).sum();
-        let earned: Decimal = fills.iter().fold(Decimal::ZERO, |acc, f| acc + f.volume_usdc);
-        let net_burn = (Decimal::from_i128(burned as i128) - earned).max(Decimal::ZERO) / Decimal::from_i128(hours as i128);
+        let earned: Decimal = fills
+            .iter()
+            .fold(Decimal::ZERO, |acc, f| acc + f.volume_usdc);
+        let net_burn = (Decimal::from_i128(burned as i128) - earned).max(Decimal::ZERO)
+            / Decimal::from_i128(hours as i128);
         let actions_per_fill = if fills.is_empty() {
             None
         } else {
@@ -709,7 +745,8 @@ impl ActionBudgetController {
         let runway = if net_burn <= Decimal::ZERO {
             f64::INFINITY
         } else {
-            self.placement_remaining_raw() as f64 / net_burn.to_string().parse::<f64>().unwrap_or(1.0)
+            self.placement_remaining_raw() as f64
+                / net_burn.to_string().parse::<f64>().unwrap_or(1.0)
         };
         BudgetWindowStats {
             window_hours: hours,
@@ -763,13 +800,18 @@ impl ActionBudgetController {
     }
 
     fn placement_remaining_raw(&self) -> i64 {
-        (self.address_remaining() - self.required_cancel_reserve() - self.settings.close_action_reserve as i64).max(0)
+        (self.address_remaining()
+            - self.required_cancel_reserve()
+            - self.settings.close_action_reserve as i64)
+            .max(0)
     }
 
     fn allocation_consumed(&self, strategy_id: &str, symbol: &str) -> i64 {
         self.attempts
             .values()
-            .filter(|a| a.strategy_id.as_deref() == Some(strategy_id) && a.symbol.as_deref() == Some(symbol))
+            .filter(|a| {
+                a.strategy_id.as_deref() == Some(strategy_id) && a.symbol.as_deref() == Some(symbol)
+            })
             .map(|a| a.address_cost())
             .sum()
     }
@@ -794,7 +836,11 @@ mod tests {
     }
 
     fn cancel_snapshot(used: i64, cap: i64, at: DateTime<Utc>) -> CancelHeadroomSnapshot {
-        CancelHeadroomSnapshot { cap, used, observed_at: at }
+        CancelHeadroomSnapshot {
+            cap,
+            used,
+            observed_at: at,
+        }
     }
 
     fn controller() -> ActionBudgetController {
@@ -802,7 +848,12 @@ mod tests {
         ActionBudgetController::new(addr, ActionBudgetSettings::default()).unwrap()
     }
 
-    fn debit(id: &str, actions: &[BudgetAction], weight: i64, at: DateTime<Utc>) -> NetworkAttemptDebit {
+    fn debit(
+        id: &str,
+        actions: &[BudgetAction],
+        weight: i64,
+        at: DateTime<Utc>,
+    ) -> NetworkAttemptDebit {
         NetworkAttemptDebit {
             attempt_id: id.into(),
             child_actions: actions.to_vec(),
@@ -820,7 +871,9 @@ mod tests {
         let view = c.snapshot();
         assert_eq!(view.placement_actions_available, 0);
         // Cancel is always permitted.
-        let p = c.permission(&PermissionRequest::new(BudgetAction::Cancel)).unwrap();
+        let p = c
+            .permission(&PermissionRequest::new(BudgetAction::Cancel))
+            .unwrap();
         assert!(p.allowed);
     }
 
@@ -831,7 +884,9 @@ mod tests {
         c.reconcile_remote(snapshot(100, 10_000, now)).unwrap();
         c.reconcile_cancel_headroom(cancel_snapshot(0, 10_000, now));
         assert_eq!(c.mode(), ActionBudgetMode::Normal);
-        let p = c.permission(&PermissionRequest::new(BudgetAction::Place)).unwrap();
+        let p = c
+            .permission(&PermissionRequest::new(BudgetAction::Place))
+            .unwrap();
         assert!(p.allowed, "{}", p.reason);
     }
 
@@ -854,8 +909,13 @@ mod tests {
         c.reconcile_remote(snapshot(0, 10_000, t0)).unwrap();
         c.reconcile_cancel_headroom(cancel_snapshot(0, 1000, t0));
         // One cancel crosses the wire after the snapshot (shadow debit).
-        c.debit_network_attempt(debit("c1", &[BudgetAction::Cancel], 1, t0 + Duration::seconds(1)))
-            .unwrap();
+        c.debit_network_attempt(debit(
+            "c1",
+            &[BudgetAction::Cancel],
+            1,
+            t0 + Duration::seconds(1),
+        ))
+        .unwrap();
         // Reconcile a remote snapshot whose `used` advanced by that same cancel.
         c.reconcile_remote(snapshot(1, 10_000, t1)).unwrap();
         assert_eq!(
@@ -889,7 +949,9 @@ mod tests {
         c.reconcile_remote(snapshot(10_000, 10_000, now)).unwrap();
         c.reconcile_cancel_headroom(cancel_snapshot(0, 10_000, now));
         assert_eq!(c.mode(), ActionBudgetMode::Exhausted);
-        let p = c.permission(&PermissionRequest::new(BudgetAction::Place)).unwrap();
+        let p = c
+            .permission(&PermissionRequest::new(BudgetAction::Place))
+            .unwrap();
         assert!(!p.allowed);
     }
 
@@ -899,9 +961,15 @@ mod tests {
         let now = Utc::now();
         let d = debit("att-1", &[BudgetAction::Place], 1, now);
         assert!(c.debit_network_attempt(d.clone()).unwrap());
-        assert!(!c.debit_network_attempt(d.clone()).unwrap(), "replay is a no-op");
+        assert!(
+            !c.debit_network_attempt(d.clone()).unwrap(),
+            "replay is a no-op"
+        );
         let conflict = debit("att-1", &[BudgetAction::Cancel], 2, now);
-        assert!(c.debit_network_attempt(conflict).is_err(), "same id, different facts");
+        assert!(
+            c.debit_network_attempt(conflict).is_err(),
+            "same id, different facts"
+        );
     }
 
     #[test]
@@ -919,7 +987,13 @@ mod tests {
         let cancel = cancel_snapshot(0, 10_000, now);
         c.reconcile_remote(remote.clone()).unwrap();
         c.reconcile_cancel_headroom(cancel.clone());
-        c.debit_network_attempt(debit("att-1", &[BudgetAction::Place], 1, now + Duration::seconds(1))).unwrap();
+        c.debit_network_attempt(debit(
+            "att-1",
+            &[BudgetAction::Place],
+            1,
+            now + Duration::seconds(1),
+        ))
+        .unwrap();
 
         let exported = c.export_recovery_state();
         let mut c2 = controller();
@@ -970,12 +1044,16 @@ mod tests {
         // 10 placements in the last minute → high burn, finite runway.
         for i in 0..10 {
             let at = now - Duration::seconds(30 - i as i64);
-            c.debit_network_attempt(debit(&format!("att-{i}"), &[BudgetAction::Place], 1, at)).unwrap();
+            c.debit_network_attempt(debit(&format!("att-{i}"), &[BudgetAction::Place], 1, at))
+                .unwrap();
         }
         let view = c.snapshot();
         let h1 = &view.windows[0];
         assert_eq!(h1.burned_actions, 10);
-        assert!(h1.runway_hours.is_finite(), "burned 10 in 1h window → finite runway");
+        assert!(
+            h1.runway_hours.is_finite(),
+            "burned 10 in 1h window → finite runway"
+        );
         assert!(h1.runway_hours > 0.0);
     }
 
@@ -1016,10 +1094,25 @@ mod tests {
         c.reconcile_remote(snapshot(9400, 10_000, now)).unwrap();
         c.reconcile_cancel_headroom(cancel_snapshot(0, 10_000, now));
         let view = c.snapshot();
-        assert_eq!(view.mode, ActionBudgetMode::Critical, "mode: {:?}", view.mode);
-        let p = c.permission(&PermissionRequest::new(BudgetAction::Place)).unwrap();
+        assert_eq!(
+            view.mode,
+            ActionBudgetMode::Critical,
+            "mode: {:?}",
+            view.mode
+        );
+        let p = c
+            .permission(&PermissionRequest::new(BudgetAction::Place))
+            .unwrap();
         assert!(!p.allowed, "critical blocks ordinary placement");
-        let p = c.permission(&PermissionRequest { action: BudgetAction::Place, risk_reducing: true, child_actions: 1, ip_weight: 1, ..Default::default() }).unwrap();
+        let p = c
+            .permission(&PermissionRequest {
+                action: BudgetAction::Place,
+                risk_reducing: true,
+                child_actions: 1,
+                ip_weight: 1,
+                ..Default::default()
+            })
+            .unwrap();
         assert!(p.allowed, "critical permits risk-reducing placement");
     }
 }

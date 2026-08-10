@@ -132,7 +132,11 @@ impl PostgresExchangeFactProjector {
             .await
             .map_err(map_sqlx)?;
             if let Some(order) = by_cloid {
-                if order.exchange_oid.as_deref().is_some_and(|oid| oid != exchange_oid) {
+                if order
+                    .exchange_oid
+                    .as_deref()
+                    .is_some_and(|oid| oid != exchange_oid)
+                {
                     return Err(HypeEdgeError::Reconciliation {
                         message: "exchange_order_cloid_oid_conflict".into(),
                     });
@@ -210,7 +214,11 @@ impl PostgresExchangeFactProjector {
             cloid,
             legacy_cloid: None,
             exchange_oid: Some(exchange_oid.to_string()),
-            symbol: if coin.is_empty() { "UNKNOWN".into() } else { coin },
+            symbol: if coin.is_empty() {
+                "UNKNOWN".into()
+            } else {
+                coin
+            },
             side: side.to_string(),
             size: dec_to_bd(size),
             price: limit_px.filter(|d| *d > Decimal::ZERO).map(dec_to_bd),
@@ -236,18 +244,29 @@ impl PostgresExchangeFactProjector {
         payload: &Value,
     ) -> Result<(), HypeEdgeError> {
         let previous_filled = bd_to_dec(order.filled_size.clone()).map_err(dec_err)?;
-        let new_filled = order.size.clone().min(dec_to_bd(previous_filled + fill_size));
+        let new_filled = order
+            .size
+            .clone()
+            .min(dec_to_bd(previous_filled + fill_size));
         let new_filled_dec = bd_to_dec(new_filled.clone()).map_err(dec_err)?;
         let mut avg = order.avg_fill_price.clone();
         if new_filled_dec > Decimal::ZERO {
-            let prev_avg = order.avg_fill_price.clone().map(|p| bd_to_dec(p).map_err(dec_err)).transpose()?;
-            let numerator = previous_filled * prev_avg.unwrap_or(fill_price) + fill_size * fill_price;
+            let prev_avg = order
+                .avg_fill_price
+                .clone()
+                .map(|p| bd_to_dec(p).map_err(dec_err))
+                .transpose()?;
+            let numerator =
+                previous_filled * prev_avg.unwrap_or(fill_price) + fill_size * fill_price;
             avg = Some(dec_to_bd(numerator / (previous_filled + fill_size)));
         }
         let previous_status = order.status.clone();
         let new_status = if new_filled_dec >= bd_to_dec(order.size.clone()).map_err(dec_err)? {
             "filled"
-        } else if matches!(previous_status.as_str(), "cancelled" | "rejected" | "expired") {
+        } else if matches!(
+            previous_status.as_str(),
+            "cancelled" | "rejected" | "expired"
+        ) {
             previous_status.as_str()
         } else {
             "partial_fill"
@@ -256,7 +275,11 @@ impl PostgresExchangeFactProjector {
         order.avg_fill_price = avg;
         order.status = new_status.to_string();
         order.revision += 1;
-        let filled_at = if new_status == "filled" { Some(occurred_at) } else { None };
+        let filled_at = if new_status == "filled" {
+            Some(occurred_at)
+        } else {
+            None
+        };
 
         sqlx::query(
             r#"
@@ -332,7 +355,11 @@ impl PostgresExchangeFactProjector {
             .and_then(|s| Decimal::from_str_lenient(s).ok())
             .unwrap_or(Decimal::ZERO);
         let new_size = fill_position_after(fill);
-        let old_entry = existing.as_ref().and_then(|(_, e, _)| e.clone()).map(|e| bd_to_dec(e).map_err(dec_err)).transpose()?;
+        let old_entry = existing
+            .as_ref()
+            .and_then(|(_, e, _)| e.clone())
+            .map(|e| bd_to_dec(e).map_err(dec_err))
+            .transpose()?;
         let entry = projected_entry_price(old_size, old_entry, new_size, fill_price);
         let entry_bd = entry.map(dec_to_bd);
 
@@ -412,7 +439,6 @@ impl PostgresExchangeFactProjector {
     }
 }
 
-
 /// Map a domain Decimal conversion failure onto the storage error hierarchy.
 fn dec_err(e: hypeedge_domain::decimal::DecimalError) -> HypeEdgeError {
     HypeEdgeError::Storage {
@@ -433,10 +459,9 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
     async fn ingest_fill(&self, fill: &Value) -> Result<IngestResult, HypeEdgeError> {
         let external_id = fill_external_id(fill);
         let (payload_hash, payload) = canonical_payload(fill);
-        let occurred_at = DateTime::from_timestamp_millis(
-            fill.get("time").and_then(|v| v.as_i64()).unwrap_or(0),
-        )
-        .unwrap_or_else(Utc::now);
+        let occurred_at =
+            DateTime::from_timestamp_millis(fill.get("time").and_then(|v| v.as_i64()).unwrap_or(0))
+                .unwrap_or_else(Utc::now);
 
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let Some(_inbox_id) = self
@@ -447,7 +472,9 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
         };
 
         let exchange_oid = str_of(fill.get("oid"));
-        let mut order = self.find_or_create_order(&mut tx, &exchange_oid, fill).await?;
+        let mut order = self
+            .find_or_create_order(&mut tx, &exchange_oid, fill)
+            .await?;
         let is_spot = order.is_spot || str_of(fill.get("coin")).starts_with('@');
         if is_spot && !order.is_spot {
             order.is_spot = true;
@@ -480,8 +507,15 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
             .and_then(|v| v.as_str())
             .and_then(|s| Decimal::from_str_lenient(s).ok())
             .unwrap_or(Decimal::ZERO);
-        let side = if str_of(fill.get("side")).eq_ignore_ascii_case("B") { "buy" } else { "sell" };
-        let is_maker = !fill.get("crossed").and_then(|c| c.as_bool()).unwrap_or(false);
+        let side = if str_of(fill.get("side")).eq_ignore_ascii_case("B") {
+            "buy"
+        } else {
+            "sell"
+        };
+        let is_maker = !fill
+            .get("crossed")
+            .and_then(|c| c.as_bool())
+            .unwrap_or(false);
 
         sqlx::query(
             r#"
@@ -533,7 +567,11 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
             let reserved_dec = bd_to_dec(reserved_size).map_err(dec_err)?;
             let new_reserved = (reserved_dec - size).max(Decimal::ZERO);
             let new_notional = if reserved_dec > Decimal::ZERO {
-                let factor = if reserved_dec > Decimal::ZERO { new_reserved / reserved_dec } else { Decimal::ZERO };
+                let factor = if reserved_dec > Decimal::ZERO {
+                    new_reserved / reserved_dec
+                } else {
+                    Decimal::ZERO
+                };
                 dec_to_bd(bd_to_dec(reserved_notional).map_err(dec_err)? * factor)
             } else {
                 dec_to_bd(Decimal::ZERO)
@@ -543,7 +581,11 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
             } else {
                 "active"
             };
-            let released_at = if status == "consumed" { Some(occurred_at) } else { None };
+            let released_at = if status == "consumed" {
+                Some(occurred_at)
+            } else {
+                None
+            };
             sqlx::query(
                 r#"
                 UPDATE risk_reservations SET reserved_size = $1, reserved_notional = $2,
@@ -564,8 +606,15 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
             None
         } else {
             Some(
-                self.apply_fill_to_position(&mut tx, &order, fill, price, realized_pnl, occurred_at)
-                    .await?,
+                self.apply_fill_to_position(
+                    &mut tx,
+                    &order,
+                    fill,
+                    price,
+                    realized_pnl,
+                    occurred_at,
+                )
+                .await?,
             )
         };
 
@@ -618,8 +667,13 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
         .await
         .map_err(map_sqlx)?;
 
-        self.advance_cursor(&mut tx, "fills", fill.get("time").and_then(|v| v.as_i64()).unwrap_or(0), &external_id)
-            .await?;
+        self.advance_cursor(
+            &mut tx,
+            "fills",
+            fill.get("time").and_then(|v| v.as_i64()).unwrap_or(0),
+            &external_id,
+        )
+        .await?;
         sqlx::query("UPDATE inbox_events SET processed_at = now() WHERE external_event_id = $1 AND source = $2")
             .bind(&external_id)
             .bind(SOURCE)
@@ -662,9 +716,8 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
             .or_else(|| raw_order.get("timestamp"))
             .and_then(|v| v.as_i64())
             .unwrap_or(0);
-        let event_status = normalize_status(
-            update.get("status").or_else(|| raw_order.get("status")),
-        );
+        let event_status =
+            normalize_status(update.get("status").or_else(|| raw_order.get("status")));
         let external_id = format!("order:{exchange_oid}:{event_status}:{timestamp_ms}");
         let (payload_hash, payload) = canonical_payload(update);
         let occurred_at = if timestamp_ms > 0 {
@@ -675,21 +728,31 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
 
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let Some(_inbox_id) = self
-            .claim_inbox(&mut tx, &external_id, "order_update", &payload_hash, &payload)
+            .claim_inbox(
+                &mut tx,
+                &external_id,
+                "order_update",
+                &payload_hash,
+                &payload,
+            )
             .await?
         else {
             return Ok(IngestResult::dedup(&external_id));
         };
-        let mut order = self.find_or_create_order(&mut tx, &exchange_oid, raw_order).await?;
+        let mut order = self
+            .find_or_create_order(&mut tx, &exchange_oid, raw_order)
+            .await?;
 
         // cloid ownership transfer (legacy_cloid preserved).
         let actual_cloid = str_of(raw_order.get("cloid"));
-        if actual_cloid.starts_with("0x") && actual_cloid.len() == 34 && order.cloid != actual_cloid {
-            let collision: Option<(Uuid,)> = sqlx::query_as("SELECT order_id FROM orders WHERE cloid = $1")
-                .bind(&actual_cloid)
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(map_sqlx)?;
+        if actual_cloid.starts_with("0x") && actual_cloid.len() == 34 && order.cloid != actual_cloid
+        {
+            let collision: Option<(Uuid,)> =
+                sqlx::query_as("SELECT order_id FROM orders WHERE cloid = $1")
+                    .bind(&actual_cloid)
+                    .fetch_optional(&mut *tx)
+                    .await
+                    .map_err(map_sqlx)?;
             match collision {
                 None => {
                     let legacy = order.cloid.clone();
@@ -717,7 +780,11 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
         if !coin.is_empty() {
             order.symbol = coin;
         }
-        order.side = if str_of(raw_order.get("side")).eq_ignore_ascii_case("B") { "buy".into() } else { "sell".into() };
+        order.side = if str_of(raw_order.get("side")).eq_ignore_ascii_case("B") {
+            "buy".into()
+        } else {
+            "sell".into()
+        };
         if let Some(d) = raw_order
             .get("origSz")
             .or_else(|| raw_order.get("sz"))
@@ -758,7 +825,11 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
             .await
             .map_err(map_sqlx)?;
             if let Some((reservation_id,)) = reservation {
-                let res_status = if event_status == "filled" { "consumed" } else { "released" };
+                let res_status = if event_status == "filled" {
+                    "consumed"
+                } else {
+                    "released"
+                };
                 sqlx::query(
                     "UPDATE risk_reservations SET status = $1, released_at = now() WHERE reservation_id = $2",
                 )
@@ -829,7 +900,8 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
         .await
         .map_err(map_sqlx)?;
 
-        self.advance_cursor(&mut tx, "orders", timestamp_ms, &external_id).await?;
+        self.advance_cursor(&mut tx, "orders", timestamp_ms, &external_id)
+            .await?;
         sqlx::query("UPDATE inbox_events SET processed_at = now() WHERE external_event_id = $1 AND source = $2")
             .bind(&external_id)
             .bind(SOURCE)
@@ -848,7 +920,11 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
     async fn ingest_funding(&self, update: &Value) -> Result<IngestResult, HypeEdgeError> {
         let external_id = funding_external_id(update);
         let (payload_hash, payload) = canonical_payload(update);
-        let delta = update.get("delta").filter(|d| d.is_object()).cloned().unwrap_or(Value::Null);
+        let delta = update
+            .get("delta")
+            .filter(|d| d.is_object())
+            .cloned()
+            .unwrap_or(Value::Null);
         if delta.get("type").and_then(|t| t.as_str()) != Some("funding") {
             return Err(HypeEdgeError::Reconciliation {
                 message: "invalid_user_funding_update".into(),
@@ -860,10 +936,25 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
                 message: "user_funding_missing_coin".into(),
             });
         }
-        let amount = delta.get("usdc").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str_lenient(s).ok()).unwrap_or(Decimal::ZERO);
-        let funding_rate = delta.get("fundingRate").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str_lenient(s).ok()).unwrap_or(Decimal::ZERO);
-        let position_size = delta.get("szi").and_then(|v| v.as_str()).and_then(|s| Decimal::from_str_lenient(s).ok()).unwrap_or(Decimal::ZERO);
-        let occurred_at = DateTime::from_timestamp_millis(update.get("time").and_then(|v| v.as_i64()).unwrap_or(0)).unwrap_or_else(Utc::now);
+        let amount = delta
+            .get("usdc")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Decimal::from_str_lenient(s).ok())
+            .unwrap_or(Decimal::ZERO);
+        let funding_rate = delta
+            .get("fundingRate")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Decimal::from_str_lenient(s).ok())
+            .unwrap_or(Decimal::ZERO);
+        let position_size = delta
+            .get("szi")
+            .and_then(|v| v.as_str())
+            .and_then(|s| Decimal::from_str_lenient(s).ok())
+            .unwrap_or(Decimal::ZERO);
+        let occurred_at = DateTime::from_timestamp_millis(
+            update.get("time").and_then(|v| v.as_i64()).unwrap_or(0),
+        )
+        .unwrap_or_else(Utc::now);
 
         let mut tx = self.pool.begin().await.map_err(map_sqlx)?;
         let Some(_inbox_id) = self
@@ -912,8 +1003,13 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
         .await
         .map_err(map_sqlx)?;
 
-        self.advance_cursor(&mut tx, "funding", update.get("time").and_then(|v| v.as_i64()).unwrap_or(0), &external_id)
-            .await?;
+        self.advance_cursor(
+            &mut tx,
+            "funding",
+            update.get("time").and_then(|v| v.as_i64()).unwrap_or(0),
+            &external_id,
+        )
+        .await?;
         sqlx::query("UPDATE inbox_events SET processed_at = now() WHERE external_event_id = $1 AND source = $2")
             .bind(&external_id)
             .bind(SOURCE)
@@ -930,11 +1026,12 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
     }
 
     async fn has_order(&self, exchange_oid: &str) -> Result<bool, HypeEdgeError> {
-        let row: Option<(Uuid,)> = sqlx::query_as("SELECT order_id FROM orders WHERE exchange_oid = $1")
-            .bind(exchange_oid)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(map_sqlx)?;
+        let row: Option<(Uuid,)> =
+            sqlx::query_as("SELECT order_id FROM orders WHERE exchange_oid = $1")
+                .bind(exchange_oid)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(map_sqlx)?;
         Ok(row.is_some())
     }
 

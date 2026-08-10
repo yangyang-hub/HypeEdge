@@ -214,16 +214,19 @@ pub fn parse_meta(
         let (Some(base_idx), Some(quote_idx)) = (base_idx, quote_idx) else {
             continue;
         };
-        let (Some(base), Some(quote)) = (token_by_index.get(&base_idx), token_by_index.get(&quote_idx))
-        else {
+        let (Some(base), Some(quote)) = (
+            token_by_index.get(&base_idx),
+            token_by_index.get(&quote_idx),
+        ) else {
             continue;
         };
-        let Some(base_name) = base.get("name").and_then(|v| v.as_str()) else { continue };
-        let Some(quote_name) = quote.get("name").and_then(|v| v.as_str()) else { continue };
-        let sz_decimals = base
-            .get("szDecimals")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as u32;
+        let Some(base_name) = base.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(quote_name) = quote.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let sz_decimals = base.get("szDecimals").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
         let display_name = format!("{base_name}/{quote_name}");
         instruments.insert(
             exchange_name.to_string(),
@@ -261,10 +264,7 @@ pub struct InstrumentMetaCache {
 }
 
 impl InstrumentMetaCache {
-    pub fn new(
-        source: Arc<dyn InstrumentMetaSource>,
-        refresh_interval_hours: Option<f64>,
-    ) -> Self {
+    pub fn new(source: Arc<dyn InstrumentMetaSource>, refresh_interval_hours: Option<f64>) -> Self {
         Self {
             source,
             refresh_interval: std::time::Duration::from_secs_f64(
@@ -293,11 +293,7 @@ impl InstrumentMetaCache {
     /// Resolve a display pair or exchange coin (`@N`) to spot metadata.
     pub fn resolve_spot(&self, market: &str) -> Option<InstrumentInfo> {
         let info = self.get(market.trim())?;
-        if info.is_spot {
-            Some(info)
-        } else {
-            None
-        }
+        if info.is_spot { Some(info) } else { None }
     }
 
     pub fn get_spot(&self, market: &str) -> Option<InstrumentInfo> {
@@ -327,8 +323,12 @@ impl InstrumentMetaCache {
         let (instruments, aliases) = parse_meta(&perp, &spot)?;
         *self.instruments.write().unwrap() = instruments;
         *self.spot_aliases.write().unwrap() = aliases;
-        self.loaded.store(true, std::sync::atomic::Ordering::Relaxed);
-        tracing::info!(instruments = self.instruments.read().unwrap().len(), "meta_loaded");
+        self.loaded
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        tracing::info!(
+            instruments = self.instruments.read().unwrap().len(),
+            "meta_loaded"
+        );
         Ok(())
     }
 

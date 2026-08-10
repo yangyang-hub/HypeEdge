@@ -402,10 +402,7 @@ impl WebSocketFeed {
 
 /// The connect/subscribe/read/reconnect loop (6c). The feed is shared behind a
 /// mutex so the read loop can take `&mut` (`handle_message` is `&mut self`).
-async fn run_feed_loop(
-    feed: std::sync::Mutex<WebSocketFeed>,
-    bus: Arc<EventBus>,
-) {
+async fn run_feed_loop(feed: std::sync::Mutex<WebSocketFeed>, bus: Arc<EventBus>) {
     use futures::SinkExt;
     use futures::StreamExt;
     use tokio_tungstenite::connect_async;

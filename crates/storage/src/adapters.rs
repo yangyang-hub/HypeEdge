@@ -128,7 +128,9 @@ impl DurableCommandQueue for PooledExecutionCommandQueue {
     }
 
     async fn defer_unknown(&self, command_id: Uuid, reason: &str) -> Result<(), HypeEdgeError> {
-        self.inner.defer_unknown(&self.pool, command_id, reason).await
+        self.inner
+            .defer_unknown(&self.pool, command_id, reason)
+            .await
     }
 }
 
@@ -162,7 +164,9 @@ impl DurableOutboxStore for PooledOutboxStore {
         event: &DurableEvent,
         worker_id: &str,
     ) -> Result<bool, HypeEdgeError> {
-        self.inner.mark_published(&self.pool, event, worker_id).await
+        self.inner
+            .mark_published(&self.pool, event, worker_id)
+            .await
     }
 
     async fn release_claim(

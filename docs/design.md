@@ -808,3 +808,30 @@ Alembic 管理，应用启动禁止 `create_all`。
 - 实例参数以 Postgres 不可变配置版本为主；YAML 仅环境默认与上限。目标态删除 `app.py` 硬编码单一
   `TrendFollowStrategy` 与实例级文件 watcher 双主（§15.2）。
 - 新增策略类型的边际成本应为一份 plugin + typed 表 + ConfigFields，而不修改 create 壳与 Supervisor 核心。
+
+## 20. 运行时装配现状（2026-08-10 Rust cutover 后）
+
+`crates/app/src/runtime.rs` 的 `build_runtime`（async）按依赖顺序装配完整运行时，由
+`HypeEdgeApp::build` 调用；`HypeEdgeApp::new` 保持控制面-only 供测试。V2 交易链经
+`v2_trading_enabled()` 开关；未开或装配失败时回退 `build_control_plane`（控制面-only）。
+
+装配顺序（每个都可在无 DB 时降级）：
+
+1. **行情**：`RestClient`（info/meta/clearinghouse）+ `InstrumentMetaCache`（asset index +
+   spec）+ `WebSocketFeed::run`（connect/subscribe/reconnect，指数退避，每 socket
+   generation）+ `LiveMarketDataProvider`（订阅 Trade/Mid/Funding/Candle/L2Book，把
+   L2BookUpdate 桥接进共享 `BookManager`）。
+2. **账户**：`AccountStatePoller`（clearinghouse 轮询，权重 2）+ `ExchangeEventIngestor`
+   （REST 历史恢复 + fills/orders/funding 摄入；`InfoClient` 由 `RestClient` 实现）+
+   `Reconciler` 对账。
+3. **执行**：`HyperliquidExchangeClient`（真实账户地址，A2）+ `NonceQueue` +
+   `ExecutionEngine`（risk checker、action budget、asset index、market data provider、
+   durable store）+ `SignedActionExecutor` 持久化 worker（claim→dispatch）。
+4. **风控**：`KillSwitch` 接线 cancel-all hook（经引擎）+ 持久化 `SystemStateStore`
+   （重启恢复 latch，A15）；`SafetyController` Starting→Running。
+5. **API**：`AppState::from_wiring` 注入 execution / market_data / config_versions /
+   durable SSE broker；`/orders` `/submit_order` `/cancel_order` `/close_position`
+   调真实引擎。`from_wiring` 注册真实 trend_follow 插件（6f）。
+
+仍待接线（不在本次审计项内）：funding_arb / market_maker 真实插件（需各自 provider
+adapter）、持久化 outbox→SSE relay 发布任务、`MarketMakerRuntime` 快照方法。

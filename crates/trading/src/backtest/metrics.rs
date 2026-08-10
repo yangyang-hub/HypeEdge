@@ -419,10 +419,7 @@ mod tests {
         let capital = Usd::new(Decimal::from_str_lenient("10000").unwrap());
         let curve = vec![
             (0, capital),
-            (
-                1,
-                Usd::new(Decimal::from_str_lenient("10200").unwrap()),
-            ),
+            (1, Usd::new(Decimal::from_str_lenient("10200").unwrap())),
         ];
         let pnls = vec![
             Usd::new(Decimal::from_str_lenient("100").unwrap()),
@@ -436,7 +433,11 @@ mod tests {
             pnls,
         );
         let m = calc.calculate();
-        assert_eq!(m.total_fees.to_string(), "12.5", "fees must be surfaced (B17)");
+        assert_eq!(
+            m.total_fees.to_string(),
+            "12.5",
+            "fees must be surfaced (B17)"
+        );
         assert_eq!(m.profit_factor, f64::INFINITY);
         let dict = m.to_dict();
         assert_eq!(

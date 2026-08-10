@@ -209,7 +209,10 @@ impl ExecutionEngine {
     }
 
     async fn store(&self, order: &Order) {
-        self.orders.lock().await.insert(order.cloid.clone(), order.clone());
+        self.orders
+            .lock()
+            .await
+            .insert(order.cloid.clone(), order.clone());
     }
 
     async fn load(&self, cloid: &str) -> Option<Order> {
@@ -270,7 +273,9 @@ impl ExecutionEngine {
         // original order instead of double-submitting.
         let raw_cloid = match intent.cloid.clone() {
             Some(c) => c,
-            None => CloidGenerator::deterministic(intent.strategy_id.as_deref(), &intent_key(&intent)),
+            None => {
+                CloidGenerator::deterministic(intent.strategy_id.as_deref(), &intent_key(&intent))
+            }
         };
         let cloid = CloidGenerator::to_hl_cloid(&raw_cloid);
 
@@ -346,7 +351,8 @@ impl ExecutionEngine {
             };
             let risk = risk_fail(reason);
             let order = self.rejected_order(&intent, reason);
-            self.persist_placement(&order, &risk, None, false, reference_price).await?;
+            self.persist_placement(&order, &risk, None, false, reference_price)
+                .await?;
             return Ok(order);
         }
 
@@ -355,7 +361,10 @@ impl ExecutionEngine {
         if let Some(checker) = &self.risk_checker {
             risk_result = checker.check(&intent, reference_price).await;
             if !risk_result.passed {
-                let reason = risk_result.reason.clone().unwrap_or_else(|| "risk_check_rejected".into());
+                let reason = risk_result
+                    .reason
+                    .clone()
+                    .unwrap_or_else(|| "risk_check_rejected".into());
                 self.handle_risk_rejection(&reason).await;
                 let order = self.rejected_order(&intent, &reason);
                 self.persist_placement(&order, &risk_result, None, false, reference_price)
@@ -365,11 +374,16 @@ impl ExecutionEngine {
         }
 
         // Action credits check.
-        if self.rate_limiter.as_ref().is_some_and(|rl| !rl.check_action_credits()) {
+        if self
+            .rate_limiter
+            .as_ref()
+            .is_some_and(|rl| !rl.check_action_credits())
+        {
             tracing::warn!(cloid = %cloid, "order_rejected_action_credits_low");
             let risk = risk_fail("action_credits_below_threshold");
             let order = self.rejected_order(&intent, "action_credits_below_threshold");
-            self.persist_placement(&order, &risk, None, false, reference_price).await?;
+            self.persist_placement(&order, &risk, None, false, reference_price)
+                .await?;
             return Ok(order);
         }
 
@@ -389,7 +403,15 @@ impl ExecutionEngine {
             is_spot: intent.is_spot,
             risk_reducing: intent.risk_reducing,
             max_slippage_bps: intent.max_slippage_bps,
-            ..Order::new("".into(), "".into(), Side::Buy, Size::ZERO, None, OrderType::Limit, TimeInForce::Gtc)
+            ..Order::new(
+                "".into(),
+                "".into(),
+                Side::Buy,
+                Size::ZERO,
+                None,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+            )
         };
         self.store(&order).await;
         self.state_machine
@@ -397,7 +419,13 @@ impl ExecutionEngine {
         order.submitted_at = Some(Utc::now());
         let command_id = uuid::Uuid::new_v4();
         let durable_risk = self
-            .persist_placement(&order, &risk_result, Some(command_id), true, reference_price)
+            .persist_placement(
+                &order,
+                &risk_result,
+                Some(command_id),
+                true,
+                reference_price,
+            )
             .await?;
         if let Some(risk) = durable_risk.filter(|r| !r.passed) {
             order.status = OrderStatus::Rejected;
@@ -424,32 +452,52 @@ impl ExecutionEngine {
         }
 
         // Submit to exchange through the serial nonce queue.
-        let outcome = self.submit_to_exchange(&intent, &cloid, reference_price).await;
+        let outcome = self
+            .submit_to_exchange(&intent, &cloid, reference_price)
+            .await;
         match outcome {
             SubmitOutcome::Response(resp) => {
-                self.handle_submit_response(&mut order, resp, Some(command_id)).await?;
+                self.handle_submit_response(&mut order, resp, Some(command_id))
+                    .await?;
             }
             SubmitOutcome::SafetyAborted(e) => {
-                self.state_machine
-                    .transition(&mut order, OrderStatus::Cancelled, Some("dispatch_aborted_by_safety_gate"))?;
+                self.state_machine.transition(
+                    &mut order,
+                    OrderStatus::Cancelled,
+                    Some("dispatch_aborted_by_safety_gate"),
+                )?;
                 order.error_message = Some(e.to_string());
-                self.persist_transition(&order, "dispatch_aborted", Some(command_id), Some("cancelled"))
-                    .await?;
+                self.persist_transition(
+                    &order,
+                    "dispatch_aborted",
+                    Some(command_id),
+                    Some("cancelled"),
+                )
+                .await?;
                 self.publish(DomainEvent::OrderCancelled(order.clone()), &cloid);
             }
             SubmitOutcome::Timeout => {
-                self.state_machine
-                    .transition(&mut order, OrderStatus::SubmitUnknown, Some("submit_timeout"))?;
+                self.state_machine.transition(
+                    &mut order,
+                    OrderStatus::SubmitUnknown,
+                    Some("submit_timeout"),
+                )?;
                 order.error_message = Some("exchange_action_outcome_unknown".into());
-                self.persist_transition(&order, "submit_unknown", Some(command_id), Some("unknown"))
-                    .await?;
+                self.persist_transition(
+                    &order,
+                    "submit_unknown",
+                    Some(command_id),
+                    Some("unknown"),
+                )
+                .await?;
                 tracing::error!(cloid = %cloid, "order_submit_unknown");
             }
             SubmitOutcome::Rejected(msg) => {
                 self.state_machine
                     .transition(&mut order, OrderStatus::Rejected, Some(&msg))?;
                 order.error_message = Some(msg.clone());
-                self.persist_transition(&order, "rejected", Some(command_id), Some("failed")).await?;
+                self.persist_transition(&order, "rejected", Some(command_id), Some("failed"))
+                    .await?;
                 self.publish(DomainEvent::OrderRejected(order.clone()), &cloid);
                 tracing::error!(cloid = %cloid, error = %msg, "order_rejected");
             }
@@ -637,32 +685,36 @@ impl ExecutionEngine {
                 message: "no asset index provider".into(),
             });
         };
-        let asset = index_provider
-            .asset_index(&intent.symbol)
-            .ok_or_else(|| HypeEdgeError::OrderRejected {
+        let asset = index_provider.asset_index(&intent.symbol).ok_or_else(|| {
+            HypeEdgeError::OrderRejected {
                 message: format!("unknown symbol {}", intent.symbol),
                 cloid: Some(cloid.to_string()),
                 reason: Some("instrument_meta_unavailable".to_string()),
-            })?;
+            }
+        })?;
 
         let is_buy = intent.side == Side::Buy;
         let sz = intent.size.inner().to_exact_string();
         let (px, tif): (String, &'static str) = match intent.order_type {
             OrderType::Limit => {
-                let p = intent.price.ok_or_else(|| HypeEdgeError::order_rejected(
-                    "limit order requires a price",
-                    Some(cloid.to_string()),
-                    Some("price_required".to_string()),
-                ))?;
+                let p = intent.price.ok_or_else(|| {
+                    HypeEdgeError::order_rejected(
+                        "limit order requires a price",
+                        Some(cloid.to_string()),
+                        Some("price_required".to_string()),
+                    )
+                })?;
                 (p.inner().to_exact_string(), tif_wire(intent.time_in_force))
             }
             OrderType::Market => {
                 // Market order: aggressive IoC priced with slippage.
-                let reference = reference_price.ok_or_else(|| HypeEdgeError::order_rejected(
-                    "market order requires a reference price",
-                    Some(cloid.to_string()),
-                    Some("market_price_not_available".to_string()),
-                ))?;
+                let reference = reference_price.ok_or_else(|| {
+                    HypeEdgeError::order_rejected(
+                        "market order requires a reference price",
+                        Some(cloid.to_string()),
+                        Some("market_price_not_available".to_string()),
+                    )
+                })?;
                 let slippage = Decimal::from_i128(intent.max_slippage_bps as i128)
                     .div(Decimal::from_i128(10_000));
                 let aggressive = if is_buy {
@@ -677,7 +729,7 @@ impl ExecutionEngine {
                     "stop orders are not supported by the execution engine",
                     Some(cloid.to_string()),
                     Some("unsupported_order_type".to_string()),
-                ))
+                ));
             }
         };
 
@@ -716,12 +768,20 @@ impl ExecutionEngine {
                         let first = &statuses[0];
                         if let Some(resting) = first.get("resting") {
                             let oid = resting.get("oid").map(|o| o.to_string());
-                            self.state_machine
-                                .transition(order, OrderStatus::Acknowledged, Some("exchange_ack"))?;
+                            self.state_machine.transition(
+                                order,
+                                OrderStatus::Acknowledged,
+                                Some("exchange_ack"),
+                            )?;
                             order.exchange_oid = oid;
                             order.acknowledged_at = Some(Utc::now());
-                            self.persist_transition(order, "acknowledged", command_id, Some("succeeded"))
-                                .await?;
+                            self.persist_transition(
+                                order,
+                                "acknowledged",
+                                command_id,
+                                Some("succeeded"),
+                            )
+                            .await?;
                             self.publish(DomainEvent::OrderAcknowledged(order.clone()), &cloid);
                         } else if first.get("filled").is_some() {
                             let fill = &first["filled"];
@@ -737,8 +797,11 @@ impl ExecutionEngine {
                                     .and_then(|s| Decimal::from_str_lenient(s).ok())
                                     .unwrap_or(Decimal::ZERO),
                             );
-                            self.state_machine
-                                .transition(order, OrderStatus::Filled, Some("immediate_fill"))?;
+                            self.state_machine.transition(
+                                order,
+                                OrderStatus::Filled,
+                                Some("immediate_fill"),
+                            )?;
                             order.filled_at = Some(Utc::now());
                             order.exchange_oid = fill.get("oid").map(|o| o.to_string());
                             order.filled_size = provisional_size;
@@ -746,20 +809,19 @@ impl ExecutionEngine {
                             // Credit the address action quota with the organic
                             // fill volume (B3).
                             if let Some(budget) = &self.action_budget {
-                                let notional =
-                                    provisional_size.inner() * provisional_price.inner();
-                                budget
-                                    .lock()
-                                    .await
-                                    .record_fill(notional, Some(Utc::now()));
+                                let notional = provisional_size.inner() * provisional_price.inner();
+                                budget.lock().await.record_fill(notional, Some(Utc::now()));
                             }
                             self.persist_transition(order, "filled", command_id, Some("succeeded"))
                                 .await?;
                             self.publish(DomainEvent::OrderFilled(order.clone()), &cloid);
                         } else if let Some(err) = first.get("error") {
                             let msg = err.as_str().unwrap_or("unknown_error").to_string();
-                            self.state_machine
-                                .transition(order, OrderStatus::Rejected, Some(&msg))?;
+                            self.state_machine.transition(
+                                order,
+                                OrderStatus::Rejected,
+                                Some(&msg),
+                            )?;
                             order.error_message = Some(msg.clone());
                             self.persist_transition(order, "rejected", command_id, Some("failed"))
                                 .await?;
@@ -770,11 +832,19 @@ impl ExecutionEngine {
                     }
                     _ => {
                         // Accepted but no detailed status.
-                        self.state_machine
-                            .transition(order, OrderStatus::Acknowledged, Some("exchange_ack"))?;
+                        self.state_machine.transition(
+                            order,
+                            OrderStatus::Acknowledged,
+                            Some("exchange_ack"),
+                        )?;
                         order.acknowledged_at = Some(Utc::now());
-                        self.persist_transition(order, "acknowledged", command_id, Some("succeeded"))
-                            .await?;
+                        self.persist_transition(
+                            order,
+                            "acknowledged",
+                            command_id,
+                            Some("succeeded"),
+                        )
+                        .await?;
                         self.publish(DomainEvent::OrderAcknowledged(order.clone()), &cloid);
                     }
                 }
@@ -784,9 +854,14 @@ impl ExecutionEngine {
                     .get("response")
                     .map(|r| r.to_string())
                     .unwrap_or_else(|| "unknown_error".into());
-                self.state_machine.transition(order, OrderStatus::Rejected, Some("exchange_err"))?;
+                self.state_machine.transition(
+                    order,
+                    OrderStatus::Rejected,
+                    Some("exchange_err"),
+                )?;
                 order.error_message = Some(msg);
-                self.persist_transition(order, "rejected", command_id, Some("failed")).await?;
+                self.persist_transition(order, "rejected", command_id, Some("failed"))
+                    .await?;
                 self.publish(DomainEvent::OrderRejected(order.clone()), &cloid);
             }
             Some("order") => {
@@ -800,35 +875,60 @@ impl ExecutionEngine {
                 let terminal = Self::terminal_exchange_status(&exchange_status);
                 match terminal {
                     Some(OrderStatus::Filled) => {
-                        self.state_machine
-                            .transition(order, OrderStatus::Filled, Some("status_query_filled"))?;
+                        self.state_machine.transition(
+                            order,
+                            OrderStatus::Filled,
+                            Some("status_query_filled"),
+                        )?;
                         order.filled_at = Some(Utc::now());
-                        self.persist_transition(order, "filled", command_id, Some("succeeded")).await?;
+                        self.persist_transition(order, "filled", command_id, Some("succeeded"))
+                            .await?;
                         self.publish(DomainEvent::OrderFilled(order.clone()), &cloid);
                     }
                     Some(OrderStatus::Cancelled) => {
-                        self.state_machine
-                            .transition(order, OrderStatus::Cancelled, Some("status_query_cancelled"))?;
-                        self.persist_transition(order, "cancelled", command_id, Some("succeeded")).await?;
+                        self.state_machine.transition(
+                            order,
+                            OrderStatus::Cancelled,
+                            Some("status_query_cancelled"),
+                        )?;
+                        self.persist_transition(order, "cancelled", command_id, Some("succeeded"))
+                            .await?;
                         self.publish(DomainEvent::OrderCancelled(order.clone()), &cloid);
                     }
                     Some(OrderStatus::Rejected) => {
-                        self.state_machine
-                            .transition(order, OrderStatus::Rejected, Some("status_query_rejected"))?;
-                        self.persist_transition(order, "rejected", command_id, Some("failed")).await?;
+                        self.state_machine.transition(
+                            order,
+                            OrderStatus::Rejected,
+                            Some("status_query_rejected"),
+                        )?;
+                        self.persist_transition(order, "rejected", command_id, Some("failed"))
+                            .await?;
                         self.publish(DomainEvent::OrderRejected(order.clone()), &cloid);
                     }
                     Some(OrderStatus::Expired) => {
-                        self.state_machine
-                            .transition(order, OrderStatus::Expired, Some("status_query_expired"))?;
-                        self.persist_transition(order, "expired", command_id, Some("failed")).await?;
+                        self.state_machine.transition(
+                            order,
+                            OrderStatus::Expired,
+                            Some("status_query_expired"),
+                        )?;
+                        self.persist_transition(order, "expired", command_id, Some("failed"))
+                            .await?;
                         self.publish(DomainEvent::OrderExpired(order.clone()), &cloid);
                     }
                     _ => {
-                        self.state_machine
-                            .transition(order, OrderStatus::Acknowledged, Some("status_query_open"))?;
+                        self.state_machine.transition(
+                            order,
+                            OrderStatus::Acknowledged,
+                            Some("status_query_open"),
+                        )?;
                         order.acknowledged_at = Some(Utc::now());
-                        self.persist_transition(order, "acknowledged", command_id, Some("succeeded")).await?;
+                        self.persist_transition(
+                            order,
+                            "acknowledged",
+                            command_id,
+                            Some("succeeded"),
+                        )
+                        .await?;
                         self.publish(DomainEvent::OrderAcknowledged(order.clone()), &cloid);
                     }
                 }
@@ -836,15 +936,21 @@ impl ExecutionEngine {
             _ => {
                 if is_object {
                     // Unknown response must not be treated as an acknowledgement.
-                    self.state_machine
-                        .transition(order, OrderStatus::SubmitUnknown, Some("unknown_response"))?;
+                    self.state_machine.transition(
+                        order,
+                        OrderStatus::SubmitUnknown,
+                        Some("unknown_response"),
+                    )?;
                     order.error_message = Some("unknown_exchange_response".into());
                     self.persist_transition(order, "submit_unknown", command_id, Some("unknown"))
                         .await?;
                 } else {
                     // Non-object response (e.g. raw market_open data).
-                    self.state_machine
-                        .transition(order, OrderStatus::Acknowledged, Some("exchange_ack"))?;
+                    self.state_machine.transition(
+                        order,
+                        OrderStatus::Acknowledged,
+                        Some("exchange_ack"),
+                    )?;
                     order.acknowledged_at = Some(Utc::now());
                     self.persist_transition(order, "acknowledged", command_id, Some("succeeded"))
                         .await?;
@@ -864,8 +970,10 @@ impl ExecutionEngine {
         if value == "margincanceled" || value == "rejected" || value.ends_with("rejected") {
             return Some(OrderStatus::Rejected);
         }
-        if matches!(value.as_str(), "canceled" | "cancelled" | "ioccancel" | "scheduledcancel")
-            || value.ends_with("canceled")
+        if matches!(
+            value.as_str(),
+            "canceled" | "cancelled" | "ioccancel" | "scheduledcancel"
+        ) || value.ends_with("canceled")
             || value.ends_with("cancelled")
         {
             return Some(OrderStatus::Cancelled);
@@ -887,10 +995,14 @@ impl ExecutionEngine {
         let cloid = order.cloid.clone();
         let is_object = response.is_object();
         if !is_object {
-            self.mark_cancel_unknown(order, "invalid_cancel_response", command_id).await;
+            self.mark_cancel_unknown(order, "invalid_cancel_response", command_id)
+                .await;
             return Ok(false);
         }
-        let top_status = response.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        let top_status = response
+            .get("status")
+            .and_then(|s| s.as_str())
+            .unwrap_or("");
         match top_status {
             "order" => {
                 let status_data = response.get("order").cloned().unwrap_or(Value::Null);
@@ -900,23 +1012,31 @@ impl ExecutionEngine {
                     .unwrap_or("")
                     .to_string();
                 match Self::terminal_exchange_status(&exchange_status) {
-                    Some(OrderStatus::Cancelled) => {
-                        Ok(self.mark_cancelled(order, "cancel_status_confirmed", command_id).await?)
-                    }
+                    Some(OrderStatus::Cancelled) => Ok(self
+                        .mark_cancelled(order, "cancel_status_confirmed", command_id)
+                        .await?),
                     Some(OrderStatus::Filled) => {
-                        self.state_machine
-                            .transition(order, OrderStatus::Filled, Some("cancel_status_filled"))?;
+                        self.state_machine.transition(
+                            order,
+                            OrderStatus::Filled,
+                            Some("cancel_status_filled"),
+                        )?;
                         order.filled_at = Some(Utc::now());
                         order.error_message = Some("cancel_not_applied_order_filled".into());
-                        self.persist_transition(order, "filled", command_id, Some("failed")).await?;
+                        self.persist_transition(order, "filled", command_id, Some("failed"))
+                            .await?;
                         tracing::warn!(cloid = %cloid, "cancel_order_already_filled");
                         Ok(false)
                     }
                     Some(OrderStatus::Rejected) | Some(OrderStatus::Expired) => {
-                        self.state_machine
-                            .transition(order, OrderStatus::Rejected, Some("cancel_status_rejected"))?;
+                        self.state_machine.transition(
+                            order,
+                            OrderStatus::Rejected,
+                            Some("cancel_status_rejected"),
+                        )?;
                         order.error_message = Some("cancel_not_applied_order_rejected".into());
-                        self.persist_transition(order, "rejected", command_id, Some("failed")).await?;
+                        self.persist_transition(order, "rejected", command_id, Some("failed"))
+                            .await?;
                         Ok(false)
                     }
                     _ => {
@@ -937,17 +1057,21 @@ impl ExecutionEngine {
                 if let Some(first) = statuses.first() {
                     if let Some(s) = first.as_str() {
                         if s.eq_ignore_ascii_case("success") {
-                            return self.mark_cancelled(order, "cancel_exchange_success", command_id).await;
+                            return self
+                                .mark_cancelled(order, "cancel_exchange_success", command_id)
+                                .await;
                         }
                     } else if first.get("error").is_some() {
                         let msg = first["error"].to_string();
                         order.error_message = Some(msg);
-                        self.persist_transition(order, "cancel_failed", command_id, Some("failed")).await?;
+                        self.persist_transition(order, "cancel_failed", command_id, Some("failed"))
+                            .await?;
                         tracing::warn!(cloid = %cloid, "cancel_order_rejected");
                         return Ok(false);
                     }
                 }
-                self.mark_cancel_unknown(order, "unknown_cancel_response", command_id).await;
+                self.mark_cancel_unknown(order, "unknown_cancel_response", command_id)
+                    .await;
                 Ok(false)
             }
             "err" => {
@@ -956,12 +1080,14 @@ impl ExecutionEngine {
                     .map(|r| r.to_string())
                     .unwrap_or_else(|| "cancel_rejected".into());
                 order.error_message = Some(msg);
-                self.persist_transition(order, "cancel_failed", command_id, Some("failed")).await?;
+                self.persist_transition(order, "cancel_failed", command_id, Some("failed"))
+                    .await?;
                 tracing::warn!(cloid = %cloid, "cancel_order_rejected");
                 Ok(false)
             }
             _ => {
-                self.mark_cancel_unknown(order, "unknown_cancel_response", command_id).await;
+                self.mark_cancel_unknown(order, "unknown_cancel_response", command_id)
+                    .await;
                 Ok(false)
             }
         }
@@ -973,9 +1099,11 @@ impl ExecutionEngine {
         reason: &str,
         command_id: Option<uuid::Uuid>,
     ) -> Result<bool, HypeEdgeError> {
-        self.state_machine.transition(order, OrderStatus::Cancelled, Some(reason))?;
+        self.state_machine
+            .transition(order, OrderStatus::Cancelled, Some(reason))?;
         order.error_message = None;
-        self.persist_transition(order, "cancelled", command_id, Some("succeeded")).await?;
+        self.persist_transition(order, "cancelled", command_id, Some("succeeded"))
+            .await?;
         self.publish(DomainEvent::OrderCancelled(order.clone()), &order.cloid);
         tracing::info!(cloid = %order.cloid, reason, "order_cancelled");
         Ok(true)
@@ -1010,9 +1138,12 @@ impl ExecutionEngine {
             .ok_or_else(|| HypeEdgeError::Execution {
                 message: "cancel command missing cloid".into(),
             })?;
-        let store = self.durable_store.as_ref().ok_or_else(|| HypeEdgeError::Execution {
-            message: "cancel command requires durable store".into(),
-        })?;
+        let store = self
+            .durable_store
+            .as_ref()
+            .ok_or_else(|| HypeEdgeError::Execution {
+                message: "cancel command requires durable store".into(),
+            })?;
         let mut order = store
             .get_order(cloid)
             .await?
@@ -1027,8 +1158,13 @@ impl ExecutionEngine {
             } else {
                 "failed"
             };
-            self.persist_transition(&order, "cancel_recovered_terminal", Some(command.command_id), Some(status))
-                .await?;
+            self.persist_transition(
+                &order,
+                "cancel_recovered_terminal",
+                Some(command.command_id),
+                Some(status),
+            )
+            .await?;
             return Ok(true);
         }
 
@@ -1050,13 +1186,18 @@ impl ExecutionEngine {
                     if matches!(exchange_status.as_str(), "open" | "resting" | "triggered") {
                         // Still live: proceed to send the cancel.
                     } else {
-                        self.handle_cancel_response(&mut order, resp, Some(command.command_id)).await?;
+                        self.handle_cancel_response(&mut order, resp, Some(command.command_id))
+                            .await?;
                         return Ok(order.status != OrderStatus::CancelUnknown);
                     }
                 }
                 None => {
-                    self.mark_cancel_unknown(&mut order, "cancel_recovery_status_unknown", Some(command.command_id))
-                        .await;
+                    self.mark_cancel_unknown(
+                        &mut order,
+                        "cancel_recovery_status_unknown",
+                        Some(command.command_id),
+                    )
+                    .await;
                     return Ok(false);
                 }
             }
@@ -1065,14 +1206,17 @@ impl ExecutionEngine {
         // Send the cancel by cloid through the serial nonce queue.
         match self.submit_cancel_by_cloid(&order).await? {
             CancelSubmit::Response(value) => {
-                self.handle_cancel_response(&mut order, value, Some(command.command_id)).await
+                self.handle_cancel_response(&mut order, value, Some(command.command_id))
+                    .await
             }
             CancelSubmit::Failed(msg) => {
-                self.mark_cancel_unknown(&mut order, &msg, Some(command.command_id)).await;
+                self.mark_cancel_unknown(&mut order, &msg, Some(command.command_id))
+                    .await;
                 Ok(false)
             }
             CancelSubmit::Timeout => {
-                self.mark_cancel_unknown(&mut order, "cancel_timeout", Some(command.command_id)).await;
+                self.mark_cancel_unknown(&mut order, "cancel_timeout", Some(command.command_id))
+                    .await;
                 Ok(false)
             }
         }
@@ -1091,7 +1235,9 @@ impl ExecutionEngine {
                 let exchange = exchange.clone();
                 let hl = hl.clone();
                 Box::pin(async move {
-                    exchange.cancel_by_cloid(vec![CancelByCloidWire { asset, cloid: hl }], nonce).await
+                    exchange
+                        .cancel_by_cloid(vec![CancelByCloidWire { asset, cloid: hl }], nonce)
+                        .await
                 })
             }),
         )
@@ -1109,11 +1255,13 @@ impl ExecutionEngine {
                 message: "no asset index provider".into(),
             });
         };
-        index_provider.asset_index(symbol).ok_or_else(|| HypeEdgeError::order_rejected(
-            format!("unknown symbol {symbol}"),
-            Some(cloid.to_string()),
-            Some("instrument_meta_unavailable".to_string()),
-        ))
+        index_provider.asset_index(symbol).ok_or_else(|| {
+            HypeEdgeError::order_rejected(
+                format!("unknown symbol {symbol}"),
+                Some(cloid.to_string()),
+                Some("instrument_meta_unavailable".to_string()),
+            )
+        })
     }
 
     // --- Persistence helpers ---
@@ -1177,10 +1325,9 @@ impl ExecutionEngine {
     }
 
     fn rejected_order(&self, intent: &OrderIntent, reason: &str) -> Order {
-        let cloid = intent
-            .cloid
-            .clone()
-            .unwrap_or_else(|| CloidGenerator::deterministic(intent.strategy_id.as_deref(), &intent_key(intent)));
+        let cloid = intent.cloid.clone().unwrap_or_else(|| {
+            CloidGenerator::deterministic(intent.strategy_id.as_deref(), &intent_key(intent))
+        });
         let order = Order {
             cloid,
             symbol: intent.symbol.clone(),
@@ -1197,7 +1344,15 @@ impl ExecutionEngine {
             risk_reducing: intent.risk_reducing,
             max_slippage_bps: intent.max_slippage_bps,
             error_message: Some(reason.to_string()),
-            ..Order::new("".into(), "".into(), Side::Buy, Size::ZERO, None, OrderType::Limit, TimeInForce::Gtc)
+            ..Order::new(
+                "".into(),
+                "".into(),
+                Side::Buy,
+                Size::ZERO,
+                None,
+                OrderType::Limit,
+                TimeInForce::Gtc,
+            )
         };
         self.publish(DomainEvent::OrderRejected(order.clone()), &order.cloid);
         order
@@ -1253,9 +1408,12 @@ impl ExecutionEngine {
             .ok_or_else(|| HypeEdgeError::Execution {
                 message: "durable command missing cloid".into(),
             })?;
-        let store = self.durable_store.as_ref().ok_or_else(|| HypeEdgeError::Execution {
-            message: "durable command requires durable store".into(),
-        })?;
+        let store = self
+            .durable_store
+            .as_ref()
+            .ok_or_else(|| HypeEdgeError::Execution {
+                message: "durable command requires durable store".into(),
+            })?;
         let mut order = store
             .get_order(cloid)
             .await?
@@ -1276,26 +1434,44 @@ impl ExecutionEngine {
                 .map_err(|e| HypeEdgeError::Execution { message: e })?;
             let Some(response) = response else {
                 if order.status != OrderStatus::SubmitUnknown {
-                    self.state_machine
-                        .transition(&mut order, OrderStatus::SubmitUnknown, Some("lease_recovery_unknown"))?;
+                    self.state_machine.transition(
+                        &mut order,
+                        OrderStatus::SubmitUnknown,
+                        Some("lease_recovery_unknown"),
+                    )?;
                 }
-                order.error_message = Some("exchange_order_not_found_after_ambiguous_submission".into());
-                self.persist_transition(&order, "submit_unknown", Some(command.command_id), Some("unknown"))
-                    .await?;
+                order.error_message =
+                    Some("exchange_order_not_found_after_ambiguous_submission".into());
+                self.persist_transition(
+                    &order,
+                    "submit_unknown",
+                    Some(command.command_id),
+                    Some("unknown"),
+                )
+                .await?;
                 return Ok(false);
             };
-            self.handle_submit_response(&mut order, response, Some(command.command_id)).await?;
+            self.handle_submit_response(&mut order, response, Some(command.command_id))
+                .await?;
             return Ok(order.status != OrderStatus::SubmitUnknown);
         }
 
         let intent = Self::intent_from_order(&order);
         // Re-run the gates before dispatch.
         if let Err(e) = self.run_gates(&intent).await {
-            self.state_machine
-                .transition(&mut order, OrderStatus::Cancelled, Some("dispatch_aborted_by_safety_gate"))?;
+            self.state_machine.transition(
+                &mut order,
+                OrderStatus::Cancelled,
+                Some("dispatch_aborted_by_safety_gate"),
+            )?;
             order.error_message = Some(e.to_string());
-            self.persist_transition(&order, "dispatch_aborted", Some(command.command_id), Some("cancelled"))
-                .await?;
+            self.persist_transition(
+                &order,
+                "dispatch_aborted",
+                Some(command.command_id),
+                Some("cancelled"),
+            )
+            .await?;
             self.publish(DomainEvent::OrderCancelled(order.clone()), &order.cloid);
             return Ok(true);
         }
@@ -1306,22 +1482,44 @@ impl ExecutionEngine {
             let reference_price = order.price.map(|p| p.inner());
             let result = checker.check(&intent, reference_price).await;
             if !result.passed {
-                let reason = result.reason.unwrap_or_else(|| "risk_check_rejected".into());
-                self.state_machine
-                    .transition(&mut order, OrderStatus::Cancelled, Some("dispatch_aborted_by_risk"))?;
+                let reason = result
+                    .reason
+                    .unwrap_or_else(|| "risk_check_rejected".into());
+                self.state_machine.transition(
+                    &mut order,
+                    OrderStatus::Cancelled,
+                    Some("dispatch_aborted_by_risk"),
+                )?;
                 order.error_message = Some(reason.clone());
-                self.persist_transition(&order, "dispatch_aborted", Some(command.command_id), Some("cancelled"))
-                    .await?;
+                self.persist_transition(
+                    &order,
+                    "dispatch_aborted",
+                    Some(command.command_id),
+                    Some("cancelled"),
+                )
+                .await?;
                 self.publish(DomainEvent::OrderCancelled(order.clone()), &order.cloid);
                 return Ok(true);
             }
         }
-        if self.rate_limiter.as_ref().is_some_and(|rl| !rl.check_action_credits()) {
-            self.state_machine
-                .transition(&mut order, OrderStatus::Cancelled, Some("dispatch_aborted_by_safety_gate"))?;
+        if self
+            .rate_limiter
+            .as_ref()
+            .is_some_and(|rl| !rl.check_action_credits())
+        {
+            self.state_machine.transition(
+                &mut order,
+                OrderStatus::Cancelled,
+                Some("dispatch_aborted_by_safety_gate"),
+            )?;
             order.error_message = Some("action_credits_below_threshold".into());
-            self.persist_transition(&order, "dispatch_aborted", Some(command.command_id), Some("cancelled"))
-                .await?;
+            self.persist_transition(
+                &order,
+                "dispatch_aborted",
+                Some(command.command_id),
+                Some("cancelled"),
+            )
+            .await?;
             self.publish(DomainEvent::OrderCancelled(order.clone()), &order.cloid);
             return Ok(true);
         }
@@ -1344,36 +1542,65 @@ impl ExecutionEngine {
                 reference_price = Some(snap.price);
             }
         }
-        let outcome = self.submit_to_exchange(&intent, cloid, reference_price).await;
+        let outcome = self
+            .submit_to_exchange(&intent, cloid, reference_price)
+            .await;
         match outcome {
             SubmitOutcome::Response(resp) => {
                 if let Some(hook) = &after_send_hook {
                     hook(command);
                 }
-                self.handle_submit_response(&mut order, resp, Some(command.command_id)).await?;
+                self.handle_submit_response(&mut order, resp, Some(command.command_id))
+                    .await?;
                 Ok(order.status != OrderStatus::SubmitUnknown)
             }
             SubmitOutcome::SafetyAborted(e) => {
-                self.state_machine
-                    .transition(&mut order, OrderStatus::Cancelled, Some("dispatch_aborted_by_safety_gate"))?;
+                self.state_machine.transition(
+                    &mut order,
+                    OrderStatus::Cancelled,
+                    Some("dispatch_aborted_by_safety_gate"),
+                )?;
                 order.error_message = Some(e.to_string());
-                self.persist_transition(&order, "dispatch_aborted", Some(command.command_id), Some("cancelled"))
-                    .await?;
+                self.persist_transition(
+                    &order,
+                    "dispatch_aborted",
+                    Some(command.command_id),
+                    Some("cancelled"),
+                )
+                .await?;
                 self.publish(DomainEvent::OrderCancelled(order.clone()), &order.cloid);
                 Ok(true)
             }
             SubmitOutcome::Timeout => {
-                self.state_machine
-                    .transition(&mut order, OrderStatus::SubmitUnknown, Some("submit_timeout"))?;
+                self.state_machine.transition(
+                    &mut order,
+                    OrderStatus::SubmitUnknown,
+                    Some("submit_timeout"),
+                )?;
                 order.error_message = Some("exchange_action_outcome_unknown".into());
-                self.persist_transition(&order, "submit_unknown", Some(command.command_id), Some("unknown"))
-                    .await?;
+                self.persist_transition(
+                    &order,
+                    "submit_unknown",
+                    Some(command.command_id),
+                    Some("unknown"),
+                )
+                .await?;
                 Ok(false)
             }
             SubmitOutcome::Rejected(msg) => {
-                self.state_machine.transition(&mut order, OrderStatus::Rejected, Some("exchange_err"))?;
+                self.state_machine.transition(
+                    &mut order,
+                    OrderStatus::Rejected,
+                    Some("exchange_err"),
+                )?;
                 order.error_message = Some(msg);
-                self.persist_transition(&order, "rejected", Some(command.command_id), Some("failed")).await?;
+                self.persist_transition(
+                    &order,
+                    "rejected",
+                    Some(command.command_id),
+                    Some("failed"),
+                )
+                .await?;
                 self.publish(DomainEvent::OrderRejected(order.clone()), &order.cloid);
                 Ok(true)
             }
@@ -1400,7 +1627,10 @@ impl ExecutionEngine {
 
     /// Durably import exchange truth before it can be cancelled locally (port
     /// of `import_exchange_order_authoritative`).
-    pub async fn import_exchange_order_authoritative(&self, order: Order) -> Result<(), HypeEdgeError> {
+    pub async fn import_exchange_order_authoritative(
+        &self,
+        order: Order,
+    ) -> Result<(), HypeEdgeError> {
         if let Some(store) = &self.durable_store {
             store.persist_reconciled_order(&order).await?;
         }
@@ -1409,7 +1639,10 @@ impl ExecutionEngine {
     }
 
     /// Refresh one committed exchange projection into process memory.
-    pub async fn refresh_order_from_durable(&self, cloid: &str) -> Result<Option<Order>, HypeEdgeError> {
+    pub async fn refresh_order_from_durable(
+        &self,
+        cloid: &str,
+    ) -> Result<Option<Order>, HypeEdgeError> {
         match &self.durable_store {
             Some(store) => {
                 let order = store.get_order(cloid).await?;
@@ -1485,7 +1718,11 @@ impl ExecutionClient for ExecutionEngine {
             return Ok(false);
         };
         if order.is_terminal() {
-            tracing::warn!(cloid, status = order.status.as_str(), "cancel_order_already_terminal");
+            tracing::warn!(
+                cloid,
+                status = order.status.as_str(),
+                "cancel_order_already_terminal"
+            );
             return Ok(false);
         }
 
@@ -1497,18 +1734,22 @@ impl ExecutionClient for ExecutionEngine {
         // Send the cancel by cloid through the serial nonce queue.
         match self.submit_cancel_by_cloid(&order).await? {
             CancelSubmit::Response(value) => {
-                let accepted = self.handle_cancel_response(&mut order, value, Some(command_id)).await?;
+                let accepted = self
+                    .handle_cancel_response(&mut order, value, Some(command_id))
+                    .await?;
                 self.store(&order).await;
                 Ok(accepted)
             }
             CancelSubmit::Failed(msg) => {
-                self.mark_cancel_unknown(&mut order, &msg, Some(command_id)).await;
+                self.mark_cancel_unknown(&mut order, &msg, Some(command_id))
+                    .await;
                 self.store(&order).await;
                 tracing::warn!(cloid, error = %msg, "cancel_order_unknown");
                 Ok(false)
             }
             CancelSubmit::Timeout => {
-                self.mark_cancel_unknown(&mut order, "cancel_timeout", Some(command_id)).await;
+                self.mark_cancel_unknown(&mut order, "cancel_timeout", Some(command_id))
+                    .await;
                 self.store(&order).await;
                 tracing::warn!(cloid, "cancel_order_unknown_timeout");
                 Ok(false)
@@ -1614,9 +1855,18 @@ mod tests {
             if self.order_error {
                 return Err("transport_error".into());
             }
-            Ok(self.responses.lock().await.pop_front().unwrap_or(Value::Null))
+            Ok(self
+                .responses
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or(Value::Null))
         }
-        async fn cancel(&self, _cancels: Vec<crate::execution::signing::CancelWire>, _nonce: u64) -> Result<Value, String> {
+        async fn cancel(
+            &self,
+            _cancels: Vec<crate::execution::signing::CancelWire>,
+            _nonce: u64,
+        ) -> Result<Value, String> {
             self.submitted.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(Value::Null)
         }
@@ -1626,7 +1876,12 @@ mod tests {
             _nonce: u64,
         ) -> Result<Value, String> {
             self.submitted.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok(self.responses.lock().await.pop_front().unwrap_or(Value::Null))
+            Ok(self
+                .responses
+                .lock()
+                .await
+                .pop_front()
+                .unwrap_or(Value::Null))
         }
         async fn update_leverage(
             &self,
@@ -1817,7 +2072,13 @@ mod tests {
         let engine = base_engine(exchange);
         let order = engine.submit_order(limit_intent(), None).await.unwrap();
         assert_eq!(order.status, OrderStatus::Rejected);
-        assert!(order.error_message.as_deref().unwrap().contains("Invalid price"));
+        assert!(
+            order
+                .error_message
+                .as_deref()
+                .unwrap()
+                .contains("Invalid price")
+        );
     }
 
     #[tokio::test]
@@ -1923,7 +2184,10 @@ mod tests {
         });
         let order = engine.submit_order(limit_intent(), None).await.unwrap();
         assert_eq!(order.status, OrderStatus::Rejected);
-        assert_eq!(order.error_message.as_deref(), Some("account_state_not_available"));
+        assert_eq!(
+            order.error_message.as_deref(),
+            Some("account_state_not_available")
+        );
     }
 
     #[tokio::test]
@@ -2038,7 +2302,11 @@ mod tests {
             1,
             "placement must debit the action ledger (B3)"
         );
-        assert_eq!(state.fills.len(), 1, "immediate fill must credit quota (B3)");
+        assert_eq!(
+            state.fills.len(),
+            1,
+            "immediate fill must credit quota (B3)"
+        );
         assert_eq!(state.fills[0].volume_usdc.to_string(), "100");
     }
 
@@ -2116,7 +2384,11 @@ mod tests {
         );
         let engine = base_engine(exchange);
         let order = engine.submit_order(limit_intent(), None).await.unwrap();
-        assert_eq!(order.status, OrderStatus::Filled, "cloid resolution must apply the authoritative outcome");
+        assert_eq!(
+            order.status,
+            OrderStatus::Filled,
+            "cloid resolution must apply the authoritative outcome"
+        );
         assert!(order.filled_at.is_some());
     }
 

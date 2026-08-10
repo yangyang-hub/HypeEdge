@@ -49,7 +49,6 @@ fn valid_cloid(n: u64) -> String {
     format!("0x{n:032x}")
 }
 
-
 /// Cross-binary serialization: every integration test binary shares one DB, so
 /// each test holds a Postgres advisory lock to stop concurrent `clean_tables`
 /// calls from clobbering another test's rows. The connection is returned; the
@@ -481,7 +480,14 @@ async fn system_order_cancel_does_not_violate_unique_command_key() {
     order.strategy_id = None; // system order -> actor_id 'execution_engine'
     order.status = OrderStatus::Submitted;
     store
-        .persist_placement(&pool, &mut order, &passing_risk(), Uuid::new_v4(), true, None)
+        .persist_placement(
+            &pool,
+            &mut order,
+            &passing_risk(),
+            Uuid::new_v4(),
+            true,
+            None,
+        )
         .await
         .expect("placement persists for a system order");
 
@@ -520,7 +526,14 @@ async fn immediate_fill_persists_fill_fields() {
     let mut order = make_order(&cloid, Side::Buy, "0.1", Some("100"));
     order.status = OrderStatus::Submitted;
     store
-        .persist_placement(&pool, &mut order, &passing_risk(), Uuid::new_v4(), true, None)
+        .persist_placement(
+            &pool,
+            &mut order,
+            &passing_risk(),
+            Uuid::new_v4(),
+            true,
+            None,
+        )
         .await
         .expect("placement persists");
 
@@ -529,11 +542,18 @@ async fn immediate_fill_persists_fill_fields() {
     let mut filled = order.clone();
     filled.status = OrderStatus::Filled;
     filled.filled_size = hypeedge_domain::Size::new(Decimal::from_str_strict("0.1").unwrap());
-    filled.avg_fill_price =
-        Some(hypeedge_domain::Price::new(Decimal::from_str_strict("99").unwrap()));
+    filled.avg_fill_price = Some(hypeedge_domain::Price::new(
+        Decimal::from_str_strict("99").unwrap(),
+    ));
     filled.filled_at = Some(Utc::now());
     store
-        .persist_transition(&pool, &filled, "filled", Some(Uuid::new_v4()), Some("succeeded"))
+        .persist_transition(
+            &pool,
+            &filled,
+            "filled",
+            Some(Uuid::new_v4()),
+            Some("succeeded"),
+        )
         .await
         .expect("fill transition persists");
 
@@ -548,7 +568,10 @@ async fn immediate_fill_persists_fill_fields() {
     assert_eq!(status, "filled");
     // NUMERIC(38,18) renders the full scale; the fix is that this is the real
     // fill (not `0`), proving merge_transport_transition persists fill fields.
-    assert_eq!(filled_size, "0.100000000000000000", "filled_size must be persisted (A11)");
+    assert_eq!(
+        filled_size, "0.100000000000000000",
+        "filled_size must be persisted (A11)"
+    );
     assert_eq!(avg_fill_price.as_deref(), Some("99.000000000000000000"));
     assert!(filled_at.is_some(), "filled_at must be persisted (A11)");
 }
@@ -573,6 +596,10 @@ async fn pooled_adapter_implements_durable_order_store_trait() {
         .await
         .unwrap();
     assert!(result.passed, "placement via trait adapter: {result:?}");
-    let loaded = store.get_order(&cloid).await.unwrap().expect("order persisted");
+    let loaded = store
+        .get_order(&cloid)
+        .await
+        .unwrap()
+        .expect("order persisted");
     assert_eq!(loaded.cloid, cloid);
 }

@@ -402,7 +402,11 @@ mod tests {
         for seq in 0..20 {
             broker.publish(&durable(seq)).await;
         }
-        assert_eq!(broker.replay.lock().unwrap().len(), 5, "replay ring bounded (C4)");
+        assert_eq!(
+            broker.replay.lock().unwrap().len(),
+            5,
+            "replay ring bounded (C4)"
+        );
     }
 
     #[tokio::test]
@@ -429,11 +433,9 @@ mod tests {
             hypeedge_domain::enums::OrderType::Limit,
             hypeedge_domain::enums::TimeInForce::Gtc,
         );
-        bus.publish_sync(Arc::new(
-            hypeedge_domain::events::Event::new(
-                hypeedge_domain::events::DomainEvent::OrderSubmitted(order),
-            ),
-        ))
+        bus.publish_sync(Arc::new(hypeedge_domain::events::Event::new(
+            hypeedge_domain::events::DomainEvent::OrderSubmitted(order),
+        )))
         .expect("publish");
 
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
