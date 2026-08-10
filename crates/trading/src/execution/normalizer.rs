@@ -85,10 +85,13 @@ impl OrderNormalizer {
         best_bid: Option<Decimal>,
         best_ask: Option<Decimal>,
     ) -> Result<OrderIntent, HypeEdgeError> {
-        let spec = self
-            .instruments
-            .get(&intent.symbol)
-            .ok_or_else(|| self.reject(&intent.symbol, "instrument_meta_unavailable", "Instrument metadata is unavailable"))?;
+        let spec = self.instruments.get(&intent.symbol).ok_or_else(|| {
+            self.reject(
+                &intent.symbol,
+                "instrument_meta_unavailable",
+                "Instrument metadata is unavailable",
+            )
+        })?;
 
         let size = Self::floor_to_step(intent.size.inner(), spec.lot_size);
         if size < spec.min_size {
@@ -126,7 +129,10 @@ impl OrderNormalizer {
                 return Err(self.reject(
                     &intent.symbol,
                     "notional_below_minimum",
-                    &format!("Normalized notional {} is below {min_notional}", size.mul(price)),
+                    &format!(
+                        "Normalized notional {} is below {min_notional}",
+                        size.mul(price)
+                    ),
                 ));
             }
         }
@@ -169,7 +175,9 @@ impl OrderNormalizer {
         }
         let significant_figures = spec.max_significant_figures.max(1) as i32;
         let significant_decimals = (significant_figures - adjusted(&value) - 1).max(0);
-        let allowed_decimals = (max_decimals.unwrap() as i32).min(significant_decimals).clamp(0, 18);
+        let allowed_decimals = (max_decimals.unwrap() as i32)
+            .min(significant_decimals)
+            .clamp(0, 18);
         // "1e-N" parses under the lenient mode (strict rejects exponents); a
         // sub-1e-18 dynamic step cannot be represented at scale 18 — the tick
         // size dominates at that point anyway.
@@ -267,7 +275,9 @@ mod tests {
     #[test]
     fn rejects_size_below_minimum() {
         let n = normalizer(spec("0.1", "0.001", "0.01"));
-        let err = n.normalize(&intent("100", "0.001"), None, None).unwrap_err();
+        let err = n
+            .normalize(&intent("100", "0.001"), None, None)
+            .unwrap_err();
         assert!(matches!(
             err,
             HypeEdgeError::OrderNormalization { ref reason, .. } if reason == "size_below_minimum"
@@ -297,7 +307,9 @@ mod tests {
         let mut s = spec("0.00001", "0.00001", "0.00001");
         s.max_price_decimals = Some(5);
         let n = normalizer(s);
-        let out = n.normalize(&intent("0.12345999", "10.0"), None, None).unwrap();
+        let out = n
+            .normalize(&intent("0.12345999", "10.0"), None, None)
+            .unwrap();
         assert_eq!(out.price.unwrap().inner().to_exact_string(), "0.12345");
     }
 
@@ -332,7 +344,9 @@ mod tests {
         let n = normalizer(spec("0.1", "0.001", "0.001"));
         let mut i = intent("100", "1.0");
         i.time_in_force = TimeInForce::Alo;
-        let err = n.normalize(&i, None, Some(Decimal::from_str_strict("99.9").unwrap())).unwrap_err();
+        let err = n
+            .normalize(&i, None, Some(Decimal::from_str_strict("99.9").unwrap()))
+            .unwrap_err();
         assert!(matches!(
             err,
             HypeEdgeError::OrderNormalization { ref reason, .. } if reason == "post_only_would_cross"

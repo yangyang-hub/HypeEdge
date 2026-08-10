@@ -39,16 +39,27 @@ impl DuckDBExporter {
         }
         let conn = duckdb::Connection::open(path).map_err(|e| format!("open duckdb: {e}"))?;
 
-        let col_list: Vec<String> = data.columns.iter().map(|c| format!("\"{c}\" VARCHAR")).collect();
-        let ddl = format!("CREATE TABLE IF NOT EXISTS {table} ({})", col_list.join(", "));
-        conn.execute(&ddl, []).map_err(|e| format!("create table: {e}"))?;
+        let col_list: Vec<String> = data
+            .columns
+            .iter()
+            .map(|c| format!("\"{c}\" VARCHAR"))
+            .collect();
+        let ddl = format!(
+            "CREATE TABLE IF NOT EXISTS {table} ({})",
+            col_list.join(", ")
+        );
+        conn.execute(&ddl, [])
+            .map_err(|e| format!("create table: {e}"))?;
 
         let placeholders = vec!["?".to_string(); data.columns.len()].join(", ");
         let insert_sql = format!("INSERT INTO {table} VALUES ({placeholders})");
 
         let mut written = 0usize;
         for row in &data.rows {
-            let params = row.iter().map(|v| duckdb::types::Value::Text(v.clone().unwrap_or_default())).collect::<Vec<_>>();
+            let params = row
+                .iter()
+                .map(|v| duckdb::types::Value::Text(v.clone().unwrap_or_default()))
+                .collect::<Vec<_>>();
             conn.execute(&insert_sql, duckdb::params_from_iter(params))
                 .map_err(|e| format!("insert: {e}"))?;
             written += 1;
@@ -85,8 +96,16 @@ mod tests {
         let data = fetched_table(
             vec!["ts".into(), "coin".into(), "px".into()],
             vec![
-                vec![Some("1700000000".into()), Some("BTC".into()), Some("100.5".into())],
-                vec![Some("1700003600".into()), Some("BTC".into()), Some("101.0".into())],
+                vec![
+                    Some("1700000000".into()),
+                    Some("BTC".into()),
+                    Some("100.5".into()),
+                ],
+                vec![
+                    Some("1700003600".into()),
+                    Some("BTC".into()),
+                    Some("101.0".into()),
+                ],
             ],
         );
         let n = exporter.export_table("candles", &data).unwrap();
@@ -94,9 +113,13 @@ mod tests {
 
         // Reopen and verify.
         let conn = duckdb::Connection::open(&tmp).unwrap();
-        let count: i64 = conn.query_row("SELECT count(*) FROM candles", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM candles", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 2);
-        let px: String = conn.query_row("SELECT px FROM candles LIMIT 1", [], |r| r.get(0)).unwrap();
+        let px: String = conn
+            .query_row("SELECT px FROM candles LIMIT 1", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(px, "100.5");
         let _ = std::fs::remove_file(&tmp);
     }

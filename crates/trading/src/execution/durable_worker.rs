@@ -110,9 +110,8 @@ impl SignedActionExecutor {
         let after_send = self.fault_injector.clone();
         let after_send_hook: Option<Box<AfterSendHook>> = after_send.map(|inj| {
             let command = command.clone();
-            Box::new(move |_claimed: &DurableExecutionCommand| {
-                inj.inject("after_send", &command)
-            }) as Box<AfterSendHook>
+            Box::new(move |_claimed: &DurableExecutionCommand| inj.inject("after_send", &command))
+                as Box<AfterSendHook>
         });
 
         let resolved = if command.command_type == "cancel_order" {
@@ -126,7 +125,10 @@ impl SignedActionExecutor {
         };
         if !resolved {
             self.queue
-                .defer_unknown(command.command_id, "cloid lookup did not prove a terminal outcome")
+                .defer_unknown(
+                    command.command_id,
+                    "cloid lookup did not prove a terminal outcome",
+                )
                 .await?;
         }
         Ok(true)
@@ -215,7 +217,13 @@ mod tests {
             &self,
             command: &DurableExecutionCommand,
         ) -> Result<bool, HypeEdgeError> {
-            let resolved = self.results.lock().unwrap().get(&command.command_id).copied().unwrap_or(true);
+            let resolved = self
+                .results
+                .lock()
+                .unwrap()
+                .get(&command.command_id)
+                .copied()
+                .unwrap_or(true);
             self.dispatched
                 .lock()
                 .unwrap()
@@ -228,14 +236,18 @@ mod tests {
             command: &DurableExecutionCommand,
             after_send_hook: Option<Box<AfterSendHook>>,
         ) -> Result<bool, HypeEdgeError> {
-            let resolved = self.results.lock().unwrap().get(&command.command_id).copied().unwrap_or(true);
+            let resolved = self
+                .results
+                .lock()
+                .unwrap()
+                .get(&command.command_id)
+                .copied()
+                .unwrap_or(true);
             self.dispatched
                 .lock()
                 .unwrap()
                 .push((command.command_type.clone(), resolved));
-            if resolved
-                && let Some(hook) = after_send_hook
-            {
+            if resolved && let Some(hook) = after_send_hook {
                 hook(command);
             }
             Ok(resolved)
@@ -325,7 +337,10 @@ mod tests {
         let worker = worker_with(queue, dispatcher).with_fault_injector(injector.clone());
         worker.run_once().await.unwrap();
         let phases = injector.phases.lock().unwrap().clone();
-        assert_eq!(phases, vec!["before_send".to_string(), "after_send".to_string()]);
+        assert_eq!(
+            phases,
+            vec!["before_send".to_string(), "after_send".to_string()]
+        );
     }
 
     #[tokio::test]

@@ -74,10 +74,7 @@ impl DedupFilter {
                     .cloned()
                     .collect();
                 self.order = keep.clone().into();
-                self.seen = keep
-                    .into_iter()
-                    .map(|k| (k, true))
-                    .collect();
+                self.seen = keep.into_iter().map(|k| (k, true)).collect();
             }
         }
     }

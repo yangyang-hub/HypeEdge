@@ -192,7 +192,9 @@ impl MarketMakerReplay {
         ending_mark_price: Price,
         assumption: Option<&ScenarioAssumption>,
     ) -> Result<MarketMakerReplayResult, String> {
-        let model = assumption.cloned().unwrap_or_else(|| default_assumption(scenario));
+        let model = assumption
+            .cloned()
+            .unwrap_or_else(|| default_assumption(scenario));
         let mut ledger = AccountingLedger::new();
         let mut orders: HashMap<String, ShadowReplayOrder> = HashMap::new();
         let mut fills: Vec<ReplayFill> = Vec::new();
@@ -252,8 +254,10 @@ impl MarketMakerReplay {
                             !order.cancelled
                                 && order.side == resting_side
                                 && e.event_time_ms >= order.active_at_ms
-                                && ((order.side == Side::Buy && order.price.inner() >= e.price.inner())
-                                    || (order.side == Side::Sell && order.price.inner() <= e.price.inner()))
+                                && ((order.side == Side::Buy
+                                    && order.price.inner() >= e.price.inner())
+                                    || (order.side == Side::Sell
+                                        && order.price.inner() <= e.price.inner()))
                         })
                         .collect();
                     eligible.sort_by(|a, b| {
@@ -436,7 +440,10 @@ mod tests {
             .unwrap();
         assert_eq!(result.accounting_pnl.funding, usd("0.5"));
         assert_eq!(result.accounting_pnl.paid_action, usd("0.1"));
-        result.accounting_pnl.assert_ledger_identity(usd("0.4")).unwrap();
+        result
+            .accounting_pnl
+            .assert_ledger_identity(usd("0.4"))
+            .unwrap();
     }
 
     #[test]
@@ -446,9 +453,11 @@ mod tests {
             quote("q1", Side::Buy, "100", "1", 0),
             quote("q1", Side::Buy, "100", "1", 5),
         ];
-        assert!(replay
-            .run(&events, ReplayScenario::Optimistic, px("100"), None)
-            .is_err());
+        assert!(
+            replay
+                .run(&events, ReplayScenario::Optimistic, px("100"), None)
+                .is_err()
+        );
     }
 
     #[test]

@@ -13,9 +13,7 @@ use hypeedge_domain::error::HypeEdgeError;
 use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
-use crate::config_version_store::{
-    ConfigVersionRecord, ConfigVersionStore, config_hash,
-};
+use crate::config_version_store::{ConfigVersionRecord, ConfigVersionStore, config_hash};
 use crate::durable_order_store::map_sqlx;
 
 /// The Postgres config-version repository.
@@ -80,13 +78,15 @@ impl ConfigVersionStore for PostgresConfigVersionStore {
 
         Ok(rows
             .into_iter()
-            .map(|(_id, version, hash, created_by, created_at, values)| ConfigVersionRecord {
-                version: version as u64,
-                config_hash: hash,
-                created_by,
-                created_at,
-                values,
-            })
+            .map(
+                |(_id, version, hash, created_by, created_at, values)| ConfigVersionRecord {
+                    version: version as u64,
+                    config_hash: hash,
+                    created_by,
+                    created_at,
+                    values,
+                },
+            )
             .collect())
     }
 

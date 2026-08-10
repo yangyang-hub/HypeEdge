@@ -61,7 +61,13 @@ impl BackfillCheckpointStore {
     }
 
     /// Update the checkpoint for a backfill key and flush to disk.
-    pub fn save(&mut self, endpoint: &str, coin: &str, interval: &str, last_ts: i64) -> Result<(), String> {
+    pub fn save(
+        &mut self,
+        endpoint: &str,
+        coin: &str,
+        interval: &str,
+        last_ts: i64,
+    ) -> Result<(), String> {
         let key = make_key(endpoint, coin, interval);
         self.data.insert(key, last_ts);
         self.flush()
@@ -101,7 +107,10 @@ mod tests {
     use super::*;
 
     fn temp_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("hypeedge_checkpoint_{tag}_{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "hypeedge_checkpoint_{tag}_{}",
+            uuid::Uuid::new_v4()
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
     }

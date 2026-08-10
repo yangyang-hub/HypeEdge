@@ -21,9 +21,7 @@ use hypeedge_domain::error::HypeEdgeError;
 use hypeedge_domain::models::{Order, OrderIntent};
 use uuid::Uuid;
 
-use super::batch::{
-    ChildActionType, DispatchGuardContext, GuardDecision, evaluate_dispatch_guard,
-};
+use super::batch::{ChildActionType, DispatchGuardContext, GuardDecision, evaluate_dispatch_guard};
 use crate::risk::action_budget::{ActionBudgetController, BudgetAction, NetworkAttemptDebit};
 
 /// A child action claimed by the quote-plan worker.
@@ -56,8 +54,14 @@ impl QuoteDispatchChild {
     pub fn request_payload(&self) -> Vec<u8> {
         let mut fields: Vec<(String, String)> = vec![
             ("action".into(), self.action.as_str().to_string()),
-            ("source_cloid".into(), self.source_cloid.clone().unwrap_or_default()),
-            ("target_cloid".into(), self.target_cloid.clone().unwrap_or_default()),
+            (
+                "source_cloid".into(),
+                self.source_cloid.clone().unwrap_or_default(),
+            ),
+            (
+                "target_cloid".into(),
+                self.target_cloid.clone().unwrap_or_default(),
+            ),
             ("symbol".into(), self.symbol.clone()),
             ("side".into(), self.side.as_str().to_string()),
             (
@@ -204,7 +208,8 @@ impl QuotePlanWorker {
     }
 
     pub fn stop(&self) {
-        self.stopped.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Claim one child from the store.
@@ -215,7 +220,8 @@ impl QuotePlanWorker {
     /// Dispatch one claimed child and record its outcome.
     pub async fn dispatch(&self, child: QuoteDispatchChild) -> Result<(), HypeEdgeError> {
         if child.action == ChildActionType::Place {
-            let decision = evaluate_dispatch_guard(child.action, &self.guards.context(&child).await);
+            let decision =
+                evaluate_dispatch_guard(child.action, &self.guards.context(&child).await);
             if decision != GuardDecision::Allow {
                 self.store
                     .finish_without_send(&child, decision, Utc::now())
@@ -227,24 +233,26 @@ impl QuotePlanWorker {
         let sent_at = Utc::now();
         let request_hash = sha256_hex(&child.request_payload());
         let (outcome, status, resolution) = match child.action {
-            ChildActionType::Cancel => {
-                match &child.source_cloid {
-                    None => ("rejected".to_string(), "failed".to_string(), Some("missing_source_cloid".to_string())),
-                    Some(cloid) => match self.executor.cancel_order(cloid).await {
-                        Ok(true) => ("succeeded".to_string(), "succeeded".to_string(), None),
-                        Ok(false) => (
-                            "unknown".to_string(),
-                            "unknown".to_string(),
-                            Some("cancel_result_not_authoritative".to_string()),
-                        ),
-                        Err(e) => (
-                            "transport_error".to_string(),
-                            "unknown".to_string(),
-                            Some(e.to_string()),
-                        ),
-                    },
-                }
-            }
+            ChildActionType::Cancel => match &child.source_cloid {
+                None => (
+                    "rejected".to_string(),
+                    "failed".to_string(),
+                    Some("missing_source_cloid".to_string()),
+                ),
+                Some(cloid) => match self.executor.cancel_order(cloid).await {
+                    Ok(true) => ("succeeded".to_string(), "succeeded".to_string(), None),
+                    Ok(false) => (
+                        "unknown".to_string(),
+                        "unknown".to_string(),
+                        Some("cancel_result_not_authoritative".to_string()),
+                    ),
+                    Err(e) => (
+                        "transport_error".to_string(),
+                        "unknown".to_string(),
+                        Some(e.to_string()),
+                    ),
+                },
+            },
             ChildActionType::Place => match self.executor.submit_order(child.intent()?).await {
                 Ok(order) => placement_outcome(&order),
                 Err(e) => (
@@ -303,12 +311,16 @@ fn placement_outcome(order: &Order) -> (String, String, Option<String>) {
         OrderStatus::Acknowledged | OrderStatus::PartialFill | OrderStatus::Filled => {
             ("succeeded".to_string(), "succeeded".to_string(), None)
         }
-        OrderStatus::SubmitUnknown => {
-            ("unknown".to_string(), "unknown".to_string(), order.error_message.clone())
-        }
-        OrderStatus::Rejected | OrderStatus::Cancelled | OrderStatus::Expired => {
-            ("rejected".to_string(), "failed".to_string(), order.error_message.clone())
-        }
+        OrderStatus::SubmitUnknown => (
+            "unknown".to_string(),
+            "unknown".to_string(),
+            order.error_message.clone(),
+        ),
+        OrderStatus::Rejected | OrderStatus::Cancelled | OrderStatus::Expired => (
+            "rejected".to_string(),
+            "failed".to_string(),
+            order.error_message.clone(),
+        ),
         other => (
             "unknown".to_string(),
             "unknown".to_string(),
@@ -327,8 +339,8 @@ fn sha256_hex(payload: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex as StdMutex;
     use std::collections::VecDeque;
+    use std::sync::Mutex as StdMutex;
 
     fn child() -> QuoteDispatchChild {
         QuoteDispatchChild {
@@ -409,7 +421,11 @@ mod tests {
         assert!(payload.contains("place"));
         assert!(payload.contains("buy"));
         c.action = ChildActionType::Cancel;
-        assert!(String::from_utf8(c.request_payload()).unwrap().contains("cancel"));
+        assert!(
+            String::from_utf8(c.request_payload())
+                .unwrap()
+                .contains("cancel")
+        );
     }
 
     // --- Worker dispatch tests with fakes ---
@@ -524,7 +540,10 @@ mod tests {
     #[async_trait]
     impl QuoteActionExecutor for FakeExecutor {
         async fn submit_order(&self, intent: OrderIntent) -> Result<Order, HypeEdgeError> {
-            self.submitted.lock().unwrap().push(intent.cloid.clone().unwrap_or_default());
+            self.submitted
+                .lock()
+                .unwrap()
+                .push(intent.cloid.clone().unwrap_or_default());
             let mut order = Order::new(
                 intent.cloid.clone().unwrap_or_default(),
                 intent.symbol,
@@ -589,7 +608,10 @@ mod tests {
             None,
         );
         worker.dispatch(c).await.unwrap();
-        assert_eq!(executor.cancelled.lock().unwrap().clone(), vec!["c0".to_string()]);
+        assert_eq!(
+            executor.cancelled.lock().unwrap().clone(),
+            vec!["c0".to_string()]
+        );
         let recorded = store.recorded();
         assert_eq!(recorded[0].1, "succeeded");
     }

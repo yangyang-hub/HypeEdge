@@ -26,12 +26,16 @@ async fn try_client() -> Option<Client> {
 #[tokio::test]
 async fn export_all_writes_duckdb_file() {
     let Some(ch) = try_client().await else {
-        eprintln!("SKIP: ClickHouse unreachable at {}; export test skipped", ch_url());
+        eprintln!(
+            "SKIP: ClickHouse unreachable at {}; export test skipped",
+            ch_url()
+        );
         return;
     };
     // Ensure the source tables exist (created by ClickHouseWriter; a missing
     // table would fail the query and the test).
-    let output = std::env::temp_dir().join(format!("hypeedge_export_{}.duckdb", std::process::id()));
+    let output =
+        std::env::temp_dir().join(format!("hypeedge_export_{}.duckdb", std::process::id()));
     let _ = std::fs::remove_file(&output);
     let path = output.to_string_lossy().to_string();
 
@@ -53,7 +57,8 @@ async fn export_all_writes_duckdb_file() {
 #[tokio::test]
 async fn export_unknown_table_errors() {
     let Some(ch) = try_client().await else { return };
-    let output = std::env::temp_dir().join(format!("hypeedge_export_bad_{}.duckdb", std::process::id()));
+    let output =
+        std::env::temp_dir().join(format!("hypeedge_export_bad_{}.duckdb", std::process::id()));
     let err = export_table(&ch, &output.to_string_lossy(), "nope", "BTC", 0, 1).await;
     assert!(err.is_err(), "unknown table must error");
 }

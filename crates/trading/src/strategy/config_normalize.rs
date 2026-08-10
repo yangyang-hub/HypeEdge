@@ -78,10 +78,15 @@ pub fn normalize_market_maker_config(values: &Value) -> Result<Value, HypeEdgeEr
     if !required.is_subset(&keys) || !keys.is_subset(&all_fields.iter().copied().collect()) {
         let mut missing: Vec<&str> = required.difference(&keys).copied().collect();
         missing.sort_unstable();
-        let mut extra: Vec<&str> = keys.difference(&all_fields.iter().copied().collect()).copied().collect();
+        let mut extra: Vec<&str> = keys
+            .difference(&all_fields.iter().copied().collect())
+            .copied()
+            .collect();
         extra.sort_unstable();
         return Err(HypeEdgeError::StrategyRegistration {
-            message: format!("Invalid market-maker config fields: missing={missing:?} extra={extra:?}"),
+            message: format!(
+                "Invalid market-maker config fields: missing={missing:?} extra={extra:?}"
+            ),
         });
     }
 
@@ -166,7 +171,9 @@ pub fn normalize_trend_follow_config(values: &Value) -> Result<Value, HypeEdgeEr
             .filter(|k| !all_fields.contains(k))
             .collect();
         return Err(HypeEdgeError::StrategyRegistration {
-            message: format!("Invalid trend-follow config fields: missing={missing:?} extra={extra:?}"),
+            message: format!(
+                "Invalid trend-follow config fields: missing={missing:?} extra={extra:?}"
+            ),
         });
     }
 
@@ -281,7 +288,9 @@ pub fn normalize_funding_arb_config(values: &Value) -> Result<Value, HypeEdgeErr
             .filter(|k| !all_fields.contains(k))
             .collect();
         return Err(HypeEdgeError::StrategyRegistration {
-            message: format!("Invalid funding-arb config fields: missing={missing:?} extra={extra:?}"),
+            message: format!(
+                "Invalid funding-arb config fields: missing={missing:?} extra={extra:?}"
+            ),
         });
     }
 
@@ -466,11 +475,7 @@ fn trim_decimal(s: &str) -> String {
         } else {
             format!("{int_part}.{frac}")
         };
-        return if neg {
-            format!("-{out}")
-        } else {
-            out
-        };
+        return if neg { format!("-{out}") } else { out };
     }
     if neg && rest != "0" {
         format!("-{rest}")
@@ -486,11 +491,13 @@ fn int_value(value: &Value) -> Result<i64, HypeEdgeError> {
             .ok_or_else(|| HypeEdgeError::StrategyRegistration {
                 message: "config field must be an integer".into(),
             }),
-        Value::String(s) => s.trim().parse::<i64>().map_err(|_| {
-            HypeEdgeError::StrategyRegistration {
-                message: "config field must be an integer".into(),
-            }
-        }),
+        Value::String(s) => {
+            s.trim()
+                .parse::<i64>()
+                .map_err(|_| HypeEdgeError::StrategyRegistration {
+                    message: "config field must be an integer".into(),
+                })
+        }
         _ => Err(HypeEdgeError::StrategyRegistration {
             message: "config field must be an integer".into(),
         }),
@@ -498,9 +505,10 @@ fn int_value(value: &Value) -> Result<i64, HypeEdgeError> {
 }
 
 fn parse_dec(s: &str) -> Result<f64, HypeEdgeError> {
-    s.parse::<f64>().map_err(|_| HypeEdgeError::StrategyRegistration {
-        message: "config field must be numeric".into(),
-    })
+    s.parse::<f64>()
+        .map_err(|_| HypeEdgeError::StrategyRegistration {
+            message: "config field must be numeric".into(),
+        })
 }
 
 fn dec_of(out: &serde_json::Map<String, Value>, key: &str) -> Result<f64, HypeEdgeError> {
@@ -508,9 +516,11 @@ fn dec_of(out: &serde_json::Map<String, Value>, key: &str) -> Result<f64, HypeEd
 }
 
 fn int_of(out: &serde_json::Map<String, Value>, key: &str) -> Result<i64, HypeEdgeError> {
-    out[key].as_i64().ok_or_else(|| HypeEdgeError::StrategyRegistration {
-        message: format!("{key} must be an integer"),
-    })
+    out[key]
+        .as_i64()
+        .ok_or_else(|| HypeEdgeError::StrategyRegistration {
+            message: format!("{key} must be an integer"),
+        })
 }
 
 /// Compact, key-sorted sha256 hash (mirrors `config_hash` in the storage
@@ -533,7 +543,10 @@ mod tests {
         let d2 = default_market_maker_config();
         assert_eq!(d1, d2);
         assert!(d1["min_markout_samples"].as_i64() == Some(20));
-        assert_eq!(d1["external_reference_weight"], Value::String("0.25".into()));
+        assert_eq!(
+            d1["external_reference_weight"],
+            Value::String("0.25".into())
+        );
     }
 
     #[test]

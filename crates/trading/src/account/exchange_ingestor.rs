@@ -29,7 +29,13 @@ use crate::account::tracker::AccountTracker;
 pub const SOURCE: &str = "hyperliquid";
 
 /// Non-terminal order statuses (the live projection keeps these).
-pub const OPEN_STATUSES: &[&str] = &["pending", "submitted", "submit_unknown", "acknowledged", "partial_fill"];
+pub const OPEN_STATUSES: &[&str] = &[
+    "pending",
+    "submitted",
+    "submit_unknown",
+    "acknowledged",
+    "partial_fill",
+];
 /// Terminal order statuses.
 pub const TERMINAL_STATUSES: &[&str] = &["filled", "cancelled", "rejected", "expired"];
 
@@ -38,7 +44,9 @@ pub const TERMINAL_STATUSES: &[&str] = &["filled", "cancelled", "rejected", "exp
 fn decimal_from(v: Option<&Value>) -> Decimal {
     match v {
         Some(Value::String(s)) => Decimal::from_str_lenient(s).unwrap_or(Decimal::ZERO),
-        Some(Value::Number(n)) => Decimal::from_f64(n.as_f64().unwrap_or(0.0)).unwrap_or(Decimal::ZERO),
+        Some(Value::Number(n)) => {
+            Decimal::from_f64(n.as_f64().unwrap_or(0.0)).unwrap_or(Decimal::ZERO)
+        }
         _ => Decimal::ZERO,
     }
 }
@@ -98,8 +106,14 @@ pub fn fill_external_id(fill: &Value) -> String {
 
 pub fn funding_external_id(update: &Value) -> String {
     let delta = update.get("delta");
-    let coin = delta.and_then(|d| d.get("coin")).map(|v| str_of(Some(v))).unwrap_or_default();
-    let usdc = delta.and_then(|d| d.get("usdc")).map(|v| str_of(Some(v))).unwrap_or_default();
+    let coin = delta
+        .and_then(|d| d.get("coin"))
+        .map(|v| str_of(Some(v)))
+        .unwrap_or_default();
+    let usdc = delta
+        .and_then(|d| d.get("usdc"))
+        .map(|v| str_of(Some(v)))
+        .unwrap_or_default();
     format!(
         "funding:{}:{}:{}:{}",
         str_of(update.get("hash")),
@@ -122,11 +136,7 @@ pub fn fill_position_after(fill: &Value) -> Decimal {
     let start = decimal_from(fill.get("startPosition"));
     let sz = decimal_from(fill.get("sz"));
     let is_buy = str_of(fill.get("side")).eq_ignore_ascii_case("B");
-    if is_buy {
-        start + sz
-    } else {
-        start - sz
-    }
+    if is_buy { start + sz } else { start - sz }
 }
 
 /// Average-cost entry projection; exchange reconciliation remains authoritative.
@@ -168,7 +178,10 @@ pub fn normalize_status(raw: Option<&Value>) -> String {
     if let Some(n) = normalized {
         return n.to_string();
     }
-    if value.ends_with("canceled") || value.ends_with("cancelled") || matches!(value.as_str(), "ioccancel" | "scheduledcancel") {
+    if value.ends_with("canceled")
+        || value.ends_with("cancelled")
+        || matches!(value.as_str(), "ioccancel" | "scheduledcancel")
+    {
         return "cancelled".into();
     }
     if value.ends_with("rejected") {
@@ -271,9 +284,23 @@ pub trait ExchangeFactProjector: Send + Sync {
 #[async_trait]
 pub trait InfoClient: Send + Sync {
     async fn historical_orders(&self, account: &str) -> Result<Vec<Value>, String>;
-    async fn user_fills_by_time(&self, account: &str, start_ms: i64, end_ms: i64) -> Result<Vec<Value>, String>;
-    async fn user_funding_history(&self, account: &str, start_ms: i64, end_ms: i64) -> Result<Vec<Value>, String>;
-    async fn query_order_by_oid(&self, account: &str, exchange_oid: i64) -> Result<Option<Value>, String>;
+    async fn user_fills_by_time(
+        &self,
+        account: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Value>, String>;
+    async fn user_funding_history(
+        &self,
+        account: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Value>, String>;
+    async fn query_order_by_oid(
+        &self,
+        account: &str,
+        exchange_oid: i64,
+    ) -> Result<Option<Value>, String>;
 }
 
 /// One enqueued authenticated WS message: `(kind, payload)`, kind ∈
@@ -313,7 +340,11 @@ impl ExchangeEventIngestor {
             tracker,
             tx,
             rx,
-            poll_interval_seconds: if poll_interval_seconds > 0.0 { poll_interval_seconds } else { 30.0 },
+            poll_interval_seconds: if poll_interval_seconds > 0.0 {
+                poll_interval_seconds
+            } else {
+                30.0
+            },
             history_recovered: false,
         }
     }
@@ -361,7 +392,11 @@ impl ExchangeEventIngestor {
         // canonical cloid and the order is not yet bound (mirrors `_ingest_fill`).
         if !exchange_oid.is_empty()
             && !has_canonical_cloid
-            && !self.projector.has_order(&exchange_oid).await.unwrap_or(true)
+            && !self
+                .projector
+                .has_order(&exchange_oid)
+                .await
+                .unwrap_or(true)
             && let Ok(Some(response)) = self
                 .info
                 .query_order_by_oid(&self.account, exchange_oid.parse().unwrap_or(0))
@@ -405,8 +440,12 @@ impl ExchangeEventIngestor {
         } else {
             Some(hypeedge_domain::models::Position {
                 symbol: projection.symbol.clone(),
-                size: hypeedge_domain::decimal::Size::new(projection.position_size.unwrap_or(Decimal::ZERO)),
-                entry_price: projection.position_entry_price.map(hypeedge_domain::decimal::Price::new),
+                size: hypeedge_domain::decimal::Size::new(
+                    projection.position_size.unwrap_or(Decimal::ZERO),
+                ),
+                entry_price: projection
+                    .position_entry_price
+                    .map(hypeedge_domain::decimal::Price::new),
                 mark_price: projection
                     .position_mark_price
                     .map(hypeedge_domain::decimal::Price::new)
@@ -427,7 +466,11 @@ impl ExchangeEventIngestor {
         let end_ms = chrono::Utc::now().timestamp_millis();
         // 1. Historical orders (establish oid/cloid ownership before fills).
         let orders = self.info.historical_orders(&self.account).await?;
-        let order_cursor = self.projector.cursor("orders").await.map_err(|e| e.to_string())?;
+        let order_cursor = self
+            .projector
+            .cursor("orders")
+            .await
+            .map_err(|e| e.to_string())?;
         let mut ordered = orders.clone();
         ordered.sort_by_key(|item| {
             item.get("statusTimestamp")
@@ -442,19 +485,35 @@ impl ExchangeEventIngestor {
                 .and_then(|v| v.as_i64())
                 .unwrap_or(0);
             if ts >= order_cursor {
-                self.projector.ingest_order_update(update).await.map_err(|e| e.to_string())?;
+                self.projector
+                    .ingest_order_update(update)
+                    .await
+                    .map_err(|e| e.to_string())?;
             }
         }
 
         // 2. Fills by time (paged until fewer than 2000 or cursor advances).
-        let mut fill_cursor = self.projector.cursor("fills").await.map_err(|e| e.to_string())?;
+        let mut fill_cursor = self
+            .projector
+            .cursor("fills")
+            .await
+            .map_err(|e| e.to_string())?;
         let mut start_ms = (fill_cursor - 1).max(0);
         loop {
-            let fills = self.info.user_fills_by_time(&self.account, start_ms, end_ms).await?;
+            let fills = self
+                .info
+                .user_fills_by_time(&self.account, start_ms, end_ms)
+                .await?;
             let mut ordered_fills = fills;
             ordered_fills.sort_by(|a, b| {
-                let (ta, ia) = (a.get("time").and_then(|v| v.as_i64()).unwrap_or(0), fill_external_id(a));
-                let (tb, ib) = (b.get("time").and_then(|v| v.as_i64()).unwrap_or(0), fill_external_id(b));
+                let (ta, ia) = (
+                    a.get("time").and_then(|v| v.as_i64()).unwrap_or(0),
+                    fill_external_id(a),
+                );
+                let (tb, ib) = (
+                    b.get("time").and_then(|v| v.as_i64()).unwrap_or(0),
+                    fill_external_id(b),
+                );
                 (ta, ia).cmp(&(tb, ib))
             });
             for fill in &ordered_fills {
@@ -464,10 +523,17 @@ impl ExchangeEventIngestor {
                 break;
             }
             if fill_cursor == 0 {
-                tracing::warn!(retained = ordered_fills.len(), "initial_fill_history_bootstrap_truncated");
+                tracing::warn!(
+                    retained = ordered_fills.len(),
+                    "initial_fill_history_bootstrap_truncated"
+                );
                 break;
             }
-            let latest_ms = ordered_fills.last().and_then(|f| f.get("time")).and_then(|v| v.as_i64()).unwrap_or(0);
+            let latest_ms = ordered_fills
+                .last()
+                .and_then(|f| f.get("time"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
             if latest_ms <= start_ms {
                 return Err("user_fills_history_cursor_not_advancing".into());
             }
@@ -479,7 +545,11 @@ impl ExchangeEventIngestor {
         // so a large gap (or the first bootstrap) would otherwise silently drop
         // the older events. Mirror the fills pagination: page forward on the
         // cursor until fewer than the cap come back, never truncating.
-        let funding_cursor = self.projector.cursor("funding").await.map_err(|e| e.to_string())?;
+        let funding_cursor = self
+            .projector
+            .cursor("funding")
+            .await
+            .map_err(|e| e.to_string())?;
         let mut funding_start_ms = (funding_cursor - 1).max(0);
         loop {
             let funding_updates = self
@@ -552,7 +622,10 @@ mod tests {
             "hash": "0xabc", "time": "1700000000000",
             "delta": {"type": "funding", "coin": "BTC", "usdc": "1.5"}
         });
-        assert_eq!(funding_external_id(&update), "funding:0xabc:1700000000000:BTC:1.5");
+        assert_eq!(
+            funding_external_id(&update),
+            "funding:0xabc:1700000000000:BTC:1.5"
+        );
     }
 
     #[test]
@@ -566,9 +639,22 @@ mod tests {
     #[test]
     fn projected_entry_price_cases() {
         // Close → None.
-        assert_eq!(projected_entry_price(Decimal::ONE, Some(Decimal::from_str_strict("100").unwrap()), Decimal::ZERO, Decimal::from_str_strict("101").unwrap()), None);
+        assert_eq!(
+            projected_entry_price(
+                Decimal::ONE,
+                Some(Decimal::from_str_strict("100").unwrap()),
+                Decimal::ZERO,
+                Decimal::from_str_strict("101").unwrap()
+            ),
+            None
+        );
         // New position → fill price.
-        let d1 = projected_entry_price(Decimal::ZERO, None, Decimal::from_str_strict("1").unwrap(), Decimal::from_str_strict("50000").unwrap());
+        let d1 = projected_entry_price(
+            Decimal::ZERO,
+            None,
+            Decimal::from_str_strict("1").unwrap(),
+            Decimal::from_str_strict("50000").unwrap(),
+        );
         assert_eq!(d1.unwrap().to_string(), "50000");
         // Add same direction → VWAP.
         let d2 = projected_entry_price(
@@ -592,17 +678,33 @@ mod tests {
     fn normalize_status_variants() {
         assert_eq!(normalize_status(Some(&Value::from("open"))), "acknowledged");
         assert_eq!(normalize_status(Some(&Value::from("filled"))), "filled");
-        assert_eq!(normalize_status(Some(&Value::from("canceled"))), "cancelled");
-        assert_eq!(normalize_status(Some(&Value::from("cancelled"))), "cancelled");
-        assert_eq!(normalize_status(Some(&Value::from("margincanceled"))), "cancelled");
-        assert_eq!(normalize_status(Some(&Value::from("triggered"))), "acknowledged");
-        assert_eq!(normalize_status(Some(&Value::from("scheduledcancel"))), "cancelled");
+        assert_eq!(
+            normalize_status(Some(&Value::from("canceled"))),
+            "cancelled"
+        );
+        assert_eq!(
+            normalize_status(Some(&Value::from("cancelled"))),
+            "cancelled"
+        );
+        assert_eq!(
+            normalize_status(Some(&Value::from("margincanceled"))),
+            "cancelled"
+        );
+        assert_eq!(
+            normalize_status(Some(&Value::from("triggered"))),
+            "acknowledged"
+        );
+        assert_eq!(
+            normalize_status(Some(&Value::from("scheduledcancel"))),
+            "cancelled"
+        );
         assert_eq!(normalize_status(Some(&Value::from("expired"))), "expired");
     }
 
     #[test]
     fn order_from_status_response_unwraps_nested() {
-        let resp = serde_json::json!({"status": "order", "order": {"order": {"oid": 1, "coin": "BTC"}}});
+        let resp =
+            serde_json::json!({"status": "order", "order": {"order": {"oid": 1, "coin": "BTC"}}});
         let order = order_from_status_response(&resp).unwrap();
         assert_eq!(order["oid"], 1);
         // Non-order responses return None.
@@ -632,8 +734,14 @@ mod tests {
     fn status_maps_onto_domain_enum() {
         assert_eq!(status_to_order_status("filled"), OrderStatus::Filled);
         assert_eq!(status_to_order_status("cancelled"), OrderStatus::Cancelled);
-        assert_eq!(status_to_order_status("acknowledged"), OrderStatus::Acknowledged);
-        assert_eq!(status_to_order_status("partial_fill"), OrderStatus::PartialFill);
+        assert_eq!(
+            status_to_order_status("acknowledged"),
+            OrderStatus::Acknowledged
+        );
+        assert_eq!(
+            status_to_order_status("partial_fill"),
+            OrderStatus::PartialFill
+        );
     }
 
     // --- Ingestor orchestration ---
@@ -643,7 +751,9 @@ mod tests {
     }
     impl FakeProjector {
         fn new() -> Self {
-            Self { fills_ingested: std::sync::atomic::AtomicU64::new(0) }
+            Self {
+                fills_ingested: std::sync::atomic::AtomicU64::new(0),
+            }
         }
     }
     #[async_trait]
@@ -676,7 +786,10 @@ mod tests {
                 funding_amount: None,
             })
         }
-        async fn ingest_order_update(&self, _update: &Value) -> Result<IngestResult, HypeEdgeError> {
+        async fn ingest_order_update(
+            &self,
+            _update: &Value,
+        ) -> Result<IngestResult, HypeEdgeError> {
             Ok(IngestResult::dedup("order:x"))
         }
         async fn ingest_funding(&self, _update: &Value) -> Result<IngestResult, HypeEdgeError> {
@@ -699,13 +812,27 @@ mod tests {
         async fn historical_orders(&self, _account: &str) -> Result<Vec<Value>, String> {
             Ok(self.orders.clone())
         }
-        async fn user_fills_by_time(&self, _account: &str, _start: i64, _end: i64) -> Result<Vec<Value>, String> {
+        async fn user_fills_by_time(
+            &self,
+            _account: &str,
+            _start: i64,
+            _end: i64,
+        ) -> Result<Vec<Value>, String> {
             Ok(self.fills.clone())
         }
-        async fn user_funding_history(&self, _account: &str, _start: i64, _end: i64) -> Result<Vec<Value>, String> {
+        async fn user_funding_history(
+            &self,
+            _account: &str,
+            _start: i64,
+            _end: i64,
+        ) -> Result<Vec<Value>, String> {
             Ok(vec![])
         }
-        async fn query_order_by_oid(&self, _account: &str, _oid: i64) -> Result<Option<Value>, String> {
+        async fn query_order_by_oid(
+            &self,
+            _account: &str,
+            _oid: i64,
+        ) -> Result<Option<Value>, String> {
             Ok(None)
         }
     }
@@ -717,7 +844,10 @@ mod tests {
         let mut ingestor = ExchangeEventIngestor::new(
             "0xabc",
             projector.clone(),
-            Arc::new(FakeInfo { orders: vec![], fills: vec![] }),
+            Arc::new(FakeInfo {
+                orders: vec![],
+                fills: vec![],
+            }),
             Some(tracker.clone()),
             30.0,
         );
@@ -742,8 +872,12 @@ mod tests {
             "0xabc",
             projector.clone(),
             Arc::new(FakeInfo {
-                orders: vec![serde_json::json!({"oid": 1, "coin": "BTC", "status": "open", "sz": "1.0"})],
-                fills: vec![serde_json::json!({"tid": 1, "oid": "1", "time": "1700000000000", "coin": "BTC", "side": "B", "px": "50000", "sz": "1.0"})],
+                orders: vec![
+                    serde_json::json!({"oid": 1, "coin": "BTC", "status": "open", "sz": "1.0"}),
+                ],
+                fills: vec![
+                    serde_json::json!({"tid": 1, "oid": "1", "time": "1700000000000", "coin": "BTC", "side": "B", "px": "50000", "sz": "1.0"}),
+                ],
             }),
             None,
             30.0,
@@ -759,7 +893,10 @@ mod tests {
         let ingestor = ExchangeEventIngestor::new(
             "0xabc",
             projector,
-            Arc::new(FakeInfo { orders: vec![], fills: vec![] }),
+            Arc::new(FakeInfo {
+                orders: vec![],
+                fills: vec![],
+            }),
             None,
             0.0,
         );

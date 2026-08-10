@@ -133,13 +133,14 @@ impl AccountingLedger {
         if same_direction {
             let total = abs(old_quantity) + abs(quantity);
             let old_cost = self.average_cost.unwrap_or(Decimal::ZERO);
-            self.average_cost = Some((abs(old_quantity) * old_cost + abs(quantity) * price).div(total));
+            self.average_cost =
+                Some((abs(old_quantity) * old_cost + abs(quantity) * price).div(total));
             self.quantity += quantity;
         } else {
             let closing = abs(old_quantity).min(abs(quantity));
-            let average = self.average_cost.ok_or_else(|| {
-                "non-flat inventory requires an average cost".to_string()
-            })?;
+            let average = self
+                .average_cost
+                .ok_or_else(|| "non-flat inventory requires an average cost".to_string())?;
             let direction = if old_quantity > Decimal::ZERO {
                 Decimal::ONE
             } else {
@@ -304,14 +305,16 @@ mod tests {
     #[test]
     fn zero_size_and_negative_action_rejected() {
         let mut ledger = AccountingLedger::new();
-        assert!(ledger
-            .record_fill(AccountingFill {
-                side: Side::Buy,
-                price: px("100"),
-                size: Size::ZERO,
-                net_fee_rebate: usd("0"),
-            })
-            .is_err());
+        assert!(
+            ledger
+                .record_fill(AccountingFill {
+                    side: Side::Buy,
+                    price: px("100"),
+                    size: Size::ZERO,
+                    net_fee_rebate: usd("0"),
+                })
+                .is_err()
+        );
         assert!(ledger.record_paid_action(usd("-1")).is_err());
     }
 

@@ -28,7 +28,6 @@ async fn try_pool() -> Option<PgPool> {
     }
 }
 
-
 /// Cross-binary serialization (shares the HYPE advisory lock with the other
 /// integration test binaries so `clean` calls do not clobber one another).
 async fn acquire_test_lock(pool: &PgPool) -> sqlx::pool::PoolConnection<sqlx::Postgres> {
@@ -42,8 +41,17 @@ async fn acquire_test_lock(pool: &PgPool) -> sqlx::pool::PoolConnection<sqlx::Po
 }
 
 async fn clean(pool: &PgPool) {
-    for t in ["funding_arb_config_versions", "market_maker_config_versions", "trend_follow_config_versions", "strategy_config_versions", "strategy_instances"] {
-        sqlx::query(&format!("DELETE FROM {t}")).execute(pool).await.ok();
+    for t in [
+        "funding_arb_config_versions",
+        "market_maker_config_versions",
+        "trend_follow_config_versions",
+        "strategy_config_versions",
+        "strategy_instances",
+    ] {
+        sqlx::query(&format!("DELETE FROM {t}"))
+            .execute(pool)
+            .await
+            .ok();
     }
 }
 
@@ -88,7 +96,10 @@ async fn create_and_list_trend_follow_config_versions() {
         .create_config_version("tf_1", "trend_follow", &values, "test", None)
         .await
         .unwrap();
-    assert_eq!(dup.version, 1, "hash-identical config must return the existing version");
+    assert_eq!(
+        dup.version, 1,
+        "hash-identical config must return the existing version"
+    );
 
     // Different values → version 2.
     let mut v2 = values.clone();
@@ -167,5 +178,8 @@ async fn unknown_instance_rejected() {
         .create_config_version("nope", "trend_follow", &values, "test", None)
         .await
         .unwrap_err();
-    assert!(err.to_string().contains("Unknown active strategy instance"), "err: {err}");
+    assert!(
+        err.to_string().contains("Unknown active strategy instance"),
+        "err: {err}"
+    );
 }

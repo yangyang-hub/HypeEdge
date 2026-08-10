@@ -96,7 +96,11 @@ impl LatestExternalReferenceProvider {
     }
 
     /// Update the slow log-basis calibration from a native Hyperliquid midpoint.
-    pub fn update_hyperliquid_mid(&mut self, symbol: &str, mid: Decimal) -> ExternalReferenceSnapshot {
+    pub fn update_hyperliquid_mid(
+        &mut self,
+        symbol: &str,
+        mid: Decimal,
+    ) -> ExternalReferenceSnapshot {
         let snapshot = self.get_external_reference(symbol, Utc::now());
         if snapshot.quality == ExternalQuality::Healthy && mid > Decimal::ZERO {
             let Some(raw) = snapshot.raw_price else {
@@ -116,14 +120,27 @@ impl LatestExternalReferenceProvider {
     }
 
     /// Build a freshness-aware snapshot from the latest observations.
-    pub fn get_external_reference(&self, symbol: &str, now: DateTime<Utc>) -> ExternalReferenceSnapshot {
+    pub fn get_external_reference(
+        &self,
+        symbol: &str,
+        now: DateTime<Utc>,
+    ) -> ExternalReferenceSnapshot {
         if !self.settings.enabled {
-            return empty_snapshot(symbol, now, ExternalQuality::Disabled, vec!["external_reference_disabled".into()]);
+            return empty_snapshot(
+                symbol,
+                now,
+                ExternalQuality::Disabled,
+                vec!["external_reference_disabled".into()],
+            );
         }
 
         let spot = self.quotes.get(&(symbol.to_string(), ExternalMarket::Spot));
-        let perpetual = self.quotes.get(&(symbol.to_string(), ExternalMarket::Perpetual));
-        let mark = self.quotes.get(&(symbol.to_string(), ExternalMarket::PerpetualMark));
+        let perpetual = self
+            .quotes
+            .get(&(symbol.to_string(), ExternalMarket::Perpetual));
+        let mark = self
+            .quotes
+            .get(&(symbol.to_string(), ExternalMarket::PerpetualMark));
         let mut reasons: Vec<String> = Vec::new();
 
         let fresh_spot = spot.is_some_and(|q| self.is_fresh(q, now));
@@ -142,8 +159,12 @@ impl LatestExternalReferenceProvider {
         }
 
         let spot_mid = fresh_spot.then(|| spot.and_then(quote_mid)).flatten();
-        let perpetual_mid = fresh_perpetual.then(|| perpetual.and_then(quote_mid)).flatten();
-        let perpetual_mark = fresh_mark.then(|| mark.and_then(|q| q.mark_price)).flatten();
+        let perpetual_mid = fresh_perpetual
+            .then(|| perpetual.and_then(quote_mid))
+            .flatten();
+        let perpetual_mark = fresh_mark
+            .then(|| mark.and_then(|q| q.mark_price))
+            .flatten();
 
         if let (Some(sm), Some(pm)) = (spot_mid, perpetual_mid) {
             let divergence = divergence_bps(pm, sm);
@@ -175,16 +196,31 @@ impl LatestExternalReferenceProvider {
             return empty_snapshot(symbol, now, ExternalQuality::Stale, dedup(reasons));
         }
 
-        let weight_sum: Decimal = contributors.iter().map(|(_, w, _)| *w).fold(Decimal::ZERO, |a, b| a + b);
+        let weight_sum: Decimal = contributors
+            .iter()
+            .map(|(_, w, _)| *w)
+            .fold(Decimal::ZERO, |a, b| a + b);
         let mut weighted = Decimal::ZERO;
         for (price, weight, _) in &contributors {
             weighted += *price * *weight;
         }
         let raw = weighted.div(weight_sum);
-        let observed_at = contributors.iter().map(|(_, _, q)| q.received_at).min().unwrap_or(now);
+        let observed_at = contributors
+            .iter()
+            .map(|(_, _, q)| q.received_at)
+            .min()
+            .unwrap_or(now);
         let age_ms = (now - observed_at).num_milliseconds().max(0) as u64;
-        let sequence = contributors.iter().map(|(_, _, q)| q.sequence).max().unwrap_or(0);
-        let generation = contributors.iter().map(|(_, _, q)| q.connection_generation).max().unwrap_or(0);
+        let sequence = contributors
+            .iter()
+            .map(|(_, _, q)| q.sequence)
+            .max()
+            .unwrap_or(0);
+        let generation = contributors
+            .iter()
+            .map(|(_, _, q)| q.connection_generation)
+            .max()
+            .unwrap_or(0);
 
         let both_books = spot_mid.is_some() && perpetual_mid.is_some();
         if !both_books {
@@ -200,7 +236,11 @@ impl LatestExternalReferenceProvider {
         };
         let age_frac = age_ms as f64 / self.settings.stale_after_ms.max(1) as f64;
         let freshness = (1.0 - age_frac).max(0.0);
-        let confidence = if quality == ExternalQuality::Healthy { 1.0 } else { 0.5 } * freshness;
+        let confidence = if quality == ExternalQuality::Healthy {
+            1.0
+        } else {
+            0.5
+        } * freshness;
         let mut effective_weight = dec_to_f64(self.settings.max_external_weight) * confidence;
         let mut conf = confidence;
         if anomaly {
@@ -297,7 +337,9 @@ fn quote_crossed(q: &ExternalVenueQuote) -> bool {
 /// The quote's mid price, or `None` when one side is missing or crossed.
 fn quote_mid(q: &ExternalVenueQuote) -> Option<Decimal> {
     match (q.bid, q.ask) {
-        (Some(b), Some(a)) if !quote_crossed(q) => Some((b.inner() + a.inner()).div(Decimal::from_scaled(2, 0))),
+        (Some(b), Some(a)) if !quote_crossed(q) => {
+            Some((b.inner() + a.inner()).div(Decimal::from_scaled(2, 0)))
+        }
         _ => None,
     }
 }
@@ -326,7 +368,13 @@ mod tests {
 
     /// A quote whose receipt time is fresh relative to now (default), or
     /// `ago_ms` milliseconds in the past for staleness tests.
-    fn quote(symbol: &str, market: ExternalMarket, bid: &str, ask: &str, seq: u64) -> ExternalVenueQuote {
+    fn quote(
+        symbol: &str,
+        market: ExternalMarket,
+        bid: &str,
+        ask: &str,
+        seq: u64,
+    ) -> ExternalVenueQuote {
         quote_at(symbol, market, bid, ask, seq, Utc::now())
     }
 
@@ -379,7 +427,11 @@ mod tests {
         assert!(snapshot.effective_weight > Decimal::ZERO);
         assert!(snapshot.spot_mid.is_some() && snapshot.perpetual_mid.is_some());
         // Both books => no single-source reason.
-        assert!(!snapshot.quality_reasons.contains(&"single_source_only".to_string()));
+        assert!(
+            !snapshot
+                .quality_reasons
+                .contains(&"single_source_only".to_string())
+        );
     }
 
     #[test]
@@ -388,7 +440,11 @@ mod tests {
         provider.update_quote(quote("BTC", ExternalMarket::Spot, "49950", "50050", 1));
         let snapshot = provider.get_external_reference("BTC", Utc::now());
         assert_eq!(snapshot.quality, ExternalQuality::Degraded);
-        assert!(snapshot.quality_reasons.contains(&"single_source_only".to_string()));
+        assert!(
+            snapshot
+                .quality_reasons
+                .contains(&"single_source_only".to_string())
+        );
         // Degraded halves confidence.
         assert!(snapshot.confidence <= Decimal::from_scaled(50, 2));
     }
@@ -398,7 +454,14 @@ mod tests {
         let mut provider = LatestExternalReferenceProvider::new(settings());
         // 5000ms old > 1500ms stale threshold.
         let old = Utc::now() - chrono::Duration::milliseconds(5000);
-        provider.update_quote(quote_at("BTC", ExternalMarket::Spot, "49950", "50050", 1, old));
+        provider.update_quote(quote_at(
+            "BTC",
+            ExternalMarket::Spot,
+            "49950",
+            "50050",
+            1,
+            old,
+        ));
         let snapshot = provider.get_external_reference("BTC", Utc::now());
         assert_eq!(snapshot.quality, ExternalQuality::Stale);
         assert_eq!(snapshot.effective_weight, Decimal::ZERO);
@@ -412,7 +475,11 @@ mod tests {
         let snapshot = provider.get_external_reference("BTC", Utc::now());
         assert_eq!(snapshot.quality, ExternalQuality::Stale);
         assert_eq!(snapshot.effective_weight, Decimal::ZERO);
-        assert!(snapshot.quality_reasons.contains(&"spot_crossed".to_string()));
+        assert!(
+            snapshot
+                .quality_reasons
+                .contains(&"spot_crossed".to_string())
+        );
     }
 
     #[test]
@@ -445,7 +512,11 @@ mod tests {
         let provider = LatestExternalReferenceProvider::new(settings());
         let snapshot = provider.get_external_reference("BTC", at(1_000));
         assert_eq!(snapshot.quality, ExternalQuality::Stale);
-        assert!(snapshot.quality_reasons.contains(&"no_external_observation".to_string()));
+        assert!(
+            snapshot
+                .quality_reasons
+                .contains(&"no_external_observation".to_string())
+        );
     }
 
     #[test]
@@ -455,7 +526,11 @@ mod tests {
         provider.update_quote(quote("BTC", ExternalMarket::Spot, "49950", "50050", 1));
         provider.update_quote(quote("BTC", ExternalMarket::Perpetual, "53000", "53100", 1));
         let snapshot = provider.get_external_reference("BTC", Utc::now());
-        assert!(snapshot.quality_reasons.contains(&"perpetual_spot_outlier".to_string()));
+        assert!(
+            snapshot
+                .quality_reasons
+                .contains(&"perpetual_spot_outlier".to_string())
+        );
         assert_eq!(snapshot.effective_weight, Decimal::ZERO);
     }
 }

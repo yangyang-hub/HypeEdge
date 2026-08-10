@@ -172,10 +172,7 @@ impl RecoveryRegistry {
         if unresolved.is_empty() {
             return None;
         }
-        let discovered_at = unresolved
-            .iter()
-            .map(|owner| owner.discovered_at)
-            .min()?;
+        let discovered_at = unresolved.iter().map(|owner| owner.discovered_at).min()?;
         let age = (now - discovered_at).to_std().unwrap_or(Duration::ZERO);
         Some(age)
     }
@@ -213,7 +210,10 @@ impl RecoveryRegistry {
 }
 
 /// Classify a live risk owner that is not part of the active plan.
-pub fn classify_orphan(owner: &QuoteRiskOwner, active_plan_revision: i64) -> Option<RecoveryReason> {
+pub fn classify_orphan(
+    owner: &QuoteRiskOwner,
+    active_plan_revision: i64,
+) -> Option<RecoveryReason> {
     if owner.status == OrderStatus::SubmitUnknown {
         return Some(RecoveryReason::SubmitUnknown);
     }
@@ -262,7 +262,10 @@ mod tests {
     #[test]
     fn recovery_reason_as_str() {
         assert_eq!(RecoveryReason::SubmitUnknown.as_str(), "submit_unknown");
-        assert_eq!(RecoveryReason::LateOldRevision.as_str(), "late_old_revision");
+        assert_eq!(
+            RecoveryReason::LateOldRevision.as_str(),
+            "late_old_revision"
+        );
     }
 
     #[test]
@@ -412,7 +415,10 @@ mod tests {
             Some(RecoveryReason::CancelUnknown)
         );
         let late = owner("c3", OrderStatus::Acknowledged, 3);
-        assert_eq!(classify_orphan(&late, 5), Some(RecoveryReason::LateOldRevision));
+        assert_eq!(
+            classify_orphan(&late, 5),
+            Some(RecoveryReason::LateOldRevision)
+        );
         let current = owner("c4", OrderStatus::Acknowledged, 5);
         assert_eq!(classify_orphan(&current, 5), None);
     }

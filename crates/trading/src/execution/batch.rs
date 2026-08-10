@@ -138,7 +138,10 @@ pub struct DispatchGuardContext {
 }
 
 /// Cancel is unconditional; risk-increasing children fail closed.
-pub fn evaluate_dispatch_guard(action: ChildActionType, context: &DispatchGuardContext) -> GuardDecision {
+pub fn evaluate_dispatch_guard(
+    action: ChildActionType,
+    context: &DispatchGuardContext,
+) -> GuardDecision {
     if action == ChildActionType::Cancel {
         return GuardDecision::Allow;
     }
@@ -234,7 +237,11 @@ impl BatchChild {
     }
 
     pub fn record_attempt(&self, attempt: NetworkAttempt) -> Result<Self, String> {
-        if self.attempts.iter().any(|a| a.attempt_id == attempt.attempt_id) {
+        if self
+            .attempts
+            .iter()
+            .any(|a| a.attempt_id == attempt.attempt_id)
+        {
             return Ok(self.clone());
         }
         if is_terminal(self.outcome) || self.outcome == ChildOutcome::Unknown {
@@ -246,7 +253,11 @@ impl BatchChild {
         Ok(updated)
     }
 
-    pub fn resolve(&self, outcome: ChildOutcome, resolution: Option<String>) -> Result<Self, String> {
+    pub fn resolve(
+        &self,
+        outcome: ChildOutcome,
+        resolution: Option<String>,
+    ) -> Result<Self, String> {
         if matches!(outcome, ChildOutcome::Pending | ChildOutcome::Dispatching) {
             return Err("resolve requires a result outcome".into());
         }
@@ -272,7 +283,11 @@ pub struct BatchExecutionCommand {
 }
 
 impl BatchExecutionCommand {
-    pub fn new(command_id: Uuid, plan_revision: i64, children: Vec<BatchChild>) -> Result<Self, String> {
+    pub fn new(
+        command_id: Uuid,
+        plan_revision: i64,
+        children: Vec<BatchChild>,
+    ) -> Result<Self, String> {
         if plan_revision < 0 {
             return Err("plan revision cannot be negative".into());
         }
@@ -356,14 +371,19 @@ impl BatchExecutionCommand {
 
     /// Children that are pending and unblocked by an unmet dependency.
     pub fn dispatchable_children(&self) -> Vec<BatchChild> {
-        let by_id: HashMap<Uuid, BatchChild> =
-            self.children.iter().map(|c| (c.child_id, c.clone())).collect();
+        let by_id: HashMap<Uuid, BatchChild> = self
+            .children
+            .iter()
+            .map(|c| (c.child_id, c.clone()))
+            .collect();
         self.children
             .iter()
             .filter(|child| child.outcome == ChildOutcome::Pending)
             .filter(|child| match child.depends_on {
                 None => true,
-                Some(dep) => by_id.get(&dep).is_some_and(|d| d.outcome == ChildOutcome::Succeeded),
+                Some(dep) => by_id
+                    .get(&dep)
+                    .is_some_and(|d| d.outcome == ChildOutcome::Succeeded),
             })
             .cloned()
             .collect()
@@ -477,7 +497,11 @@ mod tests {
         // Resolving a terminal child with a conflicting outcome errors.
         assert!(resolved.resolve(ChildOutcome::Rejected, None).is_err());
         // Sending after terminal errors.
-        assert!(resolved.record_attempt(NetworkAttempt::sent(b"y", now(), None)).is_err());
+        assert!(
+            resolved
+                .record_attempt(NetworkAttempt::sent(b"y", now(), None))
+                .is_err()
+        );
     }
 
     #[test]
@@ -539,7 +563,9 @@ mod tests {
             1,
             Some(dep.child_id),
         );
-        let batch = BatchExecutionCommand::new(Uuid::new_v4(), 1, vec![dep.clone(), dependent.clone()]).unwrap();
+        let batch =
+            BatchExecutionCommand::new(Uuid::new_v4(), 1, vec![dep.clone(), dependent.clone()])
+                .unwrap();
         // Dependent blocked until the cancel succeeds.
         let dispatchable = batch.dispatchable_children();
         assert_eq!(dispatchable.len(), 1);

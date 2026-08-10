@@ -246,13 +246,7 @@ pub trait MarketMakingMetrics: Send + Sync {
     fn observe_latency(&self, strategy_id: &str, symbol: &str, stage: LatencyStage, seconds: f64);
 
     /// Set the reconciliation diff count for a severity.
-    fn set_reconciliation_diff(
-        &self,
-        strategy_id: &str,
-        symbol: &str,
-        severity: &str,
-        count: u64,
-    );
+    fn set_reconciliation_diff(&self, strategy_id: &str, symbol: &str, severity: &str, count: u64);
 
     /// Set the strategy runtime state and config version.
     fn set_runtime(&self, strategy_id: &str, symbol: &str, state: &str, config_version: i64);
@@ -392,10 +386,11 @@ impl MarketMakingMetrics for InMemoryMarketMakingMetrics {
     }
 
     fn set_unknown_orders(&self, strategy_id: &str, symbol: &str, count: u64) {
-        self.unknown_orders
-            .lock()
-            .unwrap()
-            .push((strategy_id.to_string(), symbol.to_string(), count));
+        self.unknown_orders.lock().unwrap().push((
+            strategy_id.to_string(),
+            symbol.to_string(),
+            count,
+        ));
     }
 
     fn observe_latency(&self, strategy_id: &str, symbol: &str, stage: LatencyStage, seconds: f64) {
@@ -407,13 +402,7 @@ impl MarketMakingMetrics for InMemoryMarketMakingMetrics {
         ));
     }
 
-    fn set_reconciliation_diff(
-        &self,
-        strategy_id: &str,
-        symbol: &str,
-        severity: &str,
-        count: u64,
-    ) {
+    fn set_reconciliation_diff(&self, strategy_id: &str, symbol: &str, severity: &str, count: u64) {
         self.reconciliation.lock().unwrap().push((
             strategy_id.to_string(),
             symbol.to_string(),
@@ -431,7 +420,13 @@ impl MarketMakingMetrics for InMemoryMarketMakingMetrics {
         ));
     }
 
-    fn set_canary_directive(&self, strategy_id: &str, symbol: &str, directive: &str, enabled: bool) {
+    fn set_canary_directive(
+        &self,
+        strategy_id: &str,
+        symbol: &str,
+        directive: &str,
+        enabled: bool,
+    ) {
         self.canary.lock().unwrap().push((
             strategy_id.to_string(),
             symbol.to_string(),
@@ -445,7 +440,10 @@ impl MarketMakingMetrics for InMemoryMarketMakingMetrics {
     }
 
     fn record_emergency_cancel_failure(&self, sub_account: &str) {
-        self.emergency_failures.lock().unwrap().push(sub_account.to_string());
+        self.emergency_failures
+            .lock()
+            .unwrap()
+            .push(sub_account.to_string());
     }
 }
 
@@ -455,26 +453,47 @@ mod tests {
 
     #[test]
     fn enums_serialize_to_snake_case() {
-        assert_eq!(FreshnessSource::ExternalReference.as_str(), "external_reference");
+        assert_eq!(
+            FreshnessSource::ExternalReference.as_str(),
+            "external_reference"
+        );
         assert_eq!(InventoryBand::Emergency.as_str(), "emergency");
         assert_eq!(ExecutionOutcome::BatchPartial.as_str(), "batch_partial");
-        assert_eq!(LatencyStage::ReceiptToDecision.as_str(), "receipt_to_decision");
+        assert_eq!(
+            LatencyStage::ReceiptToDecision.as_str(),
+            "receipt_to_decision"
+        );
         assert_eq!(ExternalReferenceQuality::Degraded.as_str(), "degraded");
     }
 
     #[test]
     fn reference_prices_must_be_positive() {
         let m = InMemoryMarketMakingMetrics::new();
-        assert!(m.set_reference_prices("s", "BTC", Decimal::ZERO, Decimal::ONE).is_err());
-        assert!(m.set_reference_prices("s", "BTC", Decimal::ONE, Decimal::ZERO).is_err());
-        assert!(m.set_reference_prices("s", "BTC", Decimal::ONE, Decimal::ONE).is_ok());
+        assert!(
+            m.set_reference_prices("s", "BTC", Decimal::ZERO, Decimal::ONE)
+                .is_err()
+        );
+        assert!(
+            m.set_reference_prices("s", "BTC", Decimal::ONE, Decimal::ZERO)
+                .is_err()
+        );
+        assert!(
+            m.set_reference_prices("s", "BTC", Decimal::ONE, Decimal::ONE)
+                .is_ok()
+        );
     }
 
     #[test]
     fn quote_uptime_must_be_in_unit_interval() {
         let m = InMemoryMarketMakingMetrics::new();
-        assert!(m.set_quote_uptime("s", "BTC", "5m", Decimal::from_scaled(150, 0)).is_err());
-        assert!(m.set_quote_uptime("s", "BTC", "5m", Decimal::from_scaled(50, 2)).is_ok());
+        assert!(
+            m.set_quote_uptime("s", "BTC", "5m", Decimal::from_scaled(150, 0))
+                .is_err()
+        );
+        assert!(
+            m.set_quote_uptime("s", "BTC", "5m", Decimal::from_scaled(50, 2))
+                .is_ok()
+        );
         assert!(m.set_quote_uptime("s", "BTC", "5m", Decimal::ONE).is_ok());
     }
 

@@ -181,7 +181,11 @@ impl CanaryGateEvaluator {
         expansion_min_episodes: u64,
         max_directional_concentration: Decimal,
     ) -> Result<Self, String> {
-        if shadow_min_days <= 0 || testnet_min_days <= 0 || expansion_min_days <= 0 || expansion_min_episodes == 0 {
+        if shadow_min_days <= 0
+            || testnet_min_days <= 0
+            || expansion_min_days <= 0
+            || expansion_min_episodes == 0
+        {
             return Err("release-gate sample minimums must be positive".into());
         }
         if max_directional_concentration <= Decimal::ZERO
@@ -241,7 +245,11 @@ impl CanaryGateEvaluator {
     }
 
     /// Evaluate one live canary snapshot against its envelope.
-    pub fn evaluate_live(&self, envelope: &CanaryRiskEnvelope, observation: &CanaryObservation) -> GateDecision {
+    pub fn evaluate_live(
+        &self,
+        envelope: &CanaryRiskEnvelope,
+        observation: &CanaryObservation,
+    ) -> GateDecision {
         let mut halted: Vec<String> = Vec::new();
         let mut cancel_only: Vec<String> = Vec::new();
         let mut paused: Vec<String> = Vec::new();
@@ -272,7 +280,10 @@ impl CanaryGateEvaluator {
             halted.push("forced_flatten_cost_limit".into());
         }
 
-        if observation.oldest_unknown_age.is_some_and(|age| age > envelope.unknown_sla) {
+        if observation
+            .oldest_unknown_age
+            .is_some_and(|age| age > envelope.unknown_sla)
+        {
             cancel_only.push("unknown_sla_exceeded".into());
         }
         if observation.action_credits < envelope.min_action_credits {
@@ -484,13 +495,13 @@ mod tests {
     fn can_start_canary_halts_on_shortfalls() {
         let evaluator = CanaryGateEvaluator::new();
         let evidence = ReleaseEvidence {
-            shadow_complete_utc_days: 7,   // < 14
+            shadow_complete_utc_days: 7, // < 14
             testnet_clean_utc_days: 14,
-            reconciliation_diff_count: 1,  // diff present
+            reconciliation_diff_count: 1, // diff present
             duplicate_order_count: 0,
-            risk_bypass_count: 1,          // bypass present
+            risk_bypass_count: 1, // bypass present
             hard_inventory_breach_count: 0,
-            unresolved_unknown_count: 2,   // unknown present
+            unresolved_unknown_count: 2,          // unknown present
             pessimistic_net_edge_usdc: usd("-5"), // negative edge
             projected_runway_hours: dec("12"),
             required_runway_hours: dec("24"), // insufficient runway
@@ -498,8 +509,19 @@ mod tests {
         let decision = evaluator.can_start_canary(&evidence);
         assert!(!decision.allowed);
         assert_eq!(decision.directive, CanaryDirective::Halted);
-        for reason in ["shadow_observation_incomplete", "reconciliation_diff_present", "risk_bypass_present", "unresolved_unknown_present", "pessimistic_edge_negative", "action_runway_insufficient"] {
-            assert!(decision.reasons.iter().any(|r| r == reason), "missing reason {reason}: {:?}", decision.reasons);
+        for reason in [
+            "shadow_observation_incomplete",
+            "reconciliation_diff_present",
+            "risk_bypass_present",
+            "unresolved_unknown_present",
+            "pessimistic_edge_negative",
+            "action_runway_insufficient",
+        ] {
+            assert!(
+                decision.reasons.iter().any(|r| r == reason),
+                "missing reason {reason}: {:?}",
+                decision.reasons
+            );
         }
     }
 
@@ -517,10 +539,15 @@ mod tests {
         let evaluator = CanaryGateEvaluator::new();
         let mut obs = healthy_observation();
         obs.cumulative_pnl = usd("-2000"); // > 1500 cumulative loss
-        obs.total_actions = 600;           // > 500 total actions
+        obs.total_actions = 600; // > 500 total actions
         let decision = evaluator.evaluate_live(&valid_envelope(), &obs);
         assert_eq!(decision.directive, CanaryDirective::Halted);
-        assert!(decision.reasons.iter().any(|r| r == "cumulative_loss_limit"));
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|r| r == "cumulative_loss_limit")
+        );
         assert!(decision.reasons.iter().any(|r| r == "total_action_limit"));
     }
 
@@ -529,13 +556,21 @@ mod tests {
         let evaluator = CanaryGateEvaluator::new();
         let mut obs = healthy_observation();
         obs.oldest_unknown_age = Some(Duration::from_secs(600)); // > 300s SLA
-        obs.action_credits = 100;                                 // < 1000
-        obs.cancel_headroom = 10;                                 // < 50
+        obs.action_credits = 100; // < 1000
+        obs.cancel_headroom = 10; // < 50
         obs.market_data_healthy = false;
         let decision = evaluator.evaluate_live(&valid_envelope(), &obs);
         assert_eq!(decision.directive, CanaryDirective::CancelOnly);
-        for reason in ["unknown_sla_exceeded", "action_credits_below_minimum", "cancel_headroom_below_minimum", "runtime_data_unhealthy"] {
-            assert!(decision.reasons.iter().any(|r| r == reason), "missing {reason}");
+        for reason in [
+            "unknown_sla_exceeded",
+            "action_credits_below_minimum",
+            "cancel_headroom_below_minimum",
+            "runtime_data_unhealthy",
+        ] {
+            assert!(
+                decision.reasons.iter().any(|r| r == reason),
+                "missing {reason}"
+            );
         }
     }
 
@@ -544,12 +579,19 @@ mod tests {
         let evaluator = CanaryGateEvaluator::new();
         let mut obs = healthy_observation();
         obs.live_quote_notional = usd("60000"); // > 50000
-        obs.daily_pnl = usd("-600");            // > -500 daily loss
-        obs.daily_actions = 150;                // > 100
+        obs.daily_pnl = usd("-600"); // > -500 daily loss
+        obs.daily_actions = 150; // > 100
         let decision = evaluator.evaluate_live(&valid_envelope(), &obs);
         assert_eq!(decision.directive, CanaryDirective::Paused);
-        for reason in ["quote_notional_limit", "daily_loss_limit", "daily_action_limit"] {
-            assert!(decision.reasons.iter().any(|r| r == reason), "missing {reason}");
+        for reason in [
+            "quote_notional_limit",
+            "daily_loss_limit",
+            "daily_action_limit",
+        ] {
+            assert!(
+                decision.reasons.iter().any(|r| r == reason),
+                "missing {reason}"
+            );
         }
     }
 
@@ -561,7 +603,12 @@ mod tests {
         obs.cumulative_pnl = usd("-2000"); // halted-level
         let decision = evaluator.evaluate_live(&valid_envelope(), &obs);
         assert_eq!(decision.directive, CanaryDirective::Halted);
-        assert!(decision.reasons.iter().any(|r| r == "cumulative_loss_limit"));
+        assert!(
+            decision
+                .reasons
+                .iter()
+                .any(|r| r == "cumulative_loss_limit")
+        );
         assert!(decision.reasons.iter().any(|r| r == "daily_loss_limit"));
     }
 
@@ -601,7 +648,7 @@ mod tests {
     fn can_expand_halts_on_weak_evidence() {
         let evaluator = CanaryGateEvaluator::new();
         let evidence = ExpansionEvidence {
-            complete_utc_days: 10,   // < 30
+            complete_utc_days: 10,             // < 30
             independent_inventory_episodes: 5, // < 30
             regime_coverage_complete: false,
             accounting_edge_ci95_lower: usd("0"), // not positive
@@ -616,8 +663,20 @@ mod tests {
         let decision = evaluator.can_expand(&evidence);
         assert!(!decision.allowed);
         assert_eq!(decision.directive, CanaryDirective::Halted);
-        for reason in ["observation_window_incomplete", "inventory_episode_sample_insufficient", "regime_coverage_incomplete", "accounting_edge_ci_not_positive", "marginal_usdc_per_action_below_gate", "critical_reconciliation_diff_present", "unknown_without_terminal_fact", "directional_pnl_concentration"] {
-            assert!(decision.reasons.iter().any(|r| r == reason), "missing {reason}");
+        for reason in [
+            "observation_window_incomplete",
+            "inventory_episode_sample_insufficient",
+            "regime_coverage_incomplete",
+            "accounting_edge_ci_not_positive",
+            "marginal_usdc_per_action_below_gate",
+            "critical_reconciliation_diff_present",
+            "unknown_without_terminal_fact",
+            "directional_pnl_concentration",
+        ] {
+            assert!(
+                decision.reasons.iter().any(|r| r == reason),
+                "missing {reason}"
+            );
         }
     }
 

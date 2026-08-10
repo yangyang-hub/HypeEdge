@@ -68,10 +68,9 @@ mod tests {
             "0xdead".into(),
             "BTC".into(),
             Side::Buy,
-            hypeedge_domain::decimal::Size::new(hypeedge_domain::decimal::Decimal::from_str_strict(
-                "1.0",
-            )
-            .unwrap()),
+            hypeedge_domain::decimal::Size::new(
+                hypeedge_domain::decimal::Decimal::from_str_strict("1.0").unwrap(),
+            ),
             None,
             OrderType::Limit,
             TimeInForce::Gtc,
@@ -93,10 +92,13 @@ mod tests {
     fn legal_transition_chain() {
         let sm = OrderStateMachine::new();
         let mut o = order(OrderStatus::Pending);
-        sm.transition(&mut o, OrderStatus::Submitted, Some("submit")).unwrap();
+        sm.transition(&mut o, OrderStatus::Submitted, Some("submit"))
+            .unwrap();
         assert_eq!(o.status, OrderStatus::Submitted);
-        sm.transition(&mut o, OrderStatus::Acknowledged, Some("ack")).unwrap();
-        sm.transition(&mut o, OrderStatus::Filled, Some("fill")).unwrap();
+        sm.transition(&mut o, OrderStatus::Acknowledged, Some("ack"))
+            .unwrap();
+        sm.transition(&mut o, OrderStatus::Filled, Some("fill"))
+            .unwrap();
         assert!(sm.is_terminal(&o));
     }
 
@@ -104,7 +106,8 @@ mod tests {
     fn pending_can_reject_directly() {
         let sm = OrderStateMachine::new();
         let mut o = order(OrderStatus::Pending);
-        sm.transition(&mut o, OrderStatus::Rejected, Some("risk")).unwrap();
+        sm.transition(&mut o, OrderStatus::Rejected, Some("risk"))
+            .unwrap();
         assert!(sm.is_terminal(&o));
     }
 
@@ -117,9 +120,17 @@ mod tests {
             .unwrap_err();
         assert!(matches!(
             err,
-            HypeEdgeError::InvalidStateTransition { from: OrderStatus::Pending, to: OrderStatus::Filled, .. }
+            HypeEdgeError::InvalidStateTransition {
+                from: OrderStatus::Pending,
+                to: OrderStatus::Filled,
+                ..
+            }
         ));
-        assert_eq!(o.status, OrderStatus::Pending, "status must not change on error");
+        assert_eq!(
+            o.status,
+            OrderStatus::Pending,
+            "status must not change on error"
+        );
     }
 
     #[test]

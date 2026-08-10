@@ -163,9 +163,15 @@ mod tests {
 
     #[test]
     fn empty_required_fields_rejected() {
-        assert!(AlertPayload::new("", "t", "m", AlertSeverity::Info, BTreeMap::new(), None).is_err());
-        assert!(AlertPayload::new("r", "", "m", AlertSeverity::Info, BTreeMap::new(), None).is_err());
-        assert!(AlertPayload::new("r", "t", "", AlertSeverity::Info, BTreeMap::new(), None).is_err());
+        assert!(
+            AlertPayload::new("", "t", "m", AlertSeverity::Info, BTreeMap::new(), None).is_err()
+        );
+        assert!(
+            AlertPayload::new("r", "", "m", AlertSeverity::Info, BTreeMap::new(), None).is_err()
+        );
+        assert!(
+            AlertPayload::new("r", "t", "", AlertSeverity::Info, BTreeMap::new(), None).is_err()
+        );
     }
 
     #[test]

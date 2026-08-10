@@ -55,13 +55,15 @@ impl ReconcilerLogic {
     ) -> Vec<ReconDiff> {
         let mut diffs: Vec<ReconDiff> = Vec::new();
 
-        let local_cloids: BTreeMap<String, &Order> = local_orders
-            .iter()
-            .map(|o| (o.cloid.clone(), o))
-            .collect();
+        let local_cloids: BTreeMap<String, &Order> =
+            local_orders.iter().map(|o| (o.cloid.clone(), o)).collect();
         let exchange_cloids: BTreeMap<String, &Value> = exchange_orders
             .iter()
-            .filter_map(|o| o.get("cloid").and_then(|c| c.as_str()).map(|c| (c.to_string(), o)))
+            .filter_map(|o| {
+                o.get("cloid")
+                    .and_then(|c| c.as_str())
+                    .map(|c| (c.to_string(), o))
+            })
             .collect();
 
         // Local open orders missing on the exchange.
@@ -108,13 +110,18 @@ impl ReconcilerLogic {
                 .and_then(|s| Decimal::from_str_lenient(s).ok())
                 .unwrap_or(Decimal::ZERO);
             match local_by_symbol.get(symbol) {
-                Some(local) if (local.size.inner() - exchange_size).abs() > Decimal::from_str_strict("0.00000001").unwrap() => {
+                Some(local)
+                    if (local.size.inner() - exchange_size).abs()
+                        > Decimal::from_str_strict("0.00000001").unwrap() =>
+                {
                     diffs.push(ReconDiff {
                         entity_type: "position".into(),
                         entity_key: symbol.clone(),
                         difference_type: "size_mismatch".into(),
                         local_value: Some(serde_json::json!({ "size": local.size.to_string() })),
-                        exchange_value: Some(serde_json::json!({ "size": exchange_size.to_string() })),
+                        exchange_value: Some(
+                            serde_json::json!({ "size": exchange_size.to_string() }),
+                        ),
                         severity: Some("critical".into()),
                     });
                 }
@@ -124,7 +131,9 @@ impl ReconcilerLogic {
                         entity_key: symbol.clone(),
                         difference_type: "size_mismatch".into(),
                         local_value: None,
-                        exchange_value: Some(serde_json::json!({ "size": exchange_size.to_string() })),
+                        exchange_value: Some(
+                            serde_json::json!({ "size": exchange_size.to_string() }),
+                        ),
                         severity: Some("critical".into()),
                     });
                 }
@@ -263,7 +272,10 @@ impl ReconcilerLogic {
 
     /// Convert an exchange open-order payload into a domain `Order` (used for
     /// importing exchange truth before a cancel-all).
-    pub fn parse_exchange_order(exchange_order: &Value, canonical_cloid: &str) -> Result<Order, String> {
+    pub fn parse_exchange_order(
+        exchange_order: &Value,
+        canonical_cloid: &str,
+    ) -> Result<Order, String> {
         let symbol = exchange_order
             .get("coin")
             .and_then(|c| c.as_str())
@@ -544,7 +556,10 @@ mod tests {
             updated_at: chrono::Utc::now(),
         };
         let mut exchange_spot = BTreeMap::new();
-        exchange_spot.insert("USDC".into(), serde_json::json!({"total": "900", "hold": "0"}));
+        exchange_spot.insert(
+            "USDC".into(),
+            serde_json::json!({"total": "900", "hold": "0"}),
+        );
         let diffs = ReconcilerLogic::build_diffs(
             &[],
             &[],
@@ -644,7 +659,10 @@ mod tests {
         assert_eq!(corrected, 1);
         // Exchange wins.
         assert_eq!(tracker.get_position("BTC").unwrap().size.to_string(), "2");
-        assert_eq!(tracker.get_account_state().unwrap().equity.to_string(), "10000");
+        assert_eq!(
+            tracker.get_account_state().unwrap().equity.to_string(),
+            "10000"
+        );
     }
 
     #[tokio::test]
@@ -670,7 +688,8 @@ mod tests {
             Usd::ZERO,
         )
         .unwrap();
-        let (corrected, _) = reconciler.apply_exchange_truth(&BTreeMap::new(), &BTreeMap::new(), &acct);
+        let (corrected, _) =
+            reconciler.apply_exchange_truth(&BTreeMap::new(), &BTreeMap::new(), &acct);
         assert_eq!(corrected, 1);
         assert!(tracker.get_position("ETH").is_none());
     }

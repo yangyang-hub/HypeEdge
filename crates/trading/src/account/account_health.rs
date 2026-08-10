@@ -251,9 +251,10 @@ impl AccountHealthProvider for LayeredAccountHealthProvider {
         let observations = self.observations.lock().unwrap();
         let mut by_dimension: HashMap<AccountHealthDimension, FreshnessResult> = HashMap::new();
         for dimension in AccountHealthDimension::all() {
-            let observation = observations.get(&dimension).cloned().unwrap_or_else(|| {
-                FreshnessObservation::unobserved(dimension)
-            });
+            let observation = observations
+                .get(&dimension)
+                .cloned()
+                .unwrap_or_else(|| FreshnessObservation::unobserved(dimension));
             by_dimension.insert(dimension, evaluate(&observation, now, &self.thresholds));
         }
         AccountHealthSnapshot {
@@ -267,7 +268,11 @@ impl AccountHealthProvider for LayeredAccountHealthProvider {
 }
 
 impl MutableAccountHealthProvider for LayeredAccountHealthProvider {
-    fn record_success(&self, dimension: AccountHealthDimension, observed_at: Option<DateTime<Utc>>) {
+    fn record_success(
+        &self,
+        dimension: AccountHealthDimension,
+        observed_at: Option<DateTime<Utc>>,
+    ) {
         let timestamp = observed_at.unwrap_or_else(Utc::now);
         let mut observations = self.observations.lock().unwrap();
         observations.insert(
@@ -310,7 +315,9 @@ fn evaluate(
     now: DateTime<Utc>,
     thresholds: &AccountFreshnessThresholds,
 ) -> FreshnessResult {
-    let max_age_seconds = thresholds.for_dimension(observation.dimension).as_secs_f64();
+    let max_age_seconds = thresholds
+        .for_dimension(observation.dimension)
+        .as_secs_f64();
     let Some(observed_at) = observation.observed_at else {
         return FreshnessResult {
             dimension: observation.dimension,
@@ -318,7 +325,10 @@ fn evaluate(
             observed_at: None,
             age_seconds: None,
             max_age_seconds,
-            reason: observation.reason.clone().or_else(|| Some("not_observed".into())),
+            reason: observation
+                .reason
+                .clone()
+                .or_else(|| Some("not_observed".into())),
         };
     };
 
@@ -342,7 +352,10 @@ fn evaluate(
             observed_at: Some(observed_at),
             age_seconds: Some(age_seconds.max(0.0)),
             max_age_seconds,
-            reason: observation.reason.clone().or_else(|| Some("source_unhealthy".into())),
+            reason: observation
+                .reason
+                .clone()
+                .or_else(|| Some("source_unhealthy".into())),
         };
     }
     if age_seconds > max_age_seconds {
@@ -384,7 +397,8 @@ pub trait AccountStateSource: Send + Sync {
 pub type RiskProximityEvaluator = Box<dyn Fn(&PolledAccountSnapshot) -> bool + Send + Sync>;
 
 /// Async health-failure callback (e.g. reduce quotes).
-pub type HealthFailureCallback = Box<dyn Fn(&str) -> futures::future::BoxFuture<'_, ()> + Send + Sync>;
+pub type HealthFailureCallback =
+    Box<dyn Fn(&str) -> futures::future::BoxFuture<'_, ()> + Send + Sync>;
 
 /// Poll clearinghouse state at an adaptive, rate-budget-friendly cadence.
 pub struct AccountStatePoller {
@@ -416,7 +430,9 @@ impl AccountStatePoller {
             return Err("near-risk account poll interval must be between 0.5 and 2 seconds".into());
         }
         if near_risk_interval_seconds >= normal_interval_seconds {
-            return Err("near-risk account poll interval must be lower than normal interval".into());
+            return Err(
+                "near-risk account poll interval must be lower than normal interval".into(),
+            );
         }
         Ok(Self {
             source,
@@ -463,9 +479,11 @@ impl AccountStatePoller {
             }
             Err(e) => {
                 let reason = format!("clearinghouse_poll_failed:{e}");
-                let _ = self
-                    .health
-                    .record_failure(AccountHealthDimension::Clearinghouse, &reason, None);
+                let _ = self.health.record_failure(
+                    AccountHealthDimension::Clearinghouse,
+                    &reason,
+                    None,
+                );
                 tracing::warn!(reason = %reason, "account_state_poll_failed");
                 if let Some(callback) = &self.on_health_failure {
                     callback(&reason).await;
@@ -480,7 +498,8 @@ impl AccountStatePoller {
         if self.is_running() {
             return Err("account state poller is already running".into());
         }
-        self.running.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.running
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("account_state_poller_started");
         loop {
             let interval = self.poll_once().await;
@@ -490,7 +509,8 @@ impl AccountStatePoller {
                 _ = tokio::time::sleep(interval) => {}
             }
         }
-        self.running.store(false, std::sync::atomic::Ordering::Relaxed);
+        self.running
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         tracing::info!("account_state_poller_stopped");
         Ok(())
     }
@@ -534,16 +554,13 @@ fn default_near_risk(snapshot: &PolledAccountSnapshot) -> bool {
     if equity <= Decimal::ZERO {
         return true;
     }
-    let available_ratio = snapshot
-        .account_state
-        .available_balance
-        .inner()
-        .div(equity);
+    let available_ratio = snapshot.account_state.available_balance.inner().div(equity);
     if available_ratio.to_string().parse::<f64>().unwrap_or(0.0) <= 0.25 {
         return true;
     }
     for position in &snapshot.positions {
-        let (Some(mark), Some(liquidation)) = (position.mark_price, position.liquidation_price) else {
+        let (Some(mark), Some(liquidation)) = (position.mark_price, position.liquidation_price)
+        else {
             continue;
         };
         let mark = mark.inner();
@@ -562,7 +579,8 @@ fn default_near_risk(snapshot: &PolledAccountSnapshot) -> bool {
 /// adapter (implemented by the exchange client / app wiring).
 #[async_trait::async_trait]
 pub trait ClearinghouseRestClient: Send + Sync {
-    async fn get_clearinghouse_state(&self, user: &str) -> Result<serde_json::Value, HypeEdgeError>;
+    async fn get_clearinghouse_state(&self, user: &str)
+    -> Result<serde_json::Value, HypeEdgeError>;
     async fn get_spot_user_state(&self, user: &str) -> Result<serde_json::Value, HypeEdgeError>;
 }
 
@@ -603,7 +621,8 @@ impl AccountStateSource for RestAccountStateSource {
         let (raw, spot_raw) = self.fetch_raw().await?;
         let margin_summary = raw.get("marginSummary").and_then(|v| v.as_object());
         let asset_positions = raw.get("assetPositions").and_then(|v| v.as_array());
-        let (Some(margin_summary), Some(asset_positions)) = (margin_summary, asset_positions) else {
+        let (Some(margin_summary), Some(asset_positions)) = (margin_summary, asset_positions)
+        else {
             return Err(HypeEdgeError::MarketData(
                 "invalid_clearinghouse_state_response".into(),
             ));
@@ -617,7 +636,9 @@ impl AccountStateSource for RestAccountStateSource {
         )?;
         let margin_used_value = serde_json::json!((account_value - available).max(0.0));
         let margin_used = as_float(
-            margin_summary.get("totalMarginUsed").or(Some(&margin_used_value)),
+            margin_summary
+                .get("totalMarginUsed")
+                .or(Some(&margin_used_value)),
             "totalMarginUsed",
         )?;
 
@@ -628,7 +649,11 @@ impl AccountStateSource for RestAccountStateSource {
         let spot_balances = parse_spot_balances(&spot_raw, &self.account_address)?;
         let unrealized: f64 = positions
             .iter()
-            .map(|p| p.unrealized_pnl.map(|u| u.to_string().parse::<f64>().unwrap_or(0.0)).unwrap_or(0.0))
+            .map(|p| {
+                p.unrealized_pnl
+                    .map(|u| u.to_string().parse::<f64>().unwrap_or(0.0))
+                    .unwrap_or(0.0)
+            })
             .sum();
         let sub_account = self.account_address.to_lowercase();
         let peak = self.tracker.peak_equity().inner();
@@ -657,7 +682,10 @@ impl AccountStateSource for RestAccountStateSource {
     }
 }
 
-fn parse_spot_balances(raw: &serde_json::Value, account_address: &str) -> Result<Vec<SpotBalance>, HypeEdgeError> {
+fn parse_spot_balances(
+    raw: &serde_json::Value,
+    account_address: &str,
+) -> Result<Vec<SpotBalance>, HypeEdgeError> {
     let Some(balances) = raw.get("balances").and_then(|v| v.as_array()) else {
         return Err(HypeEdgeError::MarketData(
             "invalid_spot_clearinghouse_state_response".into(),
@@ -670,7 +698,9 @@ fn parse_spot_balances(raw: &serde_json::Value, account_address: &str) -> Result
             .or_else(|| item.get("token"))
             .and_then(|v| v.as_str());
         let Some(token) = token.filter(|t| !t.is_empty()) else {
-            return Err(HypeEdgeError::MarketData("spot_balance_missing_token".into()));
+            return Err(HypeEdgeError::MarketData(
+                "spot_balance_missing_token".into(),
+            ));
         };
         let total = as_float(item.get("total"), "spot.total")?;
         let hold = as_float(item.get("hold"), "spot.hold")?;
@@ -694,12 +724,16 @@ fn parse_position(item: &serde_json::Value) -> Result<Position, HypeEdgeError> {
     };
     let coin = raw.get("coin").and_then(|v| v.as_str());
     let Some(coin) = coin.filter(|c| !c.is_empty()) else {
-        return Err(HypeEdgeError::MarketData("asset_position_missing_coin".into()));
+        return Err(HypeEdgeError::MarketData(
+            "asset_position_missing_coin".into(),
+        ));
     };
     let size = as_float(raw.get("szi"), "szi")?;
     let position_value = as_float(raw.get("positionValue"), "positionValue")?.abs();
     let mark_price = if size != 0.0 {
-        Some(Price::new(Decimal::from_f64(position_value / size.abs()).unwrap_or_default()))
+        Some(Price::new(
+            Decimal::from_f64(position_value / size.abs()).unwrap_or_default(),
+        ))
     } else {
         None
     };
@@ -714,7 +748,8 @@ fn parse_position(item: &serde_json::Value) -> Result<Position, HypeEdgeError> {
         entry_price: optional_price(raw.get("entryPx"))?,
         mark_price,
         unrealized_pnl: Some(Usd::new(
-            Decimal::from_f64(as_float(raw.get("unrealizedPnl"), "unrealizedPnl")?).unwrap_or_default(),
+            Decimal::from_f64(as_float(raw.get("unrealizedPnl"), "unrealizedPnl")?)
+                .unwrap_or_default(),
         )),
         leverage: (leverage_value.max(1.0)) as u32,
         liquidation_price: optional_price(raw.get("liquidationPx"))?,
@@ -736,7 +771,11 @@ fn optional_price(value: Option<&serde_json::Value>) -> Result<Option<Price>, Hy
 fn as_float(value: Option<&serde_json::Value>, field: &str) -> Result<f64, HypeEdgeError> {
     value
         .and_then(|v| v.as_f64())
-        .or_else(|| value.and_then(|v| v.as_str()).and_then(|s| s.parse::<f64>().ok()))
+        .or_else(|| {
+            value
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<f64>().ok())
+        })
         .ok_or_else(|| HypeEdgeError::MarketData(format!("invalid numeric field: {field}")))
 }
 
@@ -802,7 +841,11 @@ mod tests {
     fn failure_records_unhealthy() {
         let provider = LayeredAccountHealthProvider::default();
         provider
-            .record_failure(AccountHealthDimension::Inventory, "source_boom", Some(at(90)))
+            .record_failure(
+                AccountHealthDimension::Inventory,
+                "source_boom",
+                Some(at(90)),
+            )
             .unwrap();
         let snapshot = provider.get_account_health(Some(at(100)));
         assert_eq!(snapshot.inventory.status, FreshnessStatus::Unhealthy);
@@ -812,9 +855,11 @@ mod tests {
     #[test]
     fn empty_failure_reason_rejected() {
         let provider = LayeredAccountHealthProvider::default();
-        assert!(provider
-            .record_failure(AccountHealthDimension::Inventory, "", None)
-            .is_err());
+        assert!(
+            provider
+                .record_failure(AccountHealthDimension::Inventory, "", None)
+                .is_err()
+        );
     }
 
     #[test]
@@ -833,9 +878,32 @@ mod tests {
     fn poller_validates_intervals() {
         let source: Arc<dyn AccountStateSource> = Arc::new(FailSource);
         let tracker = Arc::new(AccountTracker::new());
-        let health: Arc<dyn MutableAccountHealthProvider> = Arc::new(LayeredAccountHealthProvider::default());
-        assert!(AccountStatePoller::new(source.clone(), tracker.clone(), health.clone(), 6.0, 1.0, None, None).is_err());
-        assert!(AccountStatePoller::new(source.clone(), tracker.clone(), health.clone(), 3.0, 3.0, None, None).is_err());
+        let health: Arc<dyn MutableAccountHealthProvider> =
+            Arc::new(LayeredAccountHealthProvider::default());
+        assert!(
+            AccountStatePoller::new(
+                source.clone(),
+                tracker.clone(),
+                health.clone(),
+                6.0,
+                1.0,
+                None,
+                None
+            )
+            .is_err()
+        );
+        assert!(
+            AccountStatePoller::new(
+                source.clone(),
+                tracker.clone(),
+                health.clone(),
+                3.0,
+                3.0,
+                None,
+                None
+            )
+            .is_err()
+        );
         assert!(AccountStatePoller::new(source, tracker, health, 3.0, 1.0, None, None).is_ok());
     }
 
@@ -854,18 +922,20 @@ mod tests {
         let tracker = Arc::new(AccountTracker::new());
         let health: Arc<dyn MutableAccountHealthProvider> =
             Arc::new(LayeredAccountHealthProvider::default());
-        let poller = AccountStatePoller::new(source, tracker, health.clone(), 3.0, 1.0, None, None)
-            .unwrap();
+        let poller =
+            AccountStatePoller::new(source, tracker, health.clone(), 3.0, 1.0, None, None).unwrap();
         let interval = poller.poll_once().await;
         assert_eq!(interval, Duration::from_secs(1));
         let snapshot = health.get_account_health(None);
         assert_eq!(snapshot.clearinghouse.status, FreshnessStatus::Unhealthy);
-        assert!(snapshot
-            .clearinghouse
-            .reason
-            .as_deref()
-            .unwrap()
-            .starts_with("clearinghouse_poll_failed:"));
+        assert!(
+            snapshot
+                .clearinghouse
+                .reason
+                .as_deref()
+                .unwrap()
+                .starts_with("clearinghouse_poll_failed:")
+        );
     }
 
     #[test]

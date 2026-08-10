@@ -88,7 +88,9 @@ fn normalize_decimal_strings(value: &serde_json::Value) -> serde_json::Value {
             };
             serde_json::Value::String(s)
         }
-        serde_json::Value::String(s) if looks_numeric(s) => serde_json::Value::String(trim_decimal(s)),
+        serde_json::Value::String(s) if looks_numeric(s) => {
+            serde_json::Value::String(trim_decimal(s))
+        }
         serde_json::Value::Array(arr) => {
             serde_json::Value::Array(arr.iter().map(normalize_decimal_strings).collect())
         }
@@ -117,7 +119,8 @@ fn trim_decimal(s: &str) -> String {
 
 fn looks_numeric(s: &str) -> bool {
     !s.is_empty()
-        && s.bytes().all(|b| b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'+')
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || b == b'.' || b == b'-' || b == b'+')
         && s.bytes().any(|b| b.is_ascii_digit())
 }
 
@@ -137,7 +140,11 @@ mod tests {
     fn config_hash_normalizes_decimal_scale() {
         let a = serde_json::json!({"quote_size": "0.100"});
         let b = serde_json::json!({"quote_size": 0.1});
-        assert_eq!(config_hash(&a), config_hash(&b), "trailing-zero scale must not affect the hash");
+        assert_eq!(
+            config_hash(&a),
+            config_hash(&b),
+            "trailing-zero scale must not affect the hash"
+        );
     }
 
     #[test]

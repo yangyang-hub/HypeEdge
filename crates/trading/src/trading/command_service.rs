@@ -9,7 +9,8 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::{DateTime, Utc};use hypeedge_domain::decimal::Decimal;
+use chrono::{DateTime, Utc};
+use hypeedge_domain::decimal::Decimal;
 use hypeedge_domain::error::HypeEdgeError;
 use hypeedge_domain::models::{OrderIntent, RiskCheckResult};
 use uuid::Uuid;
@@ -149,13 +150,20 @@ pub trait SafetyPlacementGate: Send + Sync {
 /// Async data-health gate producing the market context used downstream.
 #[async_trait]
 pub trait DataHealthGate: Send + Sync {
-    async fn check_placement(&self, intent: &OrderIntent) -> Result<DataHealthDecision, HypeEdgeError>;
+    async fn check_placement(
+        &self,
+        intent: &OrderIntent,
+    ) -> Result<DataHealthDecision, HypeEdgeError>;
 }
 
 /// Risk admission gate (fail-safe: any error is a rejection).
 #[async_trait]
 pub trait RiskAdmissionGate: Send + Sync {
-    async fn check(&self, intent: &OrderIntent, reference_price: Option<Decimal>) -> RiskCheckResult;
+    async fn check(
+        &self,
+        intent: &OrderIntent,
+        reference_price: Option<Decimal>,
+    ) -> RiskCheckResult;
 }
 
 /// Action-budget placement gate.
@@ -177,7 +185,10 @@ pub trait OrderIntentNormalizer: Send + Sync {
 /// Durable sink for the canonical command.
 #[async_trait]
 pub trait DurableTradingCommandSink: Send + Sync {
-    async fn persist(&self, command: &TradingCommand) -> Result<TradingCommandReceipt, HypeEdgeError>;
+    async fn persist(
+        &self,
+        command: &TradingCommand,
+    ) -> Result<TradingCommandReceipt, HypeEdgeError>;
 }
 
 /// Admit placements in the one authorized order, then persist them.
@@ -221,7 +232,15 @@ impl TradingCommandService {
         // 1. Safety.
         if let Err(e) = self.safety.check_placement(&intent) {
             return self
-                .persist_rejection(command_id, created_at, &intent, "safety", &e.to_string(), None, None)
+                .persist_rejection(
+                    command_id,
+                    created_at,
+                    &intent,
+                    "safety",
+                    &e.to_string(),
+                    None,
+                    None,
+                )
                 .await;
         }
 
@@ -230,14 +249,33 @@ impl TradingCommandService {
             Ok(data) => data,
             Err(e) => {
                 return self
-                    .persist_rejection(command_id, created_at, &intent, "data_health", &e.to_string(), None, None)
-                    .await
+                    .persist_rejection(
+                        command_id,
+                        created_at,
+                        &intent,
+                        "data_health",
+                        &e.to_string(),
+                        None,
+                        None,
+                    )
+                    .await;
             }
         };
         if !data.allowed {
-            let reason = data.reason.clone().unwrap_or_else(|| "data_health_rejected".into());
+            let reason = data
+                .reason
+                .clone()
+                .unwrap_or_else(|| "data_health_rejected".into());
             return self
-                .persist_rejection(command_id, created_at, &intent, "data_health", &reason, None, Some(&data))
+                .persist_rejection(
+                    command_id,
+                    created_at,
+                    &intent,
+                    "data_health",
+                    &reason,
+                    None,
+                    Some(&data),
+                )
                 .await;
         }
 
@@ -245,9 +283,20 @@ impl TradingCommandService {
         let reference_price = data.reference_price;
         let risk_result = self.risk.check(&intent, reference_price).await;
         if !risk_result.passed {
-            let reason = risk_result.reason.clone().unwrap_or_else(|| "risk_rejected".into());
+            let reason = risk_result
+                .reason
+                .clone()
+                .unwrap_or_else(|| "risk_rejected".into());
             return self
-                .persist_rejection(command_id, created_at, &intent, "risk", &reason, Some(&risk_result), Some(&data))
+                .persist_rejection(
+                    command_id,
+                    created_at,
+                    &intent,
+                    "risk",
+                    &reason,
+                    Some(&risk_result),
+                    Some(&data),
+                )
                 .await;
         }
 
@@ -265,11 +314,14 @@ impl TradingCommandService {
                         Some(&risk_result),
                         Some(&data),
                     )
-                    .await
+                    .await;
             }
         };
         if !budget.allowed {
-            let reason = budget.reason.clone().unwrap_or_else(|| "action_budget_rejected".into());
+            let reason = budget
+                .reason
+                .clone()
+                .unwrap_or_else(|| "action_budget_rejected".into());
             return self
                 .persist_rejection(
                     command_id,
@@ -300,7 +352,7 @@ impl TradingCommandService {
                         Some(&risk_result),
                         Some(&data),
                     )
-                    .await
+                    .await;
             }
         };
 
@@ -424,7 +476,10 @@ impl TradingCommandService {
         .await
     }
 
-    async fn persist(&self, command: TradingCommand) -> Result<TradingCommandReceipt, HypeEdgeError> {
+    async fn persist(
+        &self,
+        command: TradingCommand,
+    ) -> Result<TradingCommandReceipt, HypeEdgeError> {
         self.sink.persist(&command).await.map_err(|e| match e {
             HypeEdgeError::TradingCommandConflict { .. } => e,
             _ => HypeEdgeError::TradingCommandPersistence {
@@ -501,7 +556,10 @@ impl InMemoryTradingCommandSink {
 
 #[async_trait]
 impl DurableTradingCommandSink for InMemoryTradingCommandSink {
-    async fn persist(&self, command: &TradingCommand) -> Result<TradingCommandReceipt, HypeEdgeError> {
+    async fn persist(
+        &self,
+        command: &TradingCommand,
+    ) -> Result<TradingCommandReceipt, HypeEdgeError> {
         let fingerprint = fingerprint(command);
         let mut guard = self.commands.lock().unwrap();
         if let Some((existing_fingerprint, receipt)) = guard.get(&command.command_id) {
@@ -545,23 +603,50 @@ fn fingerprint(command: &TradingCommand) -> String {
     };
     push("kind", command.kind.as_str().to_string());
     push("status", command.status.as_str().to_string());
-    push("target_cloid", command.target_cloid.clone().unwrap_or_default());
+    push(
+        "target_cloid",
+        command.target_cloid.clone().unwrap_or_default(),
+    );
     push("symbol", command.symbol.clone().unwrap_or_default());
-    push("strategy_id", command.strategy_id.clone().unwrap_or_default());
-    push("rejection_gate", command.rejection_gate.clone().unwrap_or_default());
-    push("rejection_reason", command.rejection_reason.clone().unwrap_or_default());
+    push(
+        "strategy_id",
+        command.strategy_id.clone().unwrap_or_default(),
+    );
+    push(
+        "rejection_gate",
+        command.rejection_gate.clone().unwrap_or_default(),
+    );
+    push(
+        "rejection_reason",
+        command.rejection_reason.clone().unwrap_or_default(),
+    );
     if let Some(intent) = &command.intent {
         push("intent.symbol", intent.symbol.clone());
         push("intent.side", intent.side.as_str().to_string());
         push("intent.size", intent.size.to_string());
-        push("intent.price", intent.price.map(|p| p.to_string()).unwrap_or_default());
+        push(
+            "intent.price",
+            intent.price.map(|p| p.to_string()).unwrap_or_default(),
+        );
         push("intent.order_type", intent.order_type.as_str().to_string());
-        push("intent.time_in_force", intent.time_in_force.as_str().to_string());
-        push("intent.strategy_id", intent.strategy_id.clone().unwrap_or_default());
-        push("intent.sub_account", intent.sub_account.clone().unwrap_or_default());
+        push(
+            "intent.time_in_force",
+            intent.time_in_force.as_str().to_string(),
+        );
+        push(
+            "intent.strategy_id",
+            intent.strategy_id.clone().unwrap_or_default(),
+        );
+        push(
+            "intent.sub_account",
+            intent.sub_account.clone().unwrap_or_default(),
+        );
         push("intent.reduce_only", intent.reduce_only.to_string());
         push("intent.cloid", intent.cloid.clone().unwrap_or_default());
-        push("intent.client_id", intent.client_id.clone().unwrap_or_default());
+        push(
+            "intent.client_id",
+            intent.client_id.clone().unwrap_or_default(),
+        );
     }
     format!("{:x}", hasher.finalize())
 }
@@ -589,7 +674,11 @@ impl SafetyPlacementGate for SafetyController {
 /// Wire the risk gate from the `RiskChecker`.
 #[async_trait]
 impl RiskAdmissionGate for crate::risk::checker::RiskChecker {
-    async fn check(&self, intent: &OrderIntent, reference_price: Option<Decimal>) -> RiskCheckResult {
+    async fn check(
+        &self,
+        intent: &OrderIntent,
+        reference_price: Option<Decimal>,
+    ) -> RiskCheckResult {
         crate::risk::checker::RiskChecker::check(self, intent, reference_price).await
     }
 }
@@ -680,7 +769,10 @@ mod tests {
 
     #[async_trait]
     impl DataHealthGate for StaticDataHealth {
-        async fn check_placement(&self, _intent: &OrderIntent) -> Result<DataHealthDecision, HypeEdgeError> {
+        async fn check_placement(
+            &self,
+            _intent: &OrderIntent,
+        ) -> Result<DataHealthDecision, HypeEdgeError> {
             Ok(self.decision.clone())
         }
     }
@@ -689,7 +781,10 @@ mod tests {
 
     #[async_trait]
     impl DataHealthGate for FailingDataHealth {
-        async fn check_placement(&self, _intent: &OrderIntent) -> Result<DataHealthDecision, HypeEdgeError> {
+        async fn check_placement(
+            &self,
+            _intent: &OrderIntent,
+        ) -> Result<DataHealthDecision, HypeEdgeError> {
             Err(HypeEdgeError::MarketData(self.0.clone()))
         }
     }
@@ -721,7 +816,11 @@ mod tests {
 
     #[async_trait]
     impl RiskAdmissionGate for StaticRisk {
-        async fn check(&self, _intent: &OrderIntent, _reference_price: Option<Decimal>) -> RiskCheckResult {
+        async fn check(
+            &self,
+            _intent: &OrderIntent,
+            _reference_price: Option<Decimal>,
+        ) -> RiskCheckResult {
             self.result.clone()
         }
     }
@@ -732,16 +831,23 @@ mod tests {
 
     impl StaticBudget {
         fn allowed() -> Self {
-            Self { decision: GateDecision::allow() }
+            Self {
+                decision: GateDecision::allow(),
+            }
         }
         fn rejected(reason: &str) -> Self {
-            Self { decision: GateDecision::reject(reason) }
+            Self {
+                decision: GateDecision::reject(reason),
+            }
         }
     }
 
     #[async_trait]
     impl ActionBudgetAdmissionGate for StaticBudget {
-        async fn check_placement(&self, _intent: &OrderIntent) -> Result<GateDecision, HypeEdgeError> {
+        async fn check_placement(
+            &self,
+            _intent: &OrderIntent,
+        ) -> Result<GateDecision, HypeEdgeError> {
             Ok(self.decision.clone())
         }
     }
@@ -822,7 +928,14 @@ mod tests {
     async fn safety_rejection_is_persisted() {
         let sink = Arc::new(InMemoryTradingCommandSink::new());
         let (_, dh, r, b, n) = all_allow();
-        let svc = service(Arc::new(RejectSafety("halting".into())), dh, r, b, n, sink.clone());
+        let svc = service(
+            Arc::new(RejectSafety("halting".into())),
+            dh,
+            r,
+            b,
+            n,
+            sink.clone(),
+        );
         let receipt = svc.submit_order(intent(), None).await.unwrap();
         assert!(!receipt.accepted());
         assert_eq!(receipt.status, TradingCommandStatus::Rejected);
@@ -845,7 +958,10 @@ mod tests {
         let receipt = svc.submit_order(intent(), None).await.unwrap();
         assert!(!receipt.accepted());
         assert_eq!(receipt.rejection_gate.as_deref(), Some("data_health"));
-        assert_eq!(receipt.rejection_reason.as_deref(), Some("stale_market_data"));
+        assert_eq!(
+            receipt.rejection_reason.as_deref(),
+            Some("stale_market_data")
+        );
     }
 
     #[tokio::test]
@@ -863,7 +979,13 @@ mod tests {
         let receipt = svc.submit_order(intent(), None).await.unwrap();
         assert!(!receipt.accepted());
         assert_eq!(receipt.rejection_gate.as_deref(), Some("data_health"));
-        assert!(receipt.rejection_reason.as_deref().unwrap().contains("boom"));
+        assert!(
+            receipt
+                .rejection_reason
+                .as_deref()
+                .unwrap()
+                .contains("boom")
+        );
     }
 
     #[tokio::test]
@@ -881,7 +1003,10 @@ mod tests {
         let receipt = svc.submit_order(intent(), None).await.unwrap();
         assert!(!receipt.accepted());
         assert_eq!(receipt.rejection_gate.as_deref(), Some("risk"));
-        assert_eq!(receipt.rejection_reason.as_deref(), Some("max_position_exceeded"));
+        assert_eq!(
+            receipt.rejection_reason.as_deref(),
+            Some("max_position_exceeded")
+        );
     }
 
     #[tokio::test]
@@ -906,7 +1031,14 @@ mod tests {
     async fn normalizer_failure_is_fail_closed() {
         let sink = Arc::new(InMemoryTradingCommandSink::new());
         let (s, dh, r, b, _) = all_allow();
-        let svc = service(s, dh, r, b, Arc::new(FailingNormalizer("bad_size".into())), sink.clone());
+        let svc = service(
+            s,
+            dh,
+            r,
+            b,
+            Arc::new(FailingNormalizer("bad_size".into())),
+            sink.clone(),
+        );
         let receipt = svc.submit_order(intent(), None).await.unwrap();
         assert!(!receipt.accepted());
         assert_eq!(receipt.rejection_gate.as_deref(), Some("normalize"));
@@ -917,7 +1049,10 @@ mod tests {
         let sink = Arc::new(InMemoryTradingCommandSink::new());
         let (s, dh, r, b, n) = all_allow();
         let svc = service(s, dh, r, b, n, sink.clone());
-        let receipt = svc.cancel_order("c1", Some("mm-btc".into()), None).await.unwrap();
+        let receipt = svc
+            .cancel_order("c1", Some("mm-btc".into()), None)
+            .await
+            .unwrap();
         assert!(receipt.accepted());
         assert_eq!(receipt.kind, TradingCommandKind::Cancel);
         assert_eq!(receipt.target_cloid.as_deref(), Some("c1"));
@@ -929,7 +1064,10 @@ mod tests {
         let sink = Arc::new(InMemoryTradingCommandSink::new());
         let (s, dh, r, b, n) = all_allow();
         let svc = service(s, dh, r, b, n, sink.clone());
-        let receipt = svc.cancel_all_orders(Some("ETH".into()), None, None).await.unwrap();
+        let receipt = svc
+            .cancel_all_orders(Some("ETH".into()), None, None)
+            .await
+            .unwrap();
         assert!(receipt.accepted());
         assert_eq!(receipt.kind, TradingCommandKind::CancelAll);
         assert_eq!(receipt.symbol.as_deref(), Some("ETH"));
