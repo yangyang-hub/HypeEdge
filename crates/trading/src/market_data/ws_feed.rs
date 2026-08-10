@@ -25,7 +25,6 @@ fn wrap_corr(payload: DomainEvent, correlation_id: impl Into<String>) -> Arc<Eve
 }
 
 /// The WebSocket market-data feed.
-#[allow(dead_code)] // ws_url + reconnect delays used by the live loop in app
 pub struct WebSocketFeed {
     ws_url: String,
     coins: Vec<String>,
@@ -71,6 +70,19 @@ impl WebSocketFeed {
 
     pub fn connection_generation(&self) -> u32 {
         self.connection_generation
+    }
+
+    /// Live connect/subscribe/reconnect loop (6c): opens the WS, subscribes,
+    /// forwards frames to [`WebSocketFeed::handle_message`], and reconnects
+    /// with exponential backoff. Runs until the task is dropped. The feed is
+    /// shared behind a mutex because `handle_message` is `&mut self`.
+    pub async fn run(self: Arc<WebSocketFeed>, bus: Arc<EventBus>) {
+        match Arc::try_unwrap(self) {
+            Ok(feed) => run_feed_loop(std::sync::Mutex::new(feed), bus).await,
+            Err(_) => {
+                tracing::error!("ws_feed_run_called_with_shared_arc");
+            }
+        }
     }
 
     /// Build the Hyperliquid subscription payloads (channel schemas differ:
@@ -385,6 +397,80 @@ impl WebSocketFeed {
             cfg.reconnect_delay_min,
             cfg.reconnect_delay_max,
         )
+    }
+}
+
+/// The connect/subscribe/read/reconnect loop (6c). The feed is shared behind a
+/// mutex so the read loop can take `&mut` (`handle_message` is `&mut self`).
+async fn run_feed_loop(
+    feed: std::sync::Mutex<WebSocketFeed>,
+    bus: Arc<EventBus>,
+) {
+    use futures::SinkExt;
+    use futures::StreamExt;
+    use tokio_tungstenite::connect_async;
+
+    let ws_url = feed.lock().unwrap().ws_url.clone();
+    let mut backoff = feed.lock().unwrap().reconnect_delay_min;
+    let mut generation = 0u32;
+    loop {
+        match connect_async(&ws_url).await {
+            Ok((ws_stream, _resp)) => {
+                let (mut write, mut read) = ws_stream.split();
+                // Bump the generation for this socket; stale frames from a
+                // previous socket are rejected by BookManager::update.
+                generation += 1;
+                tracing::info!(generation, "ws_feed_connected");
+
+                // Subscribe.
+                let subs = feed.lock().unwrap().build_subscriptions();
+                for sub in &subs {
+                    if let Err(e) = write
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            sub.to_string().into(),
+                        ))
+                        .await
+                    {
+                        tracing::warn!(error = %e, "ws_feed_subscribe_error");
+                        break;
+                    }
+                }
+
+                // Read frames until the socket closes.
+                while let Some(msg) = read.next().await {
+                    let msg = match msg {
+                        Ok(m) => m,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "ws_feed_read_error");
+                            break;
+                        }
+                    };
+                    let text = match msg {
+                        tokio_tungstenite::tungstenite::Message::Text(t) => t.to_string(),
+                        tokio_tungstenite::tungstenite::Message::Ping(p) => {
+                            let _ = write
+                                .send(tokio_tungstenite::tungstenite::Message::Pong(p))
+                                .await;
+                            continue;
+                        }
+                        tokio_tungstenite::tungstenite::Message::Close(_) => break,
+                        _ => continue,
+                    };
+                    let mut inner = feed.lock().unwrap();
+                    inner.connection_generation = generation;
+                    if let Err(e) = inner.handle_message(&bus, &text) {
+                        tracing::warn!(error = %e, "ws_feed_message_error");
+                    }
+                }
+                // Clean close; reconnect with the minimum delay.
+                backoff = feed.lock().unwrap().reconnect_delay_min;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "ws_feed_connection_error");
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_secs_f64(backoff)).await;
+        backoff = (backoff * 2.0).min(feed.lock().unwrap().reconnect_delay_max);
     }
 }
 

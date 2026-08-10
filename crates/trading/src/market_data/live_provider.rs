@@ -96,9 +96,13 @@ impl LiveMarketDataProvider {
 
     /// Subscribe to events and begin tracking market state in a background task.
     pub fn start(self: &Arc<Self>) -> Mailbox {
-        let mailbox = self
-            .event_bus
-            .subscribe_many(&[EventType::TradeUpdate, EventType::MidPriceUpdate, EventType::FundingUpdate, EventType::CandleUpdate]);
+        let mailbox = self.event_bus.subscribe_many(&[
+            EventType::TradeUpdate,
+            EventType::MidPriceUpdate,
+            EventType::FundingUpdate,
+            EventType::CandleUpdate,
+            EventType::L2BookUpdate,
+        ]);
         let consumer = mailbox.clone();
         let provider = self.clone();
         tokio::spawn(async move {
@@ -117,6 +121,12 @@ impl LiveMarketDataProvider {
 
     async fn handle_event(&self, event: &Event) {
         match &event.payload {
+            // 6c: bridge WS l2Book snapshots into the shared book manager the
+            // API and execution engine read.
+            DomainEvent::L2BookUpdate(book) => {
+                let mut books = self.book_manager.lock().await;
+                books.apply_snapshot(book);
+            }
             DomainEvent::TradeUpdate(trade) => {
                 self.last_trades
                     .lock()
@@ -333,6 +343,7 @@ mod tests {
     use hypeedge_domain::decimal::{Price, Size};
     use hypeedge_domain::enums::Side;
     use hypeedge_domain::events::EventType;
+    use hypeedge_domain::models::L2Level;
 
     struct StubHistory;
 
@@ -476,5 +487,38 @@ mod tests {
         let _ = EventType::MidPriceUpdate;
         let _ = EventType::FundingUpdate;
         let _ = EventType::CandleUpdate;
+    }
+
+    #[tokio::test]
+    async fn l2_book_update_bridges_into_shared_book() {
+        // 6c: an L2BookUpdate on the bus must write the shared BookManager the
+        // API and execution engine read.
+        let bus = Arc::new(EventBus::new(16));
+        let history: Arc<dyn CandleHistoryClient> = Arc::new(StubHistory);
+        let books = Arc::new(tokio::sync::Mutex::new(BookManager::new(10)));
+        let p = LiveMarketDataProvider::new(bus, history, books.clone());
+
+        let snapshot = L2BookSnapshot {
+            symbol: "BTC".into(),
+            bids: vec![L2Level {
+                price: Price::new(Decimal::from_str_lenient("99").unwrap()),
+                size: Size::new(Decimal::from_str_lenient("2").unwrap()),
+            }],
+            asks: vec![L2Level {
+                price: Price::new(Decimal::from_str_lenient("101").unwrap()),
+                size: Size::new(Decimal::from_str_lenient("3").unwrap()),
+            }],
+            timestamp: 1_700_000_000_000,
+            local_ts: Utc::now(),
+            version: 1,
+            connection_generation: 1,
+        };
+        p.handle_event(&Event::new(DomainEvent::L2BookUpdate(snapshot)))
+            .await;
+
+        let shared = books.lock().await.get_snapshot("BTC").expect("book populated");
+        assert_eq!(shared.bids.len(), 1);
+        assert_eq!(shared.bids[0].price.to_string(), "99");
+        assert_eq!(shared.asks[0].price.to_string(), "101");
     }
 }
