@@ -149,6 +149,10 @@ pub struct ExecutionEngine {
     market_price_stale_seconds: f64,
     durable_kill_trigger: Option<Arc<dyn DurableKillTrigger>>,
     orders: Arc<Mutex<HashMap<String, Order>>>,
+    /// Address action-quota ledger (B3): when configured, every placement
+    /// passes `permission()`, debits the ledger after a successful send, and
+    /// credits organic fill volume.
+    action_budget: Option<Arc<Mutex<crate::risk::ActionBudgetController>>>,
 }
 
 /// Configuration for [`ExecutionEngine::new`].
@@ -168,6 +172,8 @@ pub struct ExecutionEngineConfig {
     pub deferred_execution: bool,
     pub market_price_stale_seconds: f64,
     pub durable_kill_trigger: Option<Arc<dyn DurableKillTrigger>>,
+    /// Address action-quota ledger (B3).
+    pub action_budget: Option<Arc<Mutex<crate::risk::ActionBudgetController>>>,
 }
 
 impl ExecutionEngine {
@@ -190,6 +196,7 @@ impl ExecutionEngine {
             market_price_stale_seconds: config.market_price_stale_seconds,
             durable_kill_trigger: config.durable_kill_trigger,
             orders: Arc::new(Mutex::new(HashMap::new())),
+            action_budget: config.action_budget,
         }
     }
 
@@ -492,7 +499,10 @@ impl ExecutionEngine {
         let safety = self.safety.clone();
         let rl = self.rate_limiter.clone();
         let exchange = self.exchange.clone();
+        let risk_checker = self.risk_checker.clone();
         let intent_for_preflight = intent.clone();
+        let action_budget = self.action_budget.clone();
+        let cloid_owned = cloid.to_string();
 
         // Submit inside the serial nonce worker with a 3s timeout (design doc
         // §9.4). A timeout means the outcome is unknown: resolve it by cloid
@@ -504,6 +514,8 @@ impl ExecutionEngine {
                 let safety = safety.clone();
                 let rl = rl.clone();
                 let exchange = exchange.clone();
+                let risk_checker = risk_checker.clone();
+                let action_budget = action_budget.clone();
                 let intent_for_preflight = intent_for_preflight.clone();
                 Box::pin(async move {
                     // Preflight inside the worker, immediately before signing.
@@ -520,7 +532,64 @@ impl ExecutionEngine {
                     if rl.as_ref().is_some_and(|rl| !rl.check_action_credits()) {
                         return Err(format!("{SAFETY_ABORT_PREFIX}action_credits_below_threshold"));
                     }
-                    exchange.order(vec![wire], nonce).await
+                    // Re-run the risk checker immediately before the signed send
+                    // (B2): N queued orders must not all pass against the same
+                    // pre-queue account state, and a drawdown/leverage breach
+                    // that develops after admission must stop the placement.
+                    if let Some(checker) = &risk_checker {
+                        let result = checker.check(&intent_for_preflight, reference_price).await;
+                        if !result.passed {
+                            let reason = result
+                                .reason
+                                .unwrap_or_else(|| "risk_check_rejected".into());
+                            return Err(format!("{SAFETY_ABORT_PREFIX}{reason}"));
+                        }
+                    }
+                    // Action-quota permission (B3): reject when the address
+                    // budget does not permit a placement.
+                    if let Some(budget) = &action_budget {
+                        let request = crate::risk::PermissionRequest {
+                            action: crate::risk::BudgetAction::Place,
+                            strategy_id: intent_for_preflight.strategy_id.clone(),
+                            symbol: intent_for_preflight
+                                .strategy_id
+                                .as_ref()
+                                .map(|_| intent_for_preflight.symbol.clone()),
+                            child_actions: 1,
+                            ip_weight: 1,
+                            risk_reducing: intent_for_preflight.reduce_only
+                                || intent_for_preflight.risk_reducing,
+                            emergency: false,
+                        };
+                        let permission = budget.lock().await.permission(&request);
+                        if let Ok(permission) = permission
+                            && !permission.allowed
+                        {
+                            return Err(format!(
+                                "{SAFETY_ABORT_PREFIX}action_budget:{}",
+                                permission.reason
+                            ));
+                        }
+                    }
+                    let result = exchange.order(vec![wire], nonce).await;
+                    // Debit the address ledger for the placement (B3).
+                    if let Some(budget) = &action_budget {
+                        let debit = crate::risk::NetworkAttemptDebit {
+                            attempt_id: cloid_owned.clone(),
+                            child_actions: vec![crate::risk::BudgetAction::Place],
+                            ip_weight: 1,
+                            occurred_at: Utc::now(),
+                            strategy_id: intent_for_preflight.strategy_id.clone(),
+                            symbol: intent_for_preflight
+                                .strategy_id
+                                .as_ref()
+                                .map(|_| intent_for_preflight.symbol.clone()),
+                        };
+                        if let Err(e) = budget.lock().await.debit_network_attempt(debit) {
+                            tracing::error!(cloid = %cloid_owned, error = %e, "action_budget_debit_failed");
+                        }
+                    }
+                    result
                 })
             }),
         )
@@ -674,6 +743,16 @@ impl ExecutionEngine {
                             order.exchange_oid = fill.get("oid").map(|o| o.to_string());
                             order.filled_size = provisional_size;
                             order.avg_fill_price = Some(provisional_price);
+                            // Credit the address action quota with the organic
+                            // fill volume (B3).
+                            if let Some(budget) = &self.action_budget {
+                                let notional =
+                                    provisional_size.inner() * provisional_price.inner();
+                                budget
+                                    .lock()
+                                    .await
+                                    .record_fill(notional, Some(Utc::now()));
+                            }
                             self.persist_transition(order, "filled", command_id, Some("succeeded"))
                                 .await?;
                             self.publish(DomainEvent::OrderFilled(order.clone()), &cloid);
@@ -1220,6 +1299,23 @@ impl ExecutionEngine {
             self.publish(DomainEvent::OrderCancelled(order.clone()), &order.cloid);
             return Ok(true);
         }
+        // B2: a durable command replayed after a crash/lease-loss is re-sent —
+        // it must re-pass the risk check, not sail through on the state that
+        // existed when it was originally admitted.
+        if let Some(checker) = &self.risk_checker {
+            let reference_price = order.price.map(|p| p.inner());
+            let result = checker.check(&intent, reference_price).await;
+            if !result.passed {
+                let reason = result.reason.unwrap_or_else(|| "risk_check_rejected".into());
+                self.state_machine
+                    .transition(&mut order, OrderStatus::Cancelled, Some("dispatch_aborted_by_risk"))?;
+                order.error_message = Some(reason.clone());
+                self.persist_transition(&order, "dispatch_aborted", Some(command.command_id), Some("cancelled"))
+                    .await?;
+                self.publish(DomainEvent::OrderCancelled(order.clone()), &order.cloid);
+                return Ok(true);
+            }
+        }
         if self.rate_limiter.as_ref().is_some_and(|rl| !rl.check_action_credits()) {
             self.state_machine
                 .transition(&mut order, OrderStatus::Cancelled, Some("dispatch_aborted_by_safety_gate"))?;
@@ -1586,6 +1682,37 @@ mod tests {
         }
     }
 
+    /// An account facade that is healthy on the first read (so the pre-queue
+    /// risk check passes) and unavailable on later reads (so the in-worker
+    /// re-check rejects) — deterministic way to exercise the B2 worker path.
+    struct FlippingAccount {
+        reads: std::sync::atomic::AtomicU32,
+    }
+    impl crate::risk::checker::AccountView for FlippingAccount {
+        fn get_account_state(&self) -> Option<AccountState> {
+            let n = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n == 0 {
+                let eq = hypeedge_domain::Usd::new(Decimal::from_str_strict("1000000").unwrap());
+                Some(AccountState {
+                    equity: eq,
+                    available_balance: eq,
+                    total_margin_used: hypeedge_domain::Usd::ZERO,
+                    total_unrealized_pnl: hypeedge_domain::Usd::ZERO,
+                    peak_equity: eq,
+                    sub_account: None,
+                })
+            } else {
+                None
+            }
+        }
+        fn get_position(&self, _symbol: &str) -> Option<Position> {
+            None
+        }
+        fn last_update_ts(&self) -> Option<DateTime<Utc>> {
+            Some(Utc::now())
+        }
+    }
+
     fn rate_limiter() -> RateLimiter {
         let rl = RateLimiter::new(1200, 1000);
         rl.update_action_credits(5000);
@@ -1656,6 +1783,7 @@ mod tests {
             deferred_execution: false,
             market_price_stale_seconds: 5.0,
             durable_kill_trigger: None,
+            action_budget: None,
         })
     }
 
@@ -1764,6 +1892,7 @@ mod tests {
             deferred_execution: false,
             market_price_stale_seconds: 5.0,
             durable_kill_trigger: None,
+            action_budget: None,
         });
         ks.trigger("test").await;
         let err = engine.submit_order(limit_intent(), None).await.unwrap_err();
@@ -1790,10 +1919,127 @@ mod tests {
             deferred_execution: false,
             market_price_stale_seconds: 5.0,
             durable_kill_trigger: None,
+            action_budget: None,
         });
         let order = engine.submit_order(limit_intent(), None).await.unwrap();
         assert_eq!(order.status, OrderStatus::Rejected);
         assert_eq!(order.error_message.as_deref(), Some("account_state_not_available"));
+    }
+
+    #[tokio::test]
+    async fn risk_failure_inside_worker_aborts_placement() {
+        // B2 regression: the risk check is re-run inside the serial worker
+        // immediately before signing. A rejection there (account state became
+        // unavailable between the pre-queue check and the send) must abort the
+        // placement via the safety-abort path, never reach the exchange.
+        let checker = Arc::new(RiskChecker::new(
+            Arc::new(FlippingAccount {
+                reads: std::sync::atomic::AtomicU32::new(0),
+            }),
+            Default::default(),
+        ));
+        let engine = ExecutionEngine::new(ExecutionEngineConfig {
+            nonce: Arc::new(NonceQueue::new()),
+            event_bus: Arc::new(EventBus::new(256)),
+            kill_switch: Arc::new(KillSwitch::new(Arc::new(EventBus::new(256)), true)),
+            exchange: Arc::new(MockExchange::new(vec![])),
+            account_address: "0xabc".into(),
+            safety: None,
+            risk_checker: Some(checker),
+            rate_limiter: Some(Arc::new(rate_limiter())),
+            durable_store: None,
+            market_data_provider: None,
+            order_normalizer: None,
+            asset_index_provider: Some(Arc::new(FakeAssetIndex)),
+            deferred_execution: false,
+            market_price_stale_seconds: 5.0,
+            durable_kill_trigger: None,
+            action_budget: None,
+        });
+        let order = engine.submit_order(limit_intent(), None).await.unwrap();
+        // Outer risk check passes (fresh read #1); the in-worker re-check (read
+        // #2) sees no account -> SafetyAborted -> order recorded as Cancelled.
+        assert_eq!(
+            order.status,
+            OrderStatus::Cancelled,
+            "in-worker risk failure must abort the placement (B2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn action_budget_consulted_debit_and_credit_fills() {
+        // B3 regression: when an ActionBudgetController is configured, the
+        // engine passes permission() before sending, debits the ledger after a
+        // successful send, and credits organic fill volume.
+        use crate::risk::action_budget::{
+            ActionBudgetController, ActionBudgetSettings, BudgetAllocation, CancelHeadroomSnapshot,
+            RemoteActionSnapshot,
+        };
+        let owner = "0x1111111111111111111111111111111111111111";
+        let budget = Arc::new(Mutex::new(
+            ActionBudgetController::new(owner, ActionBudgetSettings::default()).unwrap(),
+        ));
+        // Reconcile so the controller leaves forced CancelOnly.
+        budget
+            .lock()
+            .await
+            .reconcile_remote(RemoteActionSnapshot {
+                quota_owner_address: owner.into(),
+                cap: 10_000,
+                used: 0,
+                observed_at: Utc::now(),
+            })
+            .expect("reconcile");
+        budget
+            .lock()
+            .await
+            .reconcile_cancel_headroom(CancelHeadroomSnapshot {
+                cap: 10_000,
+                used: 0,
+                observed_at: Utc::now(),
+            });
+        // `limit_intent()` carries a strategy_id; permission requires an
+        // allocation for (strategy, symbol).
+        budget.lock().await.set_allocation(BudgetAllocation {
+            strategy_id: "test".into(),
+            symbol: "BTC".into(),
+            soft_limit: 100,
+            hard_limit: 100,
+        });
+
+        let exchange: Arc<dyn ExchangeClient> = Arc::new(MockExchange::new(vec![
+            serde_json::json!({"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "totalSz": "1.0", "avgPx": "100", "fee": "0"}}]}}}),
+        ]));
+        let engine = ExecutionEngine::new(ExecutionEngineConfig {
+            nonce: Arc::new(NonceQueue::new()),
+            event_bus: Arc::new(EventBus::new(256)),
+            kill_switch: Arc::new(KillSwitch::new(Arc::new(EventBus::new(256)), true)),
+            exchange,
+            account_address: "0xabc".into(),
+            safety: None,
+            risk_checker: None,
+            rate_limiter: Some(Arc::new(rate_limiter())),
+            durable_store: None,
+            market_data_provider: None,
+            order_normalizer: None,
+            asset_index_provider: Some(Arc::new(FakeAssetIndex)),
+            deferred_execution: false,
+            market_price_stale_seconds: 5.0,
+            durable_kill_trigger: None,
+            action_budget: Some(budget.clone()),
+        });
+
+        let order = engine.submit_order(limit_intent(), None).await.unwrap();
+        assert_eq!(order.status, OrderStatus::Filled);
+
+        let state = budget.lock().await.export_recovery_state();
+        assert_eq!(
+            state.attempts_after_snapshot.len(),
+            1,
+            "placement must debit the action ledger (B3)"
+        );
+        assert_eq!(state.fills.len(), 1, "immediate fill must credit quota (B3)");
+        assert_eq!(state.fills[0].volume_usdc.to_string(), "100");
     }
 
     #[tokio::test]

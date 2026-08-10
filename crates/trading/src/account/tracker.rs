@@ -66,8 +66,8 @@ impl AccountTracker {
     // --- Position management from fills ---
 
     /// Update position tracking after a fill. Maintains per-symbol positions
-    /// with a VWAP entry price. `provisional` fees are tracked separately so an
-    /// authoritative fill can later replace them.
+    /// with a VWAP entry price. Fees are always keyed by cloid (B7) so a later
+    /// authoritative fill net-corrects instead of double-counting.
     pub fn update_fill(&self, fill: &Fill, provisional: bool) {
         let mut st = self.inner.lock().unwrap();
         if fill.is_spot {
@@ -405,13 +405,15 @@ impl AccountTracker {
     }
 }
 
-fn record_fill_accounting(st: &mut TrackerState, fill: &Fill, provisional: bool) {
+fn record_fill_accounting(st: &mut TrackerState, fill: &Fill, _provisional: bool) {
     st.total_fees = Usd::new(st.total_fees.inner() + fill.fee.inner().abs());
     st.fill_count += 1;
-    if provisional {
-        st.provisional_fill_fees
-            .insert(fill.cloid.clone(), Usd::new(fill.fee.inner().abs()));
-    }
+    // B7: always key the provisional fee by cloid (regardless of the
+    // `provisional` flag), so a later authoritative fill for the same cloid
+    // does a net correction in `apply_authoritative_fill` instead of adding
+    // the fee and fill_count a second time.
+    st.provisional_fill_fees
+        .insert(fill.cloid.clone(), Usd::new(fill.fee.inner().abs()));
     st.last_update_ts = Some(Utc::now());
     tracing::debug!(
         symbol = %fill.symbol,
@@ -508,6 +510,29 @@ mod tests {
         let pos = t.get_position("BTC").unwrap();
         assert!(pos.is_short());
         assert_eq!(pos.size.to_string(), "-1");
+    }
+
+    #[test]
+    fn authoritative_fill_does_not_double_count_non_provisional_local() {
+        // B7 regression: a local fill recorded with provisional=false must still
+        // be keyed by cloid, so the authoritative fill net-corrects the fee and
+        // does not add it (and fill_count) a second time.
+        let t = AccountTracker::new();
+        let mut local = fill("BTC", Side::Buy, "1.0", "50000", "c1");
+        local.is_spot = true;
+        t.update_fill(&local, false);
+
+        let mut auth = fill("BTC", Side::Buy, "1.0", "50000", "c1");
+        auth.is_spot = true;
+        let applied = t.apply_authoritative_fill("evt-1", &auth, None);
+        assert!(applied);
+
+        assert_eq!(
+            t.total_fees().to_string(),
+            "0.1",
+            "fee must be counted once (B7), not twice"
+        );
+        assert_eq!(t.fill_count(), 1, "fill_count must be counted once (B7)");
     }
 
     #[test]

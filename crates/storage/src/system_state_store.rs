@@ -123,3 +123,40 @@ impl PostgresSystemStateStore {
         Ok(())
     }
 }
+
+/// Pool-holding adapter implementing the domain [`SystemStateStore`] trait, so
+/// the kill switch (and app startup restore) can persist through a trait object
+/// (A15). The raw [`PostgresSystemStateStore`] keeps pool-per-call methods for
+/// the existing integration tests; this wrapper is what the app wires.
+pub struct PooledSystemStateStore {
+    pool: sqlx::PgPool,
+    inner: PostgresSystemStateStore,
+}
+
+impl PooledSystemStateStore {
+    pub fn new(pool: sqlx::PgPool) -> Self {
+        Self {
+            pool,
+            inner: PostgresSystemStateStore,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl hypeedge_domain::traits::SystemStateStore for PooledSystemStateStore {
+    async fn load(&self) -> Result<Option<DurableSystemState>, HypeEdgeError> {
+        self.inner.load(&self.pool).await
+    }
+
+    async fn transition(
+        &self,
+        state: &str,
+        reason: Option<&str>,
+        kill_switch_active: bool,
+        triggered_by: &str,
+    ) -> Result<(), HypeEdgeError> {
+        self.inner
+            .transition(&self.pool, state, reason, kill_switch_active, triggered_by)
+            .await
+    }
+}

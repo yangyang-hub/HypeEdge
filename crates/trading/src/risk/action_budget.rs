@@ -342,7 +342,14 @@ impl ActionBudgetController {
                 return Err("remote action snapshot timestamp regressed".into());
             }
             if snapshot.used < previous.used {
-                return Err("remote action quota usage regressed".into());
+                // B5: usage legitimately regresses when filled volume replenishes
+                // the address quota. Accept it as a reset point rather than
+                // erroring and permanently stalling the controller in CancelOnly.
+                tracing::warn!(
+                    prev_used = previous.used,
+                    new_used = snapshot.used,
+                    "action_budget_usage_regressed_resetting"
+                );
             }
         }
         self.advance_cancel_headroom(&snapshot);
@@ -369,9 +376,12 @@ impl ActionBudgetController {
             return;
         };
         let previous_used = self.remote_snapshot.as_ref().map(|s| s.used).unwrap_or(0);
-        let mut remaining = self.cancel_remaining();
         let remote_delta = snapshot.used - previous_used;
-        remaining = (remaining - remote_delta).max(0);
+        // B4: start from the raw snapshot remaining, not `cancel_remaining()`.
+        // `cancel_remaining()` already subtracts the local shadow cancel debits;
+        // `remote_delta` includes the same cancels' address cost, so subtracting
+        // both double-counts and exhausts the cancel headroom ~2-3x too fast.
+        let remaining = (cancel.cap - cancel.used - remote_delta).max(0);
         self.cancel_snapshot = Some(CancelHeadroomSnapshot {
             cap: cancel.cap,
             used: cancel.cap - remaining,
@@ -832,6 +842,44 @@ mod tests {
         c.reconcile_remote(snapshot(100, 10_000, stale)).unwrap();
         c.reconcile_cancel_headroom(cancel_snapshot(0, 10_000, stale));
         assert_eq!(c.mode(), ActionBudgetMode::CancelOnly);
+    }
+
+    #[test]
+    fn cancel_headroom_not_double_counted_after_shadow_and_remote_delta() {
+        // B4 regression: a cancel is shadow-debited locally AND its address cost
+        // appears in the remote `used` delta — the headroom must charge it once.
+        let mut c = controller();
+        let t0 = Utc::now() - Duration::minutes(10);
+        let t1 = Utc::now();
+        c.reconcile_remote(snapshot(0, 10_000, t0)).unwrap();
+        c.reconcile_cancel_headroom(cancel_snapshot(0, 1000, t0));
+        // One cancel crosses the wire after the snapshot (shadow debit).
+        c.debit_network_attempt(debit("c1", &[BudgetAction::Cancel], 1, t0 + Duration::seconds(1)))
+            .unwrap();
+        // Reconcile a remote snapshot whose `used` advanced by that same cancel.
+        c.reconcile_remote(snapshot(1, 10_000, t1)).unwrap();
+        assert_eq!(
+            c.cancel_remaining(),
+            999,
+            "cancel headroom must be charged exactly once (B4), not 998"
+        );
+    }
+
+    #[test]
+    fn usage_regression_resets_instead_of_stalling() {
+        // B5 regression: filled volume replenishes the address quota, so a
+        // lower `used` is legitimate. It must reset the ledger, not error and
+        // permanently force CancelOnly.
+        let mut c = controller();
+        let t0 = Utc::now() - Duration::minutes(10);
+        c.reconcile_remote(snapshot(100, 10_000, t0)).unwrap();
+        assert!(!c.forced_cancel_only);
+        let result = c.reconcile_remote(snapshot(50, 10_000, Utc::now()));
+        assert!(result.is_ok(), "usage regression must not error (B5)");
+        assert!(
+            !c.forced_cancel_only,
+            "controller must recover from a usage regression (B5)"
+        );
     }
 
     #[test]

@@ -113,12 +113,14 @@ impl RiskChecker {
             return Ok(fail("account_state_stale", checked));
         }
 
-        // Effective reference price.
+        // Effective reference price. The market reference (passed by the engine
+        // from the live provider) takes precedence over the order's own limit
+        // price (A16): a marketable sell at a far-below-market limit must not
+        // have its notional computed from that limit — the order controls the
+        // limit, so the order would control the number risk checks.
         let existing_pos = self.tracker.get_position(&intent.symbol);
-        let effective_reference_price = intent
-            .price
-            .map(|p| p.inner())
-            .or(reference_price)
+        let effective_reference_price = reference_price
+            .or(intent.price.map(|p| p.inner()))
             .or_else(|| {
                 existing_pos
                     .as_ref()
@@ -164,8 +166,12 @@ impl RiskChecker {
                     checked,
                 ));
             }
+            // A17: zero/negative equity is not "no constraint" — reject.
+            if account.equity.inner() <= Decimal::ZERO {
+                return Ok(fail("account_equity_non_positive", checked));
+            }
             // Spot buys bounded by the per-strategy notional fraction.
-            if intent.side == Side::Buy && account.equity.inner() > Decimal::ZERO {
+            if intent.side == Side::Buy {
                 let notional = intent.size.inner() * effective_reference_price;
                 let max_notional = account.equity.inner()
                     * Decimal::from_f64(self.limits.max_position_pct).unwrap_or(Decimal::ZERO);
@@ -193,19 +199,18 @@ impl RiskChecker {
         checked.push("max_leverage".into());
         let resulting_notional = resulting_size.abs() * effective_reference_price;
         let equity = account.equity.inner();
-        if equity > Decimal::ZERO
-            && resulting_notional.div(equity) > Decimal::from_i128(self.limits.max_leverage as i128)
-        {
+        if equity <= Decimal::ZERO {
+            return Ok(fail("account_equity_non_positive", checked));
+        }
+        if resulting_notional.div(equity) > Decimal::from_i128(self.limits.max_leverage as i128) {
             return Ok(fail("leverage_exceeded", checked));
         }
 
         checked.push("max_position_pct".into());
-        if equity > Decimal::ZERO {
-            let max_notional =
-                equity * Decimal::from_f64(self.limits.max_position_pct).unwrap_or(Decimal::ZERO);
-            if resulting_notional > max_notional {
-                return Ok(fail("position_limit_exceeded", checked));
-            }
+        let max_notional =
+            equity * Decimal::from_f64(self.limits.max_position_pct).unwrap_or(Decimal::ZERO);
+        if resulting_notional > max_notional {
+            return Ok(fail("position_limit_exceeded", checked));
         }
 
         Ok(pass(checked))
@@ -355,5 +360,41 @@ mod tests {
         let r = checker.check(&intent("1", Side::Buy), None).await;
         assert!(!r.passed);
         assert_eq!(r.reason.as_deref(), Some("account_state_stale"));
+    }
+
+    #[tokio::test]
+    async fn sell_limit_far_below_market_uses_market_notional() {
+        // A16 regression: a marketable sell at a far-below-market limit must
+        // have its notional computed from the market reference, not the limit
+        // the order controls. equity 10000, max_position_pct 0.20 -> ceiling
+        // 2000. 50 BTC @ market 100 = 5000 -> reject; @ limit 40 = 2000 would pass.
+        let checker = RiskChecker::new(make_tracker("10000", None), RiskLimits::default());
+        let mut it = intent("50", Side::Sell);
+        it.price = Some(hypeedge_domain::Price::new(
+            Decimal::from_str_strict("40").unwrap(),
+        ));
+        let r = checker
+            .check(&it, Some(Decimal::from_str_strict("100").unwrap()))
+            .await;
+        assert!(!r.passed);
+        assert_eq!(r.reason.as_deref(), Some("position_limit_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn zero_equity_is_fail_closed() {
+        // A17 regression: equity == 0 must reject, not skip the leverage and
+        // position gates (fail-open).
+        let checker = RiskChecker::new(make_tracker("0", None), RiskLimits::default());
+        let r = checker.check(&intent("1", Side::Buy), None).await;
+        assert!(!r.passed);
+        assert_eq!(r.reason.as_deref(), Some("account_equity_non_positive"));
+    }
+
+    #[tokio::test]
+    async fn negative_equity_is_fail_closed() {
+        let checker = RiskChecker::new(make_tracker("-100", None), RiskLimits::default());
+        let r = checker.check(&intent("1", Side::Buy), None).await;
+        assert!(!r.passed);
+        assert_eq!(r.reason.as_deref(), Some("account_equity_non_positive"));
     }
 }

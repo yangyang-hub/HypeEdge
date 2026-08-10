@@ -475,18 +475,43 @@ impl ExchangeEventIngestor {
             fill_cursor = start_ms;
         }
 
-        // 3. Funding history.
+        // 3. Funding history (B6): the endpoint caps its response (~500 items),
+        // so a large gap (or the first bootstrap) would otherwise silently drop
+        // the older events. Mirror the fills pagination: page forward on the
+        // cursor until fewer than the cap come back, never truncating.
         let funding_cursor = self.projector.cursor("funding").await.map_err(|e| e.to_string())?;
-        let funding_updates = self.info.user_funding_history(&self.account, (funding_cursor - 1).max(0), end_ms).await?;
-        let mut funding_sorted = funding_updates;
-        funding_sorted.sort_by_key(|u| u.get("time").and_then(|v| v.as_i64()).unwrap_or(0));
-        for update in &funding_sorted {
-            let result = self.projector.ingest_funding(update).await.map_err(|e| e.to_string())?;
-            if result.processed
-                && let (Some(amount), Some(tracker)) = (result.funding_amount, &self.tracker)
-            {
-                tracker.apply_funding(&hypeedge_domain::decimal::Usd::new(amount));
+        let mut funding_start_ms = (funding_cursor - 1).max(0);
+        loop {
+            let funding_updates = self
+                .info
+                .user_funding_history(&self.account, funding_start_ms, end_ms)
+                .await?;
+            let mut funding_sorted = funding_updates;
+            funding_sorted.sort_by_key(|u| u.get("time").and_then(|v| v.as_i64()).unwrap_or(0));
+            for update in &funding_sorted {
+                let result = self
+                    .projector
+                    .ingest_funding(update)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if result.processed
+                    && let (Some(amount), Some(tracker)) = (result.funding_amount, &self.tracker)
+                {
+                    tracker.apply_funding(&hypeedge_domain::decimal::Usd::new(amount));
+                }
             }
+            if funding_sorted.len() < 500 {
+                break;
+            }
+            let latest_ms = funding_sorted
+                .last()
+                .and_then(|u| u.get("time"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0);
+            if latest_ms <= funding_start_ms {
+                return Err("funding_history_cursor_not_advancing".into());
+            }
+            funding_start_ms = latest_ms;
         }
         self.history_recovered = true;
         Ok(())
