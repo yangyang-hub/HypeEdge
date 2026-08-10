@@ -503,6 +503,18 @@ impl FundingArbRuntimeHandle {
                         unknown: false,
                     });
                 }
+                // A18: an IOC order that the engine records as Filled is
+                // terminal even on a partial fill — an IOC cannot fill further.
+                // Treating a partial IOC fill as `unknown` faulted the cycle and
+                // paid the spread twice (or left an unmanaged residual).
+                if order.status == OrderStatus::Filled && order.time_in_force == TimeInForce::Ioc {
+                    return Ok(OrderOutcome {
+                        cloid: cloid.into(),
+                        filled_size: filled,
+                        status: Some("filled".into()),
+                        unknown: false,
+                    });
+                }
                 if matches!(
                     order.status,
                     OrderStatus::Cancelled | OrderStatus::Rejected | OrderStatus::Expired
@@ -649,6 +661,16 @@ impl FundingArbRuntimeHandle {
         let created = deps.cycles.create(&cycle).await?;
         *self.cycle.lock().await = Some(created);
 
+        // A20: set the perp leverage *before* buying the spot leg. If the
+        // leverage update failed after the spot buy, the account would hold a
+        // naked spot long with a stuck cycle (and a retry would hit the active
+        // unique index).
+        let leverage_u32 = self.params.leverage.to_string().parse::<u32>().unwrap_or(1);
+        deps.execution
+            .update_leverage(&plan.perp_symbol, leverage_u32, false)
+            .await
+            .map_err(|e| format!("leverage update failed: {e}"))?;
+
         let spot_outcome = self
             .execute_leg(&LegRequest {
                 symbol: plan.spot_symbol.clone(),
@@ -702,11 +724,6 @@ impl FundingArbRuntimeHandle {
             }),
         )
         .await?;
-        let leverage_u32 = self.params.leverage.to_string().parse::<u32>().unwrap_or(1);
-        deps.execution
-            .update_leverage(&plan.perp_symbol, leverage_u32, false)
-            .await
-            .map_err(|e| format!("leverage update failed: {e}"))?;
         let perp_outcome = self
             .execute_leg(&LegRequest {
                 symbol: plan.perp_symbol.clone(),
@@ -854,6 +871,14 @@ impl FundingArbRuntimeHandle {
             return Ok(());
         }
         let (spot_size, perp_size) = self.actual_exposure().await;
+        // A21: an inverted perp leg must fault before the spot is sold — the
+        // pre-fix code read a long perp as zero exposure, sold the spot, and
+        // left a naked long behind.
+        if self.perp_leg_inverted(&cycle.perp_symbol) {
+            return self
+                .fault("inverted_perp_leg", "perp position is long (expected short)")
+                .await;
+        }
         self.transition(
             FundingArbCycleState::ExitingPerp,
             "exit_started",
@@ -915,7 +940,10 @@ impl FundingArbRuntimeHandle {
 
     /// Rebalance when the two legs drift past `rebalance_threshold_bps`.
     pub async fn rebalance_if_needed(&self) -> Result<(), String> {
-        if self.cycle.lock().await.is_none() || !self.refresh_authoritative_account().await {
+        let Some(cycle) = self.cycle.lock().await.clone() else {
+            return Ok(());
+        };
+        if !self.refresh_authoritative_account().await {
             return Ok(());
         }
         let (spot_size, perp_size) = self.actual_exposure().await;
@@ -923,6 +951,13 @@ impl FundingArbRuntimeHandle {
         let denominator = (perp_size * self.params.hedge_ratio).max(spot_lot);
         if denominator <= Decimal::ZERO {
             return Ok(());
+        }
+        // A21: an inverted perp leg (long, expected short) is a critical
+        // anomaly — fault rather than let rebalancing act on a phantom short.
+        if self.perp_leg_inverted(&cycle.perp_symbol) {
+            return self
+                .fault("inverted_perp_leg", "perp position is long (expected short)")
+                .await;
         }
         let deviation_bps =
             (spot_size - perp_size * self.params.hedge_ratio).abs() / denominator
@@ -1025,6 +1060,17 @@ impl FundingArbRuntimeHandle {
             return (Decimal::ZERO, Decimal::ZERO);
         };
         self.actual_cycle_exposure(&*deps.tracker, &cycle)
+    }
+
+    /// Whether the perp leg is inverted (long when the strategy only ever
+    /// shorts) — a critical anomaly that must fault rather than be silently
+    /// read as flat exposure (A21).
+    fn perp_leg_inverted(&self, symbol: &str) -> bool {
+        self.deps
+            .as_ref()
+            .and_then(|d| d.tracker.get_position(symbol))
+            .map(|p| p.size.inner() > Decimal::ZERO)
+            .unwrap_or(false)
     }
 
     /// The current spot balance total for a token.
@@ -1252,6 +1298,55 @@ impl StrategyRuntimeHandle for FundingArbRuntimeAdapter {
         let handle = self.inner.lock().await;
         let mut started = handle.started.lock().await;
         *started = true;
+        // A19: recover a cycle that was open when the process restarted. The
+        // in-memory binding is empty after a restart, so without this the
+        // runtime would never rebalance/close the persisted hedge, and a later
+        // `open_cycle` would violate the active-cycle unique index forever.
+        if let Some(deps) = handle.deps.clone()
+            && let Some(cycle) = deps.cycles.get_active(&handle.strategy_id).await?
+        {
+            match cycle.state {
+                FundingArbCycleState::Open
+                | FundingArbCycleState::Rebalancing
+                | FundingArbCycleState::ExitingPerp
+                | FundingArbCycleState::ExitingSpot => {
+                    tracing::info!(
+                        strategy_id = %handle.strategy_id,
+                        cycle_id = %cycle.cycle_id,
+                        state = cycle.state.as_str(),
+                        "funding_arb_recovered_active_cycle"
+                    );
+                    *handle.cycle.lock().await = Some(cycle);
+                }
+                _ => {
+                    // An entry-intermediate state cannot be resumed safely;
+                    // fault it so the operator can intervene (exposure is
+                    // handled by reconciliation, not silently left managed).
+                    tracing::error!(
+                        strategy_id = %handle.strategy_id,
+                        cycle_state = cycle.state.as_str(),
+                        "funding_arb_recovered_unresumable_cycle_faulting"
+                    );
+                    *handle.cycle.lock().await = Some(cycle.clone());
+                    handle
+                        .transition(
+                            FundingArbCycleState::Faulted,
+                            "cycle_recovery_faulted",
+                            Some(serde_json::json!({
+                                "error_code": "unresumable_cycle_state",
+                                "error_message": format!(
+                                    "recovered cycle in {} state",
+                                    cycle.state.as_str()
+                                ),
+                            })),
+                            serde_json::json!({
+                                "error_code": "unresumable_cycle_state",
+                            }),
+                        )
+                        .await?;
+                }
+            }
+        }
         Ok(())
     }
     async fn set_mode(&self, mode: MarketMakerLifecycle) -> Result<(), String> {
@@ -1577,6 +1672,8 @@ mod tests {
         cycle_states: Vec<(FundingArbCycleState, String)>,
         current_cycle: Option<FundingArbCycle>,
         leverage_updated: bool,
+        /// Operation sequence for ordering assertions (A20).
+        ops: Vec<String>,
     }
 
     impl ScriptedEnv {
@@ -1589,6 +1686,7 @@ mod tests {
                     cycle_states: Vec::new(),
                     current_cycle: None,
                     leverage_updated: false,
+                    ops: Vec::new(),
                 })),
             }
         }
@@ -1623,14 +1721,17 @@ mod tests {
             let mut st = self.state.lock().unwrap();
             let filled = intent.size.inner();
             if intent.is_spot {
+                st.ops.push("spot_leg".into());
                 if intent.side == Side::Buy {
                     st.spot_total += filled;
                 } else {
                     st.spot_total = st.spot_total - filled;
                 }
             } else if intent.side == Side::Buy {
+                st.ops.push("perp_buy".into());
                 st.perp_position += filled;
             } else {
+                st.ops.push("perp_sell".into());
                 st.perp_position = st.perp_position - filled;
             }
             let cloid = intent.cloid.clone().unwrap_or_default();
@@ -1701,7 +1802,9 @@ mod tests {
             _: u32,
             _: bool,
         ) -> Result<serde_json::Value, hypeedge_domain::error::HypeEdgeError> {
-            self.state.lock().unwrap().leverage_updated = true;
+            let mut st = self.state.lock().unwrap();
+            st.leverage_updated = true;
+            st.ops.push("leverage".into());
             Ok(serde_json::json!({ "ok": true }))
         }
     }
@@ -1899,5 +2002,135 @@ mod tests {
             .unwrap();
         assert!(outcome.unknown);
         assert_eq!(outcome.filled_size.to_string(), "0");
+    }
+
+    #[tokio::test]
+    async fn ioc_partial_fill_is_settled_not_unknown() {
+        // A18 regression: an IOC order the engine records as Filled is terminal
+        // even on a partial fill — it must settle, not be treated as unknown
+        // (which used to fault the cycle and pay the spread twice).
+        let env = ScriptedEnv::new();
+        let handle = scripted_runtime(&env);
+        let mut order = Order::new(
+            "c_partial".into(),
+            "BTC".into(),
+            Side::Buy,
+            Size::new(Decimal::from_str_strict("2").unwrap()),
+            None,
+            OrderType::Market,
+            TimeInForce::Ioc,
+        );
+        order.status = OrderStatus::Filled;
+        order.filled_size = Size::new(Decimal::from_str_strict("1").unwrap());
+        order.cloid = "c_partial".into();
+        env.state.lock().unwrap().orders.push(order);
+
+        let outcome = handle.wait_authoritative_order("c_partial", 2).await.unwrap();
+        assert!(!outcome.unknown, "IOC partial fill must be settled (A18)");
+        assert_eq!(outcome.filled_size.to_string(), "1");
+    }
+
+    fn cycle_in_state(state: FundingArbCycleState) -> FundingArbCycle {
+        FundingArbCycle {
+            cycle_id: uuid::Uuid::new_v4(),
+            strategy_id: "fa_1".into(),
+            config_revision: 1,
+            sub_account: "0xabc".into(),
+            perp_symbol: "BTC".into(),
+            spot_symbol: "@1".into(),
+            spot_display: "BTC/USDC".into(),
+            base_token: "BTC".into(),
+            quote_token: "USDC".into(),
+            state,
+            target_perp_size: Decimal::from_str_strict("1").unwrap(),
+            target_spot_size: Decimal::from_str_strict("1").unwrap(),
+            perp_open_size: Decimal::from_str_strict("1").unwrap(),
+            spot_open_size: Decimal::from_str_strict("1").unwrap(),
+            baseline_spot_size: Decimal::ZERO,
+            entry_funding_rate: Decimal::from_str_strict("0.001").unwrap(),
+            entry_basis_bps: Decimal::from_str_strict("10").unwrap(),
+            revision: 0,
+            spot_entry_cloid: None,
+            perp_entry_cloid: None,
+            compensation_cloid: None,
+            perp_exit_cloid: None,
+            spot_exit_cloid: None,
+            error_code: None,
+            error_message: None,
+            opened_at: None,
+            closed_at: None,
+            created_at: None,
+            updated_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn start_recovers_open_cycle_and_faults_unresumable() {
+        // A19 regression: after a restart the in-memory cycle binding is empty;
+        // start() must rebind a persisted Open/Rebalancing/Exiting cycle and
+        // fault an unresumable entry-intermediate one.
+        let env = ScriptedEnv::new();
+        env.state.lock().unwrap().current_cycle = Some(cycle_in_state(FundingArbCycleState::Open));
+        let handle = scripted_runtime(&env);
+        let adapter = FundingArbRuntimeAdapter {
+            inner: tokio::sync::Mutex::new(handle),
+        };
+        adapter.start().await.unwrap();
+        assert!(
+            env.state.lock().unwrap().cycle_states.is_empty(),
+            "a recoverable Open cycle must not be faulted on recovery (A19)"
+        );
+
+        let env2 = ScriptedEnv::new();
+        env2.state.lock().unwrap().current_cycle =
+            Some(cycle_in_state(FundingArbCycleState::EnteringSpot));
+        let handle2 = scripted_runtime(&env2);
+        let adapter2 = FundingArbRuntimeAdapter {
+            inner: tokio::sync::Mutex::new(handle2),
+        };
+        adapter2.start().await.unwrap();
+        let states = env2.state.lock().unwrap().cycle_states.clone();
+        assert!(
+            states.iter().any(|(s, _)| *s == FundingArbCycleState::Faulted),
+            "an unresumable cycle state must be faulted on recovery (A19): {states:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn leverage_is_set_before_spot_leg() {
+        // A20 regression: the perp leverage must be set before the spot leg is
+        // bought, so a leverage failure can never leave a naked spot long.
+        let env = ScriptedEnv::new();
+        let handle = scripted_runtime(&env);
+        handle.open_cycle(&ScriptedEnv::plan()).await.unwrap();
+
+        let ops = env.state.lock().unwrap().ops.clone();
+        let leverage_at = ops.iter().position(|o| o == "leverage").expect("leverage op");
+        let spot_at = ops.iter().position(|o| o == "spot_leg").expect("spot op");
+        assert!(
+            leverage_at < spot_at,
+            "leverage must be set before the spot leg (A20): {ops:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn close_cycle_faults_on_inverted_perp_leg() {
+        // A21 regression: an inverted (long) perp leg must fault the cycle
+        // instead of being silently read as flat (which sold the spot and left
+        // a naked long).
+        let env = ScriptedEnv::new();
+        // Build an OPEN cycle with a long perp position.
+        env.state.lock().unwrap().current_cycle = Some(cycle_in_state(FundingArbCycleState::Open));
+        env.state.lock().unwrap().perp_position = Decimal::from_str_strict("1").unwrap(); // inverted long
+        env.state.lock().unwrap().spot_total = Decimal::from_str_strict("1").unwrap();
+        let handle = scripted_runtime(&env);
+        // Bind the Open cycle into the handle (the env's get_active returns it).
+        handle.cycle.lock().await.replace(cycle_in_state(FundingArbCycleState::Open));
+        handle.close_cycle("test").await.unwrap();
+        let states = env.state.lock().unwrap().cycle_states.clone();
+        assert!(
+            states.iter().any(|(s, _)| *s == FundingArbCycleState::Faulted),
+            "inverted perp leg must fault the cycle (A21): {states:?}"
+        );
     }
 }
