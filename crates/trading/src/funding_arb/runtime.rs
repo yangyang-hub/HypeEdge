@@ -393,26 +393,6 @@ impl FundingArbRuntimeHandle {
 
     // --- Lifecycle ---
 
-    /// Bind a recovered cycle's instruments.
-    #[allow(dead_code)] // used by the live recover path
-    async fn bind_cycle_instruments(
-        &self,
-        cycle: &FundingArbCycle,
-        meta: &InstrumentInfo,
-        spot_meta: &InstrumentInfo,
-    ) -> Result<(), String> {
-        if cycle.perp_symbol != meta.symbol
-            || !spot_meta.is_spot
-            || cycle.spot_symbol != spot_meta.symbol
-        {
-            return Err(format!(
-                "instrument metadata mismatch for cycle {}",
-                cycle.cycle_id
-            ));
-        }
-        Ok(())
-    }
-
     /// Recover a cycle that was open when the process restarted (A19).
     pub async fn recover_active_cycle(&self) -> Result<(), String> {
         let Some(deps) = self.deps.clone() else {

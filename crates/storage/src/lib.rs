@@ -6,8 +6,6 @@
 //! [`outbox`] is the transactional outbox feeding SSE; [`system_state_store`]
 //! is the durable safety latch. [`decimal_sqlx`] integrates the domain Decimal
 //! with `NUMERIC(38,18)`.
-//!
-//! The ClickHouse writer and spool are added in a later Phase-1 increment.
 
 pub mod account_state_store;
 pub mod adapters;

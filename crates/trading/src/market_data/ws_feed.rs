@@ -370,9 +370,9 @@ fn parse_f64(v: Option<&serde_json::Value>) -> f64 {
     }
 }
 
-/// Run loop placeholder — the live connect/subscribe/reconnect loop is NOT yet
-/// wired anywhere (the app wiring workstream is pending); the pure parse/publish
-/// parts above are what this module owns.
+/// Configuration for the live feed. The connect/subscribe/read/reconnect loop
+/// runs in the app wiring (`run_feed_loop`); this module owns the pure
+/// parse/publish parts that feed the shared [`BookManager`] and event bus.
 pub struct WsFeedConfig {
     pub url: String,
     pub coins: Vec<String>,

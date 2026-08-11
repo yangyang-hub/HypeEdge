@@ -1,9 +1,6 @@
-//! Market data: in-memory order books, the Hyperliquid rate limiter, and the
-//! latest-state provider facade (port of `src/hypeedge/market_data/`).
-//!
-//! The WebSocket feed, REST client, and instrument cache land in later Phase-2
-//! increments; the pure, testable pieces (book, rate limiter, provider) are
-//! here now.
+//! Market data: the Hyperliquid WebSocket feed, REST client, instrument cache,
+//! rate limiter, in-memory order books, and the latest-state provider facade
+//! (port of `src/hypeedge/market_data/`).
 
 pub mod book;
 pub mod external_reference;

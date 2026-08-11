@@ -106,7 +106,7 @@ pub fn allowed_transitions(from: MarketMakerLifecycle) -> Vec<MarketMakerLifecyc
     }
 }
 
-#[allow(dead_code)] // used by tests; future callers enforce the table
+#[cfg(test)]
 fn transition_allowed(from: MarketMakerLifecycle, to: MarketMakerLifecycle) -> bool {
     allowed_transitions(from).contains(&to)
 }

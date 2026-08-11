@@ -53,10 +53,7 @@ pub trait ConfigVersionStore: Send + Sync {
 /// trimmed strings, sort keys, compact separators, then sha256 hex. Mirrors
 /// `*_config_hash`.
 pub fn config_hash(values: &serde_json::Value) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(canonical_json(values).as_bytes());
-    hex::encode(hasher.finalize())
+    hypeedge_infra::sha256_hex(canonical_json(values).as_bytes())
 }
 
 /// Compact, key-sorted, decimal-normalized JSON (the hash input).

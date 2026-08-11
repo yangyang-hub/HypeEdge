@@ -19,6 +19,7 @@ use hypeedge_domain::decimal::{Price, Size};
 use hypeedge_domain::enums::{OrderStatus, OrderType, Side, TimeInForce};
 use hypeedge_domain::error::HypeEdgeError;
 use hypeedge_domain::models::{Order, OrderIntent};
+use hypeedge_infra::sha256_hex;
 use uuid::Uuid;
 
 use super::batch::{ChildActionType, DispatchGuardContext, GuardDecision, evaluate_dispatch_guard};
@@ -327,13 +328,6 @@ fn placement_outcome(order: &Order) -> (String, String, Option<String>) {
             Some(format!("non_authoritative_order_status:{}", other.as_str())),
         ),
     }
-}
-
-fn sha256_hex(payload: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(payload);
-    format!("{:x}", hasher.finalize())
 }
 
 #[cfg(test)]

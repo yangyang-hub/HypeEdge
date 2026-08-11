@@ -527,10 +527,7 @@ fn int_of(out: &serde_json::Map<String, Value>, key: &str) -> Result<i64, HypeEd
 /// crate). The normalized config is already key-sorted decimal strings, so
 /// serde_json's deterministic serialization is the canonical form.
 fn config_hash(values: &Value) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(serde_json::to_string(values).unwrap_or_default().as_bytes());
-    hex::encode(hasher.finalize())
+    hypeedge_infra::sha256_hex(serde_json::to_string(values).unwrap_or_default().as_bytes())
 }
 
 #[cfg(test)]

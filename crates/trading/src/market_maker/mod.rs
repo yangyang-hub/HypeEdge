@@ -1,8 +1,8 @@
 //! Market-maker strategy core: pure models, fair value, inventory, policy, and
 //! estimators.
 //!
-//! Ports `src/hypeedge/strategy/market_maker/` (the pure, testable parts). The
-//! coalesced runtime loop and its providers land in a follow-up increment.
+//! Ports `src/hypeedge/strategy/market_maker/`: pure, testable parts plus the
+//! coalesced runtime loop and its providers.
 
 pub mod adapters;
 pub mod estimators;

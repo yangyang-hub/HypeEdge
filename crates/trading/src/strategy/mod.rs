@@ -1,9 +1,9 @@
 //! Strategy framework: base trait, sequential runner, indicators, params, and
 //! the trend-following strategy.
 //!
-//! Ports `src/hypeedge/strategy/`. The strategy control plane (supervisor,
-//! registry, multi-strategy plugin) and the market-maker / funding-arb runtimes
-//! land in later Phase-5 increments.
+//! Ports `src/hypeedge/strategy/`: the strategy control plane (supervisor,
+//! registry, multi-strategy plugin) and the market-maker / funding-arb
+//! runtimes.
 
 pub mod base;
 pub mod config_normalize;

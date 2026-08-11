@@ -5,7 +5,6 @@
 //! Skips (rather than fails) when Postgres is unreachable so `cargo test
 //! --workspace` stays green on machines without the container.
 
-use chrono::Utc;
 use hypeedge_storage::exchange_ingestor_store::PostgresExchangeFactProjector;
 use hypeedge_trading::account::exchange_ingestor::ExchangeFactProjector;
 use serde_json::json;
@@ -378,10 +377,4 @@ async fn synthetic_cloid_used_for_unknown_oid() {
     let cloid = result.fill_projection.unwrap().cloid;
     assert!(cloid.starts_with("0x"), "synthetic cloid: {cloid}");
     assert_eq!(cloid.len(), 34);
-}
-
-// Keep `Utc` referenced so chrono stays a used dep in this test binary.
-#[allow(dead_code)]
-fn _touch_utc() -> chrono::DateTime<Utc> {
-    Utc::now()
 }

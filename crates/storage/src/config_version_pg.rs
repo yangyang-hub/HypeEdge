@@ -11,7 +11,6 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use hypeedge_domain::error::HypeEdgeError;
 use sqlx::{PgPool, Postgres, Transaction};
-use uuid::Uuid;
 
 use crate::config_version_store::{ConfigVersionRecord, ConfigVersionStore, config_hash};
 use crate::durable_order_store::map_sqlx;
@@ -346,11 +345,4 @@ fn dec_field(values: &serde_json::Value, key: &str) -> bigdecimal::BigDecimal {
         .and_then(|v| v.as_str())
         .and_then(|s| s.parse::<bigdecimal::BigDecimal>().ok())
         .unwrap_or_else(|| bigdecimal::BigDecimal::from(0))
-}
-
-// `Uuid` kept referenced so the import is used (sqlx `FromRow` needs it in
-// some paths); remove if clippy flags it.
-#[allow(dead_code)]
-fn _touch_uuid() -> Uuid {
-    Uuid::new_v4()
 }

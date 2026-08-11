@@ -8,7 +8,6 @@ pub mod auth;
 pub mod errors;
 pub mod middleware;
 pub mod routes;
-pub mod sse;
 pub mod sse_broker;
 pub mod sse_durable;
 pub mod state;

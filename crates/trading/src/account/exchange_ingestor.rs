@@ -56,7 +56,7 @@ fn decimal_from(v: Option<&Value>) -> Decimal {
 pub fn canonical_payload(payload: &Value) -> (String, Value) {
     let normalized = sort_keys_recursive(payload);
     let encoded = serde_json::to_string(&normalized).unwrap_or_default();
-    let digest = sha256_hex(encoded.as_bytes());
+    let digest = hypeedge_infra::sha256_hex(encoded.as_bytes());
     (digest, normalized)
 }
 
@@ -74,13 +74,6 @@ fn sort_keys_recursive(value: &Value) -> Value {
         Value::Array(arr) => Value::Array(arr.iter().map(sort_keys_recursive).collect()),
         other => other.clone(),
     }
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    hex::encode(hasher.finalize())
 }
 
 /// Deterministic cloid for an exchange OID with no cloid in the payload

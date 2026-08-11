@@ -14,6 +14,7 @@ tracing = { workspace = true }
 sqlx = { workspace = true }
 bigdecimal = { workspace = true }
 clickhouse = { workspace = true }
+duckdb = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
@@ -21,8 +22,6 @@ hypeedge_domain = { path = "../domain" }
 hypeedge_config = { path = "../config" }
 hypeedge_infra = { path = "../infra" }
 hypeedge_trading = { path = "../trading" }
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
