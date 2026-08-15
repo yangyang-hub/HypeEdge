@@ -51,6 +51,19 @@ impl RiskChecker {
     }
 
     /// Run the risk check with a fail-safe timeout: timeout or error = reject.
+    ///
+    /// L-RK6: [`Self::run_checks`] is deliberately synchronous — it contains no
+    /// await points ([`AccountView`] is a sync trait and all arithmetic is
+    /// in-memory), so the inner future completes on its first poll and the
+    /// `timeout_ms` deadline can never fire in practice. The `tokio::time::timeout`
+    /// wrapper is kept as a defensive fail-safe structure: if a future change
+    /// introduces real awaits or blocking (e.g. an async `AccountView`), the
+    /// deadline starts enforcing the design rule "risk checks must return
+    /// within `timeout_ms`" (see rules/backend.md §风控). Moving the timeout up
+    /// to the engine caller would require engine-side changes (out of scope),
+    /// and a tracker that blocks on a lock would stall the executor thread
+    /// regardless of this wrapper — so the sync facade must stay lock-free and
+    /// cheap. Timeout or error = reject (fail-safe).
     pub async fn check(
         &self,
         intent: &OrderIntent,
@@ -121,10 +134,10 @@ impl RiskChecker {
         // from the live provider) takes precedence over the order's own limit
         // price (A16): a marketable sell at a far-below-market limit must not
         // have its notional computed from that limit — the order controls the
-        // limit, so the order would control the number risk checks.
+        // limit, so the order would control the risk-check notional.
         let existing_pos = self.tracker.get_position(&intent.symbol);
         let effective_reference_price = reference_price
-            .or(intent.price.map(|p| p.inner()))
+            .or_else(|| Self::conservative_fallback_price(intent, existing_pos.as_ref()))
             .or_else(|| {
                 existing_pos
                     .as_ref()
@@ -218,6 +231,34 @@ impl RiskChecker {
         }
 
         Ok(pass(checked))
+    }
+
+    /// A16 (checker side): when no market reference is supplied, the order's
+    /// own limit price would let the order control the notional used by the
+    /// risk gates. For limit orders use the more conservative of {limit, mark}
+    /// — a marketable sell (limit far below mark) actually fills near mark, so
+    /// its notional must not be computed from the low limit; symmetrically a
+    /// marketable buy (limit far above mark) transacts at mark, not at the
+    /// inflated limit. For resting orders (limit on the far side of mark) the
+    /// limit is the fill price and is returned unchanged, so ordinary limit
+    /// orders are unaffected. Without a mark (no open position) the limit is
+    /// used as a last resort — the engine-side snapshot gate
+    /// (execution/engine.rs) is the primary defense in that case.
+    fn conservative_fallback_price(
+        intent: &OrderIntent,
+        pos: Option<&Position>,
+    ) -> Option<Decimal> {
+        let limit = intent.price.map(|p| p.inner());
+        let mark = pos.and_then(|p| p.mark_price).map(|p| p.inner());
+        match (limit, mark) {
+            (Some(l), Some(m)) => Some(if intent.side == Side::Sell {
+                l.max(m)
+            } else {
+                l.min(m)
+            }),
+            (Some(l), None) => Some(l),
+            _ => None,
+        }
     }
 }
 
@@ -382,6 +423,63 @@ mod tests {
             .await;
         assert!(!r.passed);
         assert_eq!(r.reason.as_deref(), Some("position_limit_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn marketable_sell_without_market_ref_falls_back_conservatively() {
+        // A16 checker side: even with no market reference supplied (engine
+        // snapshot missing), a marketable sell whose limit is far below the
+        // position mark must be priced at the conservative max(limit, mark).
+        // equity 10000, ceiling 2000; existing long 5 @ mark 100, sell 50 ->
+        // resulting -45. @ mark 100 = 4500 -> reject; @ limit 40 = 1800 would pass.
+        let checker = RiskChecker::new(make_tracker("10000", Some("5")), RiskLimits::default());
+        let mut it = intent("50", Side::Sell);
+        it.price = Some(hypeedge_domain::Price::new(
+            Decimal::from_str_strict("40").unwrap(),
+        ));
+        let r = checker.check(&it, None).await;
+        assert!(!r.passed);
+        assert_eq!(r.reason.as_deref(), Some("position_limit_exceeded"));
+    }
+
+    #[tokio::test]
+    async fn marketable_buy_without_market_ref_uses_mark_notional() {
+        // A16 checker side, buy direction: a marketable buy (limit far above
+        // mark) is priced at min(limit, mark) = mark — the inflated limit must
+        // not inflate the notional. equity 10000, ceiling 2000; existing long
+        // 5 @ mark 100, buy 6 -> resulting 11. @ mark 100 = 1100 -> pass;
+        // @ limit 200 = 2200 would be a false rejection.
+        let checker = RiskChecker::new(make_tracker("10000", Some("5")), RiskLimits::default());
+        let mut it = intent("6", Side::Buy);
+        it.price = Some(hypeedge_domain::Price::new(
+            Decimal::from_str_strict("200").unwrap(),
+        ));
+        let r = checker.check(&it, None).await;
+        assert!(r.passed, "marketable buy within limits: {r:?}");
+    }
+
+    #[tokio::test]
+    async fn resting_limit_order_keeps_own_price_without_market_ref() {
+        // A16 guard: an ordinary resting limit order (limit on the far side of
+        // mark) must be unaffected by the conservative fallback: for a sell the
+        // limit is already the max(limit, mark), for a buy the min. equity
+        // 10000, ceiling 2000; existing long 5 @ mark 100, resting sell 1 @ 120
+        // -> resulting 4 @ 120 = 480 -> passes.
+        let checker = RiskChecker::new(make_tracker("10000", Some("5")), RiskLimits::default());
+        let mut it = intent("1", Side::Sell);
+        it.price = Some(hypeedge_domain::Price::new(
+            Decimal::from_str_strict("120").unwrap(),
+        ));
+        let r = checker.check(&it, None).await;
+        assert!(r.passed, "resting sell within limits: {r:?}");
+        // Resting buy below mark keeps its own (lower) limit.
+        let checker = RiskChecker::new(make_tracker("10000", Some("5")), RiskLimits::default());
+        let mut it = intent("1", Side::Buy);
+        it.price = Some(hypeedge_domain::Price::new(
+            Decimal::from_str_strict("80").unwrap(),
+        ));
+        let r = checker.check(&it, None).await;
+        assert!(r.passed, "resting buy within limits: {r:?}");
     }
 
     #[tokio::test]

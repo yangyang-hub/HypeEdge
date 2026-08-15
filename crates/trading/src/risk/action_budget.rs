@@ -389,7 +389,12 @@ impl ActionBudgetController {
         // `cancel_remaining()` already subtracts the local shadow cancel debits;
         // `remote_delta` includes the same cancels' address cost, so subtracting
         // both double-counts and exhausts the cancel headroom ~2-3x too fast.
-        let remaining = (cancel.cap - cancel.used - remote_delta).max(0);
+        // L-RK3: when the remote `used` regresses (B5 fill credit) `remote_delta`
+        // is negative, so the raw projection can exceed `cap` — that would push
+        // the stored `used` below zero and inflate `cancel_remaining()` above
+        // `cap`. Clamp the projection to [0, cap] so `used` stays in [0, cap]
+        // and the headroom never exceeds the configured floor.
+        let remaining = (cancel.cap - cancel.used - remote_delta).clamp(0, cancel.cap);
         self.cancel_snapshot = Some(CancelHeadroomSnapshot {
             cap: cancel.cap,
             used: cancel.cap - remaining,
@@ -515,21 +520,22 @@ impl ActionBudgetController {
             });
         }
 
+        // M-RK3: CancelOnly/Exhausted still permit *risk-reducing* placements —
+        // a reduce-only close lowers exposure, which is exactly the CancelOnly
+        // directive's intent — while ordinary placements stay blocked. The
+        // risk-reducing order still has to clear the address/IP/allocation
+        // gates below (and is correctly refused when the address is genuinely
+        // exhausted). Emergency closes take their own channel above (`Close`
+        // + `emergency`), which predates and bypasses this mode gate.
         if matches!(
             current_mode,
-            ActionBudgetMode::CancelOnly | ActionBudgetMode::Exhausted
-        ) {
+            ActionBudgetMode::CancelOnly | ActionBudgetMode::Exhausted | ActionBudgetMode::Critical
+        ) && !risk_reducing
+        {
             return Ok(BudgetPermission {
                 allowed: false,
                 mode: current_mode,
-                reason: "budget mode forbids placement".into(),
-            });
-        }
-        if current_mode == ActionBudgetMode::Critical && !risk_reducing {
-            return Ok(BudgetPermission {
-                allowed: false,
-                mode: current_mode,
-                reason: "critical mode permits only risk reduction".into(),
+                reason: "budget mode permits only risk-reducing placement".into(),
             });
         }
         if view.placement_actions_available < child_actions {
@@ -1114,5 +1120,112 @@ mod tests {
             })
             .unwrap();
         assert!(p.allowed, "critical permits risk-reducing placement");
+    }
+
+    #[test]
+    fn cancel_only_permits_risk_reducing_close() {
+        // M-RK3 regression: a reduce-only close must pass in CancelOnly mode
+        // (it lowers exposure, matching the directive), while an ordinary
+        // placement stays blocked. CancelOnly via insufficient cancel headroom
+        // (5 remaining < required reserve 20) with ample address quota.
+        let mut c = controller();
+        let now = Utc::now();
+        c.reconcile_remote(snapshot(100, 10_000, now)).unwrap();
+        c.reconcile_cancel_headroom(cancel_snapshot(995, 1000, now));
+        c.update_possible_live_orders(10); // required reserve = 10 + 10 = 20
+        assert_eq!(c.mode(), ActionBudgetMode::CancelOnly);
+        let p = c
+            .permission(&PermissionRequest::new(BudgetAction::Place))
+            .unwrap();
+        assert!(!p.allowed, "cancel-only blocks ordinary placement");
+        let p = c
+            .permission(&PermissionRequest {
+                action: BudgetAction::Place,
+                risk_reducing: true,
+                child_actions: 1,
+                ip_weight: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            p.allowed,
+            "cancel-only permits risk-reducing close: {}",
+            p.reason
+        );
+    }
+
+    #[test]
+    fn exhausted_permits_risk_reducing_close() {
+        // M-RK3 regression: same as cancel-only when the ledger is Exhausted
+        // (here via cancel headroom == 0) but the address still has actions.
+        let mut c = controller();
+        let now = Utc::now();
+        c.reconcile_remote(snapshot(100, 10_000, now)).unwrap();
+        c.reconcile_cancel_headroom(cancel_snapshot(1000, 1000, now));
+        assert_eq!(c.mode(), ActionBudgetMode::Exhausted);
+        let p = c
+            .permission(&PermissionRequest::new(BudgetAction::Place))
+            .unwrap();
+        assert!(!p.allowed, "exhausted blocks ordinary placement");
+        let p = c
+            .permission(&PermissionRequest {
+                action: BudgetAction::Place,
+                risk_reducing: true,
+                child_actions: 1,
+                ip_weight: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(
+            p.allowed,
+            "exhausted permits risk-reducing close: {}",
+            p.reason
+        );
+        // Genuinely exhausted address still refuses the close (no actions left).
+        let mut c2 = controller();
+        c2.reconcile_remote(snapshot(10_000, 10_000, now)).unwrap();
+        c2.reconcile_cancel_headroom(cancel_snapshot(0, 10_000, now));
+        assert_eq!(c2.mode(), ActionBudgetMode::Exhausted);
+        let p = c2
+            .permission(&PermissionRequest {
+                action: BudgetAction::Place,
+                risk_reducing: true,
+                child_actions: 1,
+                ip_weight: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(!p.allowed, "no address actions left -> close refused");
+    }
+
+    #[test]
+    fn negative_remote_delta_keeps_cancel_headroom_within_cap() {
+        // L-RK3 regression: when the remote `used` regresses (B5 fill credit),
+        // `remote_delta` is negative and the raw projection could exceed `cap`,
+        // pushing the stored `used` negative and inflating `cancel_remaining()`.
+        let mut c = controller();
+        let t0 = Utc::now() - Duration::minutes(10);
+        let t1 = Utc::now();
+        c.reconcile_cancel_headroom(cancel_snapshot(50, 1000, t0));
+        // First reconcile burns the headroom down to zero: delta = 5000.
+        c.reconcile_remote(snapshot(5000, 10_000, t0)).unwrap();
+        assert_eq!(c.cancel_remaining(), 0);
+        // Usage regresses by more than the remaining headroom: delta = -1100.
+        // Unfixed, `remaining` would be 1100 > cap 1000 and `used` = -100.
+        c.reconcile_remote(snapshot(3900, 10_000, t1)).unwrap();
+        let view = c.snapshot();
+        assert_eq!(
+            view.cancel_headroom_remaining, 1000,
+            "headroom must be capped at the configured floor, not inflated"
+        );
+        assert!(
+            (0..=1000).contains(&view.cancel_headroom_remaining),
+            "cancel headroom must stay within [0, cap], got {}",
+            view.cancel_headroom_remaining
+        );
+        // After a later non-regressing reconcile the ledger stays consistent.
+        c.reconcile_remote(snapshot(5000, 10_000, Utc::now()))
+            .unwrap();
+        assert_eq!(c.cancel_remaining(), 0);
     }
 }

@@ -17,6 +17,11 @@ use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 
 use super::engine::AfterSendHook;
 
+/// Initial backoff after a transient failure (P2-4/H-EX1).
+const BACKOFF_BASE: Duration = Duration::from_millis(100);
+/// Backoff ceiling so a permanently failing worker retries at most every 30s.
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
 /// The engine surface the worker dispatches through (implemented by
 /// [`super::engine::ExecutionEngine`] and faked in tests).
 #[async_trait]
@@ -79,16 +84,35 @@ impl SignedActionExecutor {
         &self.worker_id
     }
 
-    /// Run the claim→dispatch loop until stopped.
+    /// Run the claim→dispatch loop until stopped. P2-4/H-EX1: a single
+    /// transient failure (DB jitter, network blip) must not kill the worker —
+    /// errors back off exponentially and the loop continues. Only `stop()` or
+    /// the channel/queue being closed exits the loop.
     pub async fn run(&self) -> Result<(), HypeEdgeError> {
         tracing::info!(worker_id = %self.worker_id, "signed_action_executor_started");
+        let mut backoff = BACKOFF_BASE;
         loop {
             if !self.running.load(AtomicOrdering::Relaxed) {
                 break;
             }
-            let processed = self.run_once().await?;
-            if !processed {
-                tokio::time::sleep(self.poll_interval).await;
+            match self.run_once().await {
+                Ok(true) => {
+                    backoff = BACKOFF_BASE;
+                }
+                Ok(false) => {
+                    backoff = BACKOFF_BASE;
+                    tokio::time::sleep(self.poll_interval).await;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        worker_id = %self.worker_id,
+                        error = %e,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "signed_action_executor_transient_failure_retry"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
+                }
             }
         }
         tracing::info!(worker_id = %self.worker_id, "signed_action_executor_stopped");
@@ -145,11 +169,14 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::AtomicU32;
 
     /// In-memory queue with a programmable claim sequence.
     struct FakeQueue {
         commands: StdMutex<VecDeque<Option<DurableExecutionCommand>>>,
         deferred: StdMutex<Vec<(uuid::Uuid, String)>>,
+        /// Number of consecutive `claim` failures to inject first.
+        claim_errors: AtomicU32,
     }
 
     impl FakeQueue {
@@ -157,6 +184,7 @@ mod tests {
             Self {
                 commands: StdMutex::new(commands.into()),
                 deferred: StdMutex::new(Vec::new()),
+                claim_errors: AtomicU32::new(0),
             }
         }
         fn deferred(&self) -> Vec<(uuid::Uuid, String)> {
@@ -170,6 +198,17 @@ mod tests {
             &self,
             _worker_id: &str,
         ) -> Result<Option<DurableExecutionCommand>, HypeEdgeError> {
+            let injected = self
+                .claim_errors
+                .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |n| {
+                    n.checked_sub(1)
+                })
+                .is_ok();
+            if injected {
+                return Err(HypeEdgeError::Postgres {
+                    message: "transient claim failure".into(),
+                });
+            }
             let mut queue = self.commands.lock().unwrap();
             Ok(queue.pop_front().unwrap_or(None))
         }
@@ -377,5 +416,29 @@ mod tests {
         worker.stop();
         run.await.unwrap().unwrap();
         assert_eq!(dispatcher.dispatched(), vec![("place_order".into(), true)]);
+    }
+
+    #[tokio::test]
+    async fn transient_claim_error_backs_off_and_worker_continues() {
+        // H-EX1 regression: one transient DB error must not kill the worker —
+        // run() backs off and keeps processing subsequent commands.
+        let cmd = command("place_order", false);
+        let queue = Arc::new(FakeQueue::new(vec![Some(cmd.clone()), None]));
+        queue.claim_errors.store(1, AtomicOrdering::SeqCst);
+        let dispatcher = Arc::new(FakeDispatcher::new().with_result(cmd.command_id, true));
+        let worker = worker_with(queue.clone(), dispatcher.clone());
+        let run_worker = worker.clone();
+        let run = tokio::spawn(async move { run_worker.run().await });
+
+        // Give the injected claim failure + 100ms base backoff + retry time.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !dispatcher.dispatched().is_empty(),
+            "worker must continue after the transient failure"
+        );
+        assert_eq!(dispatcher.dispatched(), vec![("place_order".into(), true)]);
+
+        worker.stop();
+        run.await.unwrap().unwrap();
     }
 }

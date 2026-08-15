@@ -14,12 +14,15 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use hypeedge_domain::decimal::Decimal;
 use hypeedge_domain::enums::OrderStatus;
 use hypeedge_domain::error::HypeEdgeError;
+use hypeedge_domain::events::DomainEvent;
 use hypeedge_domain::models::Fill;
+use hypeedge_infra::event_bus::{EventBus, wrap};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
@@ -97,19 +100,25 @@ pub fn fill_external_id(fill: &Value) -> String {
     format!("fill:{}", parts.join(":"))
 }
 
+/// Stable exchange identity for a funding payment, unified across the WS delta
+/// shape (`{time, hash, delta:{coin, usdc}}`) and the REST flat shape
+/// (`{time, coin, usdc}`): `funding:{time}:{coin}:{usdc}` (P3-3). The `hash`
+/// is deliberately excluded — it is absent from the REST/userFunding response,
+/// so including it would make the two paths disagree and double-ingest.
 pub fn funding_external_id(update: &Value) -> String {
     let delta = update.get("delta");
     let coin = delta
         .and_then(|d| d.get("coin"))
         .map(|v| str_of(Some(v)))
-        .unwrap_or_default();
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| str_of(update.get("coin")));
     let usdc = delta
         .and_then(|d| d.get("usdc"))
         .map(|v| str_of(Some(v)))
-        .unwrap_or_default();
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| str_of(update.get("usdc")));
     format!(
-        "funding:{}:{}:{}:{}",
-        str_of(update.get("hash")),
+        "funding:{}:{}:{}",
         str_of(update.get("time")),
         coin,
         usdc
@@ -277,6 +286,30 @@ pub trait ExchangeFactProjector: Send + Sync {
 #[async_trait]
 pub trait InfoClient: Send + Sync {
     async fn historical_orders(&self, account: &str) -> Result<Vec<Value>, String>;
+    /// Page of historical orders within `[start_ms, end_ms)`, sorted by
+    /// `statusTimestamp`. M-RK7: the API caps a single `historicalOrders`
+    /// response (~2000 entries), so recovery pages forward on the last
+    /// `statusTimestamp` like fills/funding.
+    ///
+    /// The default implementation filters one full `historical_orders()`
+    /// response client-side. Clients that support `startTime`/`endTime`
+    /// (Hyperliquid's `historicalOrders` does) should override this with a
+    /// server-side windowed request so arbitrarily deep history can be paged.
+    async fn historical_orders_paged(
+        &self,
+        account: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Value>, String> {
+        let orders = self.historical_orders(account).await?;
+        Ok(orders
+            .into_iter()
+            .filter(|item| {
+                let ts = order_status_timestamp_ms(item);
+                ts >= start_ms && ts < end_ms
+            })
+            .collect())
+    }
     async fn user_fills_by_time(
         &self,
         account: &str,
@@ -296,6 +329,16 @@ pub trait InfoClient: Send + Sync {
     ) -> Result<Option<Value>, String>;
 }
 
+/// The `statusTimestamp` of an order-status payload (falls back to the nested
+/// order timestamp, then 0).
+pub fn order_status_timestamp_ms(update: &Value) -> i64 {
+    update
+        .get("statusTimestamp")
+        .or_else(|| update.get("order").and_then(|o| o.get("timestamp")))
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+}
+
 /// One enqueued authenticated WS message: `(kind, payload)`, kind ∈
 /// `fill` | `order` | `funding`.
 type IngestMessage = (String, Value);
@@ -311,6 +354,10 @@ pub struct ExchangeEventIngestor {
     projector: Arc<dyn ExchangeFactProjector>,
     info: Arc<dyn InfoClient>,
     tracker: Option<Arc<AccountTracker>>,
+    /// Optional event bus for publishing authoritative `OrderFilled` /
+    /// `OrderPartialFill` events (P1-4). `None` keeps the constructor
+    /// compatible; the app wires it via [`ExchangeEventIngestor::with_event_bus`].
+    event_bus: Option<Arc<EventBus>>,
     tx: mpsc::Sender<IngestMessage>,
     rx: mpsc::Receiver<IngestMessage>,
     poll_interval_seconds: f64,
@@ -331,6 +378,7 @@ impl ExchangeEventIngestor {
             projector,
             info,
             tracker,
+            event_bus: None,
             tx,
             rx,
             poll_interval_seconds: if poll_interval_seconds > 0.0 {
@@ -340,6 +388,12 @@ impl ExchangeEventIngestor {
             },
             history_recovered: false,
         }
+    }
+
+    /// Attach the event bus for authoritative fill publication (P1-4).
+    pub fn with_event_bus(mut self, event_bus: Arc<EventBus>) -> Self {
+        self.event_bus = Some(event_bus);
+        self
     }
 
     /// Enqueue a message from the WS callback (bounded; drops + logs on overflow).
@@ -361,15 +415,37 @@ impl ExchangeEventIngestor {
         self.rx.recv().await
     }
 
+    /// Consume the WS queue until the channel closes, ingesting each message.
+    /// M-RK6: additionally re-runs `recover_history` on every `poll_interval`
+    /// (previously recovery ran exactly once at startup — a disconnected WS
+    /// user stream meant REST history was never backfilled again, so fills
+    /// could be missed indefinitely).
     pub async fn run_until_closed(&mut self) {
-        while let Some((kind, payload)) = self.rx.recv().await {
-            let result = match kind.as_str() {
-                "fill" => self.ingest_fill(&payload).await,
-                "order" => self.projector.ingest_order_update(&payload).await,
-                _ => self.projector.ingest_funding(&payload).await,
-            };
-            if let Err(e) = result {
-                tracing::error!(kind, error = %e, "exchange_event_ingest_failed");
+        // Move the live receiver out so `tokio::select!` can poll it while the
+        // recovery branch calls `&mut self` methods (disjoint borrows). The
+        // placeholder receiver replaces the moved field and is never fed.
+        let mut rx = std::mem::replace(&mut self.rx, mpsc::channel::<IngestMessage>(1).1);
+        let poll = Duration::from_secs_f64(self.poll_interval_seconds.max(0.1));
+        let mut interval = tokio::time::interval(poll);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    let Some((kind, payload)) = msg else { break; };
+                    let result = match kind.as_str() {
+                        "fill" => self.ingest_fill(&payload).await,
+                        "order" => self.projector.ingest_order_update(&payload).await,
+                        _ => self.projector.ingest_funding(&payload).await,
+                    };
+                    if let Err(e) = result {
+                        tracing::error!(kind, error = %e, "exchange_event_ingest_failed");
+                    }
+                }
+                _ = interval.tick() => {
+                    if let Err(e) = self.recover_history().await {
+                        tracing::warn!(error = %e, "exchange_event_periodic_recovery_failed");
+                    }
+                }
             }
         }
     }
@@ -406,10 +482,11 @@ impl ExchangeEventIngestor {
         let Some(projection) = result.fill_projection.clone() else {
             return Ok(result);
         };
-        let Some(tracker) = &self.tracker else {
-            return Ok(result);
-        };
-
+        // The projector claims the inbox transactionally by external id, so a
+        // fresh projection here means this exact fill was committed exactly
+        // once — the dedup anchor for the publish below (P1-4): the same fill
+        // delivered again (WS replay vs REST recovery) yields `dedup` with no
+        // projection and is never re-published.
         let fill = Fill {
             cloid: projection.cloid.clone(),
             exchange_oid: projection.exchange_oid.clone(),
@@ -428,64 +505,156 @@ impl ExchangeEventIngestor {
             sub_account: projection.sub_account.clone(),
             is_spot: projection.is_spot,
         };
+        // M-RK5 (fail-closed): a perp fill whose projection carries no
+        // `position_size` maps to `None` here — `apply_authoritative_fill`
+        // then refuses to apply it instead of treating it as a zero-size
+        // position (which would delete the tracked position as a phantom close).
         let position = if projection.is_spot {
             None
         } else {
-            Some(hypeedge_domain::models::Position {
-                symbol: projection.symbol.clone(),
-                size: hypeedge_domain::decimal::Size::new(
-                    projection.position_size.unwrap_or(Decimal::ZERO),
-                ),
-                entry_price: projection
-                    .position_entry_price
-                    .map(hypeedge_domain::decimal::Price::new),
-                mark_price: projection
-                    .position_mark_price
-                    .map(hypeedge_domain::decimal::Price::new)
-                    .or(Some(fill.price)),
-                unrealized_pnl: None,
-                leverage: 0,
-                liquidation_price: None,
-                sub_account: projection.sub_account.clone(),
-                strategy_id: projection.strategy_id.clone(),
+            projection.position_size.map(|position_size| {
+                hypeedge_domain::models::Position {
+                    symbol: projection.symbol.clone(),
+                    size: hypeedge_domain::decimal::Size::new(position_size),
+                    entry_price: projection
+                        .position_entry_price
+                        .map(hypeedge_domain::decimal::Price::new),
+                    mark_price: projection
+                        .position_mark_price
+                        .map(hypeedge_domain::decimal::Price::new)
+                        .or(Some(fill.price)),
+                    unrealized_pnl: None,
+                    leverage: 0,
+                    liquidation_price: None,
+                    sub_account: projection.sub_account.clone(),
+                    strategy_id: projection.strategy_id.clone(),
+                }
             })
         };
-        tracker.apply_authoritative_fill(&projection.external_event_id, &fill, position.as_ref());
+        if let Some(tracker) = &self.tracker {
+            tracker.apply_authoritative_fill(&projection.external_event_id, &fill, position.as_ref());
+        }
+        self.publish_fill_event(&projection, &fill).await;
         Ok(result)
     }
 
+    /// Publish the authoritative fill as `OrderFilled` / `OrderPartialFill`
+    /// (P1-4) so strategies that only consume bus events (e.g. trend-follow's
+    /// working-cloid clearing) unblock even when the engine's own receipt path
+    /// missed the fill (crash between exchange fill and response, or orders
+    /// placed outside the engine). Deduplicated by the projector's exactly-once
+    /// inbox claim above.
+    async fn publish_fill_event(
+        &self,
+        projection: &CommittedFillProjection,
+        fill: &Fill,
+    ) {
+        let Some(bus) = &self.event_bus else {
+            return;
+        };
+        let order = {
+            let mut order = hypeedge_domain::models::Order::new(
+                projection.cloid.clone(),
+                projection.symbol.clone(),
+                fill.side,
+                fill.size,
+                Some(fill.price),
+                hypeedge_domain::enums::OrderType::Market,
+                hypeedge_domain::enums::TimeInForce::Ioc,
+            );
+            order.status = status_to_order_status(&projection.order_status);
+            order.filled_size = fill.size;
+            order.avg_fill_price = Some(fill.price);
+            order.strategy_id = projection.strategy_id.clone();
+            order.sub_account = projection.sub_account.clone();
+            order.is_spot = projection.is_spot;
+            order
+        };
+        let event = if projection.order_status == "filled" {
+            DomainEvent::OrderFilled(order)
+        } else {
+            DomainEvent::OrderPartialFill(order)
+        };
+        bus.publish(wrap(event)).await;
+        tracing::debug!(
+            cloid = %projection.cloid,
+            external_event_id = %projection.external_event_id,
+            order_status = %projection.order_status,
+            "exchange_ingestor_published_fill_event"
+        );
+    }
+
     /// Recover REST history after the last cursors. Mirrors `_recover_history_once`.
+    ///
+    /// P3-3: each segment (orders / fills / funding) is fault-tolerant — a
+    /// transient failure in one segment logs and moves on instead of aborting
+    /// the remaining segments (previously the first `?` error skipped the rest
+    /// of the bootstrap). The overall call still fails when *every* segment
+    /// failed, so the caller knows recovery did nothing.
     pub async fn recover_history(&mut self) -> Result<(), String> {
         let end_ms = chrono::Utc::now().timestamp_millis();
-        // 1. Historical orders (establish oid/cloid ownership before fills).
-        let orders = self.info.historical_orders(&self.account).await?;
+        let mut segments_ok = 0usize;
+        let mut last_error: Option<String> = None;
+        for (name, result) in [
+            ("orders", self.recover_orders(end_ms).await),
+            ("fills", self.recover_fills(end_ms).await),
+            ("funding", self.recover_funding(end_ms).await),
+        ] {
+            match result {
+                Ok(()) => segments_ok += 1,
+                Err(e) => {
+                    last_error = Some(format!("{name}: {e}"));
+                    tracing::warn!(segment = name, error = %e, "ingestor_history_segment_failed");
+                }
+            }
+        }
+        if segments_ok == 0 {
+            return Err(last_error.unwrap_or_else(|| "history recovery failed".into()));
+        }
+        self.history_recovered = true;
+        Ok(())
+    }
+
+    /// Segment 1: historical orders, paged forward on `statusTimestamp`
+    /// (M-RK7 — a single response is capped at ~2000 entries, so a long
+    /// history would otherwise be silently truncated).
+    async fn recover_orders(&self, end_ms: i64) -> Result<(), String> {
         let order_cursor = self
             .projector
             .cursor("orders")
             .await
             .map_err(|e| e.to_string())?;
-        let mut ordered = orders.clone();
-        ordered.sort_by_key(|item| {
-            item.get("statusTimestamp")
-                .or_else(|| item.get("order").and_then(|o| o.get("timestamp")))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0)
-        });
-        for update in &ordered {
-            let ts = update
-                .get("statusTimestamp")
-                .or_else(|| update.get("order").and_then(|o| o.get("timestamp")))
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0);
-            if ts >= order_cursor {
+        let mut start_ms = (order_cursor - 1).max(0);
+        loop {
+            let orders = self
+                .info
+                .historical_orders_paged(&self.account, start_ms, end_ms)
+                .await?;
+            let mut ordered = orders;
+            ordered.sort_by_key(order_status_timestamp_ms);
+            for update in &ordered {
                 self.projector
                     .ingest_order_update(update)
                     .await
                     .map_err(|e| e.to_string())?;
             }
+            if ordered.len() < 2000 {
+                break;
+            }
+            let latest_ms = ordered
+                .last()
+                .map(order_status_timestamp_ms)
+                .unwrap_or(0);
+            if latest_ms <= start_ms {
+                return Err("historical_orders_cursor_not_advancing".into());
+            }
+            start_ms = latest_ms;
         }
+        Ok(())
+    }
 
-        // 2. Fills by time (paged until fewer than 2000 or cursor advances).
+    /// Segment 2: fills by time (paged until fewer than 2000 or cursor advances).
+    async fn recover_fills(&self, end_ms: i64) -> Result<(), String> {
         let fill_cursor = self
             .projector
             .cursor("fills")
@@ -525,11 +694,14 @@ impl ExchangeEventIngestor {
             }
             start_ms = latest_ms;
         }
+        Ok(())
+    }
 
-        // 3. Funding history (B6): the endpoint caps its response (~500 items),
-        // so a large gap (or the first bootstrap) would otherwise silently drop
-        // the older events. Mirror the fills pagination: page forward on the
-        // cursor until fewer than the cap come back, never truncating.
+    /// Segment 3: funding history (B6): the endpoint caps its response (~500
+    /// items), so a large gap (or the first bootstrap) would otherwise silently
+    /// drop the older events. Mirror the fills pagination: page forward on the
+    /// cursor until fewer than the cap come back, never truncating.
+    async fn recover_funding(&self, end_ms: i64) -> Result<(), String> {
         let funding_cursor = self
             .projector
             .cursor("funding")
@@ -568,7 +740,6 @@ impl ExchangeEventIngestor {
             }
             funding_start_ms = latest_ms;
         }
-        self.history_recovered = true;
         Ok(())
     }
 
@@ -602,14 +773,25 @@ mod tests {
     }
 
     #[test]
-    fn funding_external_id_composes_hash_time_coin_usdc() {
-        let update = serde_json::json!({
+    fn funding_external_id_unifies_delta_and_flat_shapes() {
+        // P3-3: the WS delta shape and the REST flat shape must produce the
+        // same `(time, coin, usdc)` external id — the hash is excluded because
+        // the REST/userFunding response does not carry it.
+        let ws = serde_json::json!({
             "hash": "0xabc", "time": "1700000000000",
             "delta": {"type": "funding", "coin": "BTC", "usdc": "1.5"}
         });
+        let rest = serde_json::json!({
+            "time": "1700000000000", "coin": "BTC", "usdc": "1.5"
+        });
         assert_eq!(
-            funding_external_id(&update),
-            "funding:0xabc:1700000000000:BTC:1.5"
+            funding_external_id(&ws),
+            "funding:1700000000000:BTC:1.5"
+        );
+        assert_eq!(
+            funding_external_id(&rest),
+            funding_external_id(&ws),
+            "flat and delta funding payloads must dedup to one id"
         );
     }
 
@@ -733,19 +915,30 @@ mod tests {
 
     struct FakeProjector {
         fills_ingested: std::sync::atomic::AtomicU64,
+        orders_ingested: std::sync::atomic::AtomicU64,
+        ingested_fill_ids: std::sync::Mutex<Vec<String>>,
     }
     impl FakeProjector {
         fn new() -> Self {
             Self {
                 fills_ingested: std::sync::atomic::AtomicU64::new(0),
+                orders_ingested: std::sync::atomic::AtomicU64::new(0),
+                ingested_fill_ids: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
     #[async_trait]
     impl ExchangeFactProjector for FakeProjector {
         async fn ingest_fill(&self, fill: &Value) -> Result<IngestResult, HypeEdgeError> {
-            self.fills_ingested.fetch_add(1, AtomicOrdering::SeqCst);
             let id = fill_external_id(fill);
+            {
+                let mut seen = self.ingested_fill_ids.lock().unwrap();
+                if seen.iter().any(|x| x == &id) {
+                    return Ok(IngestResult::dedup(&id));
+                }
+                seen.push(id.clone());
+            }
+            self.fills_ingested.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(IngestResult {
                 processed: true,
                 external_event_id: id.clone(),
@@ -775,6 +968,7 @@ mod tests {
             &self,
             _update: &Value,
         ) -> Result<IngestResult, HypeEdgeError> {
+            self.orders_ingested.fetch_add(1, AtomicOrdering::SeqCst);
             Ok(IngestResult::dedup("order:x"))
         }
         async fn ingest_funding(&self, _update: &Value) -> Result<IngestResult, HypeEdgeError> {
@@ -886,5 +1080,226 @@ mod tests {
             0.0,
         );
         assert_eq!(ingestor.poll_interval_seconds(), 30.0);
+    }
+
+    #[tokio::test]
+    async fn ingest_fill_publishes_order_filled_exactly_once() {
+        // P1-4: an authoritatively committed fill must surface on the bus as
+        // OrderFilled (with the cloid), and the same fill re-ingested (WS
+        // replay / REST recovery) must NOT be published a second time.
+        let bus = Arc::new(EventBus::new(16));
+        let filled = bus.subscribe(hypeedge_domain::events::EventType::OrderFilled);
+        let ingestor = ExchangeEventIngestor::new(
+            "0xabc",
+            Arc::new(FakeProjector::new()),
+            Arc::new(FakeInfo {
+                orders: vec![],
+                fills: vec![],
+            }),
+            None,
+            30.0,
+        )
+        .with_event_bus(bus);
+        let payload = serde_json::json!({"tid": 1, "oid": "9", "time": "1700000000000", "coin": "BTC", "side": "B", "px": "50000", "sz": "1.0", "fee": "0.1", "startPosition": "0"});
+
+        let result = ingestor.ingest_fill(&payload).await.unwrap();
+        assert!(result.processed);
+        let event = filled.recv().await.unwrap();
+        match &event.payload {
+            DomainEvent::OrderFilled(order) => {
+                assert_eq!(order.cloid, "0xabc");
+                assert_eq!(order.filled_size.to_string(), "1");
+                assert_eq!(order.symbol, "BTC");
+            }
+            other => panic!("expected OrderFilled, got {:?}", other.event_type()),
+        }
+
+        // Same fill again → projector dedups → no projection → no event.
+        let result = ingestor.ingest_fill(&payload).await.unwrap();
+        assert!(!result.processed, "second ingest of the same fill must dedup");
+        assert!(filled.is_empty(), "deduped fill must not be re-published");
+    }
+
+    #[tokio::test]
+    async fn perp_fill_without_position_size_is_fail_closed() {
+        // M-RK5 call-site: a perp fill whose projection carries no
+        // `position_size` must not be applied to the tracker as a zero-size
+        // (flat) position — that would delete the tracked position as a
+        // phantom close. The tracker keeps the position.
+        struct MissingSizeProjector;
+        #[async_trait]
+        impl ExchangeFactProjector for MissingSizeProjector {
+            async fn ingest_fill(&self, fill: &Value) -> Result<IngestResult, HypeEdgeError> {
+                let id = fill_external_id(fill);
+                Ok(IngestResult {
+                    processed: true,
+                    external_event_id: id.clone(),
+                    fill_projection: Some(CommittedFillProjection {
+                        external_event_id: id,
+                        cloid: "0xabc".into(),
+                        exchange_oid: "9".into(),
+                        symbol: "BTC".into(),
+                        side: "sell".into(),
+                        price: Decimal::from_str_strict("51000").unwrap(),
+                        size: Decimal::from_str_strict("1.0").unwrap(),
+                        fee: Decimal::from_str_strict("0.1").unwrap(),
+                        is_maker: false,
+                        occurred_at: 1_700_000_000_000,
+                        strategy_id: None,
+                        sub_account: Some("0xabc".into()),
+                        position_size: None, // projector could not determine it
+                        position_entry_price: None,
+                        position_mark_price: None,
+                        order_status: "filled".into(),
+                        is_spot: false,
+                    }),
+                    funding_amount: None,
+                })
+            }
+            async fn ingest_order_update(
+                &self,
+                _: &Value,
+            ) -> Result<IngestResult, HypeEdgeError> {
+                Ok(IngestResult::dedup("order:x"))
+            }
+            async fn ingest_funding(&self, _: &Value) -> Result<IngestResult, HypeEdgeError> {
+                Ok(IngestResult::dedup("funding:x"))
+            }
+            async fn has_order(&self, _: &str) -> Result<bool, HypeEdgeError> {
+                Ok(true)
+            }
+            async fn cursor(&self, _: &str) -> Result<i64, HypeEdgeError> {
+                Ok(0)
+            }
+        }
+
+        let tracker = Arc::new(AccountTracker::new());
+        // A long BTC position tracked locally.
+        let entry = Fill {
+            cloid: "0xabc".into(),
+            exchange_oid: "1".into(),
+            symbol: "BTC".into(),
+            side: hypeedge_domain::enums::Side::Buy,
+            price: hypeedge_domain::decimal::Price::new(
+                Decimal::from_str_strict("50000").unwrap(),
+            ),
+            size: hypeedge_domain::decimal::Size::new(Decimal::from_str_strict("1.0").unwrap()),
+            fee: hypeedge_domain::decimal::Usd::ZERO,
+            is_maker: false,
+            timestamp: 1_700_000_000_000,
+            strategy_id: None,
+            sub_account: None,
+            is_spot: false,
+        };
+        tracker.update_fill(&entry, false);
+
+        let ingestor = ExchangeEventIngestor::new(
+            "0xabc",
+            Arc::new(MissingSizeProjector),
+            Arc::new(FakeInfo {
+                orders: vec![],
+                fills: vec![],
+            }),
+            Some(tracker.clone()),
+            30.0,
+        );
+        let payload = serde_json::json!({"tid": 2, "oid": "9", "time": "1700000000001", "coin": "BTC", "side": "A", "px": "51000", "sz": "1.0", "fee": "0.1", "startPosition": "1"});
+        let result = ingestor.ingest_fill(&payload).await.unwrap();
+        assert!(result.processed, "the fill itself commits");
+        // Fail-closed: the missing position projection must not close the
+        // tracked position.
+        let pos = tracker.get_position("BTC").unwrap();
+        assert_eq!(pos.size.to_string(), "1", "position must survive a projection without position_size (M-RK5)");
+    }
+
+    /// An `InfoClient` whose `historical_orders_paged` performs real
+    /// server-side windowing (2000-entry cap), for the M-RK7 pagination test.
+    struct PagedOrdersInfo {
+        orders: Vec<Value>,
+        paged_calls: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl InfoClient for PagedOrdersInfo {
+        async fn historical_orders(&self, _: &str) -> Result<Vec<Value>, String> {
+            Ok(vec![])
+        }
+        async fn historical_orders_paged(
+            &self,
+            _account: &str,
+            start_ms: i64,
+            end_ms: i64,
+        ) -> Result<Vec<Value>, String> {
+            let mut out: Vec<Value> = self
+                .orders
+                .iter()
+                .filter(|o| {
+                    let ts = order_status_timestamp_ms(o);
+                    ts >= start_ms && ts < end_ms
+                })
+                .cloned()
+                .collect();
+            out.truncate(2000); // the API caps one response at ~2000 entries
+            self.paged_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(out)
+        }
+        async fn user_fills_by_time(
+            &self,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<Value>, String> {
+            Ok(vec![])
+        }
+        async fn user_funding_history(
+            &self,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<Value>, String> {
+            Ok(vec![])
+        }
+        async fn query_order_by_oid(
+            &self,
+            _: &str,
+            _: i64,
+        ) -> Result<Option<Value>, String> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn recover_orders_pages_past_the_2000_cap() {
+        // M-RK7: historical order recovery must page forward on
+        // `statusTimestamp` instead of silently truncating at 2000 entries.
+        let mut orders = Vec::new();
+        for i in 0..2001_i64 {
+            orders.push(serde_json::json!({
+                "oid": i,
+                "coin": "BTC",
+                "status": "open",
+                "statusTimestamp": 1_700_000_000_000 + i,
+            }));
+        }
+        let info = Arc::new(PagedOrdersInfo {
+            orders,
+            paged_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let projector = Arc::new(FakeProjector::new());
+        let mut ingestor = ExchangeEventIngestor::new(
+            "0xabc",
+            projector.clone(),
+            info.clone(),
+            None,
+            30.0,
+        );
+        ingestor.recover_history().await.unwrap();
+        assert!(
+            info.paged_calls.load(AtomicOrdering::SeqCst) >= 2,
+            "orders must page past the 2000 cap"
+        );
+        assert!(
+            projector.orders_ingested.load(AtomicOrdering::SeqCst) >= 2001,
+            "all 2001 orders must be ingested, none truncated"
+        );
     }
 }

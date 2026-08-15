@@ -4,21 +4,35 @@
 
 use std::sync::Arc;
 
-use chrono::Utc;
+use chrono::{DateTime, Duration, Utc};
 use hypeedge_domain::decimal::{Decimal, Size, Usd};
 use hypeedge_domain::enums::{Side, TimeInForce};
 use hypeedge_domain::traits::ExecutionClient;
 
 use super::models::{ActionBudgetSnapshot, InventorySnapshot};
 use super::runtime::{
-    ActionBudgetSnapshotProvider, FundingSnapshotProvider, InventorySnapshotProvider,
-    QuoteCancelRequest, QuotePlanCommandClient, QuoteSlotProvider,
+    ActionBudgetSnapshotProvider, DEFAULT_ACTION_SHADOW_COST_USDC, FundingSnapshotProvider,
+    InventorySnapshotProvider, QuoteCancelRequest, QuotePlanCommandClient, QuoteSlotProvider,
 };
 use crate::account::AccountTracker;
 use crate::execution::ExecutionEngine;
 use crate::market_data::live_provider::LiveMarketDataProvider;
 use crate::risk::ActionBudgetController;
 use crate::trading::quotes::{QuotePlan, QuoteRiskOwner, QuoteSlotKey, QuoteSlotView};
+
+/// H-MM3: account data older than this is treated as stale (fail-closed).
+/// The trading crate cannot read the deployment `account_poll_interval_seconds`
+/// (default 3s), so the task's fallback constant is used; a configurable
+/// threshold is available via [`TrackerHealthProvider::with_freshness_after`].
+const ACCOUNT_FRESH_AFTER: Duration = Duration::seconds(30);
+
+/// True when the tracker was updated recently enough to be trusted.
+fn tracker_is_fresh(tracker: &AccountTracker, now: DateTime<Utc>) -> bool {
+    match tracker.last_update_ts() {
+        Some(ts) => now >= ts && now - ts <= ACCOUNT_FRESH_AFTER,
+        None => false,
+    }
+}
 
 /// Inventory from the live account tracker.
 pub struct TrackerInventoryProvider {
@@ -51,7 +65,8 @@ impl InventorySnapshotProvider for TrackerInventoryProvider {
             available_balance: available,
             margin_used,
             observed_at: self.tracker.last_update_ts().unwrap_or_else(Utc::now),
-            healthy: self.tracker.last_update_ts().is_some(),
+            // H-MM3: "healthy" means *fresh*, not merely "was updated once".
+            healthy: tracker_is_fresh(&self.tracker, Utc::now()),
         }
     }
 }
@@ -91,7 +106,13 @@ impl ActionBudgetSnapshotProvider for ControllerBudgetProvider {
             address_actions_remaining: view.address_remaining,
             cancel_headroom: view.cancel_headroom_remaining,
             ip_weight_remaining: view.ip_weight_remaining,
-            action_shadow_cost_usdc: Usd::ZERO,
+            // M-MM11: expose a non-zero action shadow cost. The trailing
+            // marginal USDC/action in the budget view is *earned* revenue, not
+            // cost, so a conservative constant is the safe default until a
+            // dynamic per-strategy cost estimate is wired in.
+            action_shadow_cost_usdc: Usd::new(
+                Decimal::from_str_lenient(DEFAULT_ACTION_SHADOW_COST_USDC).unwrap(),
+            ),
             observed_at: Utc::now(),
             healthy: true,
         }
@@ -101,18 +122,37 @@ impl ActionBudgetSnapshotProvider for ControllerBudgetProvider {
 /// Account health from the tracker freshness.
 pub struct TrackerHealthProvider {
     tracker: Arc<AccountTracker>,
+    fresh_after: Duration,
 }
 
 impl TrackerHealthProvider {
     pub fn new(tracker: Arc<AccountTracker>) -> Self {
-        Self { tracker }
+        Self {
+            tracker,
+            fresh_after: ACCOUNT_FRESH_AFTER,
+        }
+    }
+
+    /// H-MM3: allow overriding the freshness threshold (e.g. from deployment
+    /// config `2 × account_poll_interval_seconds` at assembly time).
+    pub fn with_freshness_after(mut self, fresh_after: Duration) -> Self {
+        self.fresh_after = fresh_after;
+        self
+    }
+
+    fn is_fresh(&self, now: DateTime<Utc>) -> bool {
+        match self.tracker.last_update_ts() {
+            Some(ts) => now >= ts && now - ts <= self.fresh_after,
+            None => false,
+        }
     }
 }
 
 impl super::runtime::AccountHealthProvider for TrackerHealthProvider {
     fn allows_risk_increase(&self) -> bool {
-        // Fresh account state ⇒ risk increases are allowed.
-        self.tracker.last_update_ts().is_some()
+        // H-MM3: freshness gate, fail-closed — "was updated at least once"
+        // is not enough; the account must have been updated recently.
+        self.is_fresh(Utc::now())
     }
 }
 
@@ -179,6 +219,14 @@ impl QuoteSlotProvider for EngineSlotProvider {
                 price,
                 remaining_size: Size::new(remaining),
                 status: order.status,
+                // L-MM2: the engine does not expose the quote-plan revision an
+                // order belongs to, so this is hardcoded to 0. KNOWN
+                // LIMITATION: with plan_revision always 0 the coordinator's
+                // `stale_plan_revision` / `slot_revision_mismatch` fences and
+                // the orphaned-owner detection are effectively disabled for
+                // live slots (they still work in shadow mode). Fixing this
+                // requires persisting the owning plan revision on the order —
+                // tracked as a follow-up, not silently assumed correct.
                 plan_revision: 0,
                 live_since: order
                     .acknowledged_at
@@ -205,6 +253,10 @@ impl QuoteSlotProvider for EngineSlotProvider {
                 side,
                 level: 0,
             },
+            // L-MM2: see the plan_revision comment above — revision and
+            // last_transition_at are also not derivable from the engine's open
+            // orders, so revision-based fences and refresh_cooldown are inert
+            // for live slots (a documented follow-up).
             revision: 0,
             plan_revision: 0,
             owners,
@@ -311,5 +363,105 @@ impl EngineQuotePlanClient {
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::market_maker::runtime::AccountHealthProvider;
+    use crate::risk::ActionBudgetSettings;
+    use hypeedge_domain::decimal::Price;
+    use hypeedge_domain::models::{Fill, Position};
+
+    fn fill_at(timestamp_millis: i64) -> Fill {
+        Fill {
+            cloid: "c1".into(),
+            exchange_oid: "o1".into(),
+            symbol: "BTC".into(),
+            side: Side::Buy,
+            price: Price::new(Decimal::from_str_lenient("100").unwrap()),
+            size: Size::new(Decimal::ONE),
+            fee: Usd::ZERO,
+            is_maker: true,
+            timestamp: timestamp_millis,
+            strategy_id: Some("mm_1".into()),
+            sub_account: Some("sub1".into()),
+            is_spot: false,
+        }
+    }
+
+    fn position() -> Position {
+        Position {
+            symbol: "BTC".into(),
+            size: Size::new(Decimal::ONE),
+            entry_price: Some(Price::new(Decimal::from_str_lenient("100").unwrap())),
+            mark_price: None,
+            unrealized_pnl: None,
+            leverage: 1,
+            liquidation_price: None,
+            sub_account: Some("sub1".into()),
+            strategy_id: Some("mm_1".into()),
+        }
+    }
+
+    // H-MM3: account health is a *freshness* gate, fail-closed — "updated at
+    // least once" is not enough.
+
+    #[test]
+    fn tracker_health_requires_fresh_account_state() {
+        let tracker = Arc::new(AccountTracker::new());
+        let health = TrackerHealthProvider::new(tracker.clone());
+        assert!(
+            !health.allows_risk_increase(),
+            "never-updated account must not allow risk increase"
+        );
+        // Stale update (older than the 30s threshold) → fail closed.
+        let stale_ts = (Utc::now() - Duration::seconds(60)).timestamp_millis();
+        tracker.apply_authoritative_fill("e_stale", &fill_at(stale_ts), Some(&position()));
+        assert!(
+            !health.allows_risk_increase(),
+            "stale account must not allow risk increase"
+        );
+        // Fresh update → allowed.
+        let fresh_ts = Utc::now().timestamp_millis();
+        tracker.apply_authoritative_fill("e_fresh", &fill_at(fresh_ts), Some(&position()));
+        assert!(
+            health.allows_risk_increase(),
+            "fresh account must allow risk increase"
+        );
+    }
+
+    #[test]
+    fn tracker_inventory_healthy_requires_fresh_state() {
+        let tracker = Arc::new(AccountTracker::new());
+        let provider = TrackerInventoryProvider::new(tracker.clone());
+        assert!(!provider.get_inventory("sub1", "BTC").healthy);
+        let stale_ts = (Utc::now() - Duration::seconds(60)).timestamp_millis();
+        tracker.apply_authoritative_fill("e_stale", &fill_at(stale_ts), Some(&position()));
+        assert!(!provider.get_inventory("sub1", "BTC").healthy);
+        tracker.apply_authoritative_fill(
+            "e_fresh",
+            &fill_at(Utc::now().timestamp_millis()),
+            Some(&position()),
+        );
+        assert!(provider.get_inventory("sub1", "BTC").healthy);
+    }
+
+    // M-MM11: the budget provider exposes a non-zero action shadow cost.
+
+    #[test]
+    fn budget_provider_reports_non_zero_shadow_cost() {
+        let address = format!("0x{}", "a".repeat(40));
+        let controller =
+            ActionBudgetController::new(&address, ActionBudgetSettings::default()).unwrap();
+        let provider = ControllerBudgetProvider::new(Arc::new(tokio::sync::Mutex::new(controller)));
+        let snapshot = provider.get_action_budget("mm_1", "BTC");
+        assert!(snapshot.healthy);
+        assert_eq!(
+            snapshot.action_shadow_cost_usdc.to_string(),
+            DEFAULT_ACTION_SHADOW_COST_USDC
+        );
+        assert!(snapshot.action_shadow_cost_usdc.inner() > Decimal::ZERO);
     }
 }

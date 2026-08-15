@@ -21,6 +21,10 @@ use hypeedge_infra::event_bus::{BoundedMailbox, EventBus};
 /// A subscriber mailbox (shared handle to a bounded event queue).
 type Mailbox = Arc<BoundedMailbox<Arc<Event>>>;
 
+/// Default staleness threshold for [`LiveMarketDataProvider::get_mid_price`]
+/// (M-MD7): a mid observed longer ago than this is no longer served as live.
+const DEFAULT_MID_STALE_AFTER_SECONDS: f64 = 10.0;
+
 use super::book::BookManager;
 
 /// A normalized mid/mark price and its actual observation time.
@@ -59,6 +63,9 @@ pub struct LiveMarketDataProvider {
     rest_client: Arc<dyn CandleHistoryClient>,
     book_manager: Arc<tokio::sync::Mutex<BookManager>>,
     max_candles_per_series: usize,
+    /// A mid price older than this (seconds) is treated as stale by
+    /// [`LiveMarketDataProvider::get_mid_price`] (M-MD7).
+    mid_stale_after_seconds: f64,
 
     last_trades: tokio::sync::Mutex<HashMap<String, Trade>>,
     mid_prices: tokio::sync::Mutex<HashMap<String, MidPriceState>>,
@@ -87,11 +94,18 @@ impl LiveMarketDataProvider {
             rest_client,
             book_manager,
             max_candles_per_series: 1_500,
+            mid_stale_after_seconds: DEFAULT_MID_STALE_AFTER_SECONDS,
             last_trades: tokio::sync::Mutex::new(HashMap::new()),
             mid_prices: tokio::sync::Mutex::new(HashMap::new()),
             funding: tokio::sync::Mutex::new(HashMap::new()),
             candles: tokio::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Builder: override the mid staleness threshold in seconds (M-MD7).
+    pub fn with_mid_stale_after_seconds(mut self, seconds: f64) -> Self {
+        self.mid_stale_after_seconds = seconds.max(0.0);
+        self
     }
 
     /// Subscribe to events and begin tracking market state in a background task.
@@ -215,15 +229,33 @@ impl LiveMarketDataProvider {
         self.book_manager.lock().await.get_snapshot(symbol)
     }
 
-    /// Get the latest mid price; prefers the allMids WS price, falls back to
-    /// the book mid.
-    pub async fn get_mid_price(&self, symbol: &str) -> Option<f64> {
+    /// Latest mid price with its observation time, or `None` when no mid or
+    /// book observation exists (M-MD7). The observation time lets callers
+    /// decide freshness themselves (e.g. `get_price_snapshot_full`).
+    pub async fn get_mid_price_with_age(&self, symbol: &str) -> Option<(f64, DateTime<Utc>)> {
         let mid_prices = self.mid_prices.lock().await;
         if let Some(state) = mid_prices.get(symbol) {
-            return Some(state.price);
+            return Some((state.price, state.observed_at));
         }
         drop(mid_prices);
-        self.book_manager.lock().await.get_mid_price(symbol)
+        let book = self.book_manager.lock().await;
+        let snapshot = book.get_snapshot(symbol)?;
+        let mid = book.get_mid_price(symbol)?;
+        Some((mid, snapshot.local_ts))
+    }
+
+    /// Get the latest mid price; prefers the allMids WS price, falls back to
+    /// the book mid. Returns `None` when the latest observation is older than
+    /// `mid_stale_after_seconds` so a frozen price is never served as live
+    /// (M-MD7).
+    pub async fn get_mid_price(&self, symbol: &str) -> Option<f64> {
+        let (price, observed_at) = self.get_mid_price_with_age(symbol).await?;
+        let age_seconds = (Utc::now() - observed_at).num_milliseconds() as f64 / 1000.0;
+        if age_seconds > self.mid_stale_after_seconds {
+            None
+        } else {
+            Some(price)
+        }
     }
 
     /// Return a normalized mid/mark price and its actual observation time.
@@ -485,6 +517,34 @@ mod tests {
         p.handle_event(&Event::new(DomainEvent::MidPriceUpdate(mid)))
             .await;
         assert_eq!(p.get_mid_price("BTC").await, Some(50010.0));
+    }
+
+    #[tokio::test]
+    async fn stale_mid_is_not_served() {
+        // M-MD7: a mid older than the threshold is not served as live; the
+        // age-carrying variant still reports it for callers that decide.
+        let p = provider().with_mid_stale_after_seconds(1.0);
+        let mid = MidPrice {
+            symbol: "BTC".into(),
+            price: Decimal::from_scaled(50010, 0),
+            timestamp: 200,
+        };
+        p.handle_event(&Event::new(DomainEvent::MidPriceUpdate(mid)))
+            .await;
+        assert_eq!(p.get_mid_price("BTC").await, Some(50010.0));
+        {
+            let mut m = p.mid_prices.lock().await;
+            if let Some(state) = m.get_mut("BTC") {
+                state.observed_at = Utc::now() - chrono::Duration::seconds(5);
+            }
+        }
+        assert_eq!(p.get_mid_price("BTC").await, None, "stale mid not served");
+        let (price, observed_at) = p.get_mid_price_with_age("BTC").await.unwrap();
+        assert_eq!(price, 50010.0);
+        assert!((Utc::now() - observed_at).num_seconds() >= 4);
+        // Unknown symbol: both return None.
+        assert!(p.get_mid_price("NOPE").await.is_none());
+        assert!(p.get_mid_price_with_age("NOPE").await.is_none());
     }
 
     #[tokio::test]

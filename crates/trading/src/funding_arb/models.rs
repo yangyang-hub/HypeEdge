@@ -21,6 +21,10 @@ pub struct FundingArbParams {
     pub expected_hold_hours: u32,
     pub round_trip_fee_bps: Decimal,
     pub max_unhedged_seconds: u32,
+    /// M-FA7: hard ceiling on how long an open cycle may be held. The tick
+    /// driver force-closes the cycle when `opened_at` is older than this.
+    /// Default 168h (7 days) — a safety valve, not the exit trigger.
+    pub max_hold_hours: u32,
 }
 
 impl Default for FundingArbParams {
@@ -38,6 +42,7 @@ impl Default for FundingArbParams {
             expected_hold_hours: 8,
             round_trip_fee_bps: Decimal::from_str_lenient("20").unwrap(),
             max_unhedged_seconds: 15,
+            max_hold_hours: 168,
         }
     }
 }
@@ -125,6 +130,12 @@ impl FundingArbParams {
             errors.push(format!(
                 "max_unhedged_seconds must be in [1, 60], got {}",
                 self.max_unhedged_seconds
+            ));
+        }
+        if !(1..=8760).contains(&self.max_hold_hours) {
+            errors.push(format!(
+                "max_hold_hours must be in [1, 8760], got {}",
+                self.max_hold_hours
             ));
         }
         if errors.is_empty() {

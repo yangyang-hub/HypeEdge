@@ -394,6 +394,18 @@ impl FundingArbRuntimeHandle {
     // --- Lifecycle ---
 
     /// Recover a cycle that was open when the process restarted (A19).
+    ///
+    /// P2-2 (C7 + M-FA1): entry-intermediate states (EnteringSpot /
+    /// EnteringPerp / CompensatingEntry) are no longer blindly faulted.
+    /// Recovery first tries to *prove* what actually happened from the
+    /// authoritative execution layer (`ExecutionClient::get_order` on the
+    /// persisted leg cloids) and from the tracker's spot/perp balances:
+    ///   - proven residual exposure → resume through the existing
+    ///     compensation/flatten paths (spot-only → `compensate_spot`; perp
+    ///     involved → `close_cycle`);
+    ///   - a proven fill with no residual exposure → the cycle was already
+    ///     resolved externally; retire it as flat;
+    ///   - nothing provable → fault (fail-closed, the previous behavior).
     pub async fn recover_active_cycle(&self) -> Result<(), String> {
         let Some(deps) = self.deps.clone() else {
             return Ok(());
@@ -413,6 +425,11 @@ impl FundingArbRuntimeHandle {
                     "funding_arb_recovered_active_cycle"
                 );
                 *self.cycle.lock().await = Some(cycle);
+            }
+            FundingArbCycleState::EnteringSpot
+            | FundingArbCycleState::EnteringPerp
+            | FundingArbCycleState::CompensatingEntry => {
+                self.recover_intermediate_cycle(&cycle).await?;
             }
             _ => {
                 tracing::error!(
@@ -441,6 +458,101 @@ impl FundingArbRuntimeHandle {
         Ok(())
     }
 
+    /// P2-2: resolve a crash-interrupted entry cycle against the authoritative
+    /// execution layer instead of faulting outright.
+    async fn recover_intermediate_cycle(&self, cycle: &FundingArbCycle) -> Result<(), String> {
+        let Some(deps) = self.deps.clone() else {
+            return Ok(());
+        };
+        // Bind the cycle first so the compensation/flatten helpers below have
+        // a target (transitions and exposure reads need the binding).
+        *self.cycle.lock().await = Some(cycle.clone());
+        tracing::warn!(
+            strategy_id = %self.strategy_id,
+            cycle_id = %cycle.cycle_id,
+            state = cycle.state.as_str(),
+            "funding_arb_recovering_intermediate_cycle"
+        );
+
+        // 1) Prove fills from the authoritative execution layer: query every
+        //    persisted leg cloid. A positive filled size is proof the leg
+        //    actually traded (P2-2a).
+        let mut proven_fill = false;
+        for cloid in [
+            cycle.spot_entry_cloid.clone(),
+            cycle.perp_entry_cloid.clone(),
+            cycle.compensation_cloid.clone(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            match deps.execution.get_order(&cloid).await {
+                Ok(Some(order)) if order.filled_size.inner() > Decimal::ZERO => {
+                    proven_fill = true;
+                    tracing::info!(
+                        cloid = %cloid,
+                        filled = %order.filled_size,
+                        "funding_arb_recovery_proven_fill"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(cloid = %cloid, error = %e, "funding_arb_recovery_order_query_failed");
+                }
+            }
+        }
+
+        // 2) Determine the actual residual exposure from the tracker balances.
+        self.refresh_authoritative_account().await;
+        let (spot, perp) = self.actual_exposure().await;
+
+        if perp > Decimal::ZERO || spot > Decimal::ZERO {
+            // Proven exposure → flatten through the existing paths
+            // (P2-2a): the cycle must not be left as a naked residual.
+            tracing::warn!(
+                spot = %spot,
+                perp = %perp,
+                "funding_arb_recovery_exposure_found_flattening"
+            );
+            if perp > Decimal::ZERO {
+                return self.close_cycle("recovery_intermediate_flatten").await;
+            }
+            return self
+                .compensate_spot(spot, "recovery_intermediate_compensation")
+                .await;
+        }
+        if proven_fill {
+            // A leg provably traded but the account is flat: the cycle was
+            // already resolved externally — retire it as flat instead of
+            // resurrecting a phantom cycle.
+            tracing::info!(
+                strategy_id = %self.strategy_id,
+                cycle_id = %cycle.cycle_id,
+                "funding_arb_recovery_flat_after_proven_fill"
+            );
+            return self
+                .transition(
+                    FundingArbCycleState::Closed,
+                    "recovery_flat",
+                    None,
+                    serde_json::json!({
+                        "spot_open_size": Decimal::ZERO,
+                        "perp_open_size": Decimal::ZERO,
+                    }),
+                )
+                .await;
+        }
+        // Nothing provable → fail closed (the pre-P2-2 behavior).
+        self.fault(
+            "unresolvable_intermediate_cycle",
+            &format!(
+                "recovered cycle in {} state with no provable fill and no exposure",
+                cycle.state.as_str()
+            ),
+        )
+        .await
+    }
+
     /// One driver tick: entry scanning when flat; rebalance/exit when open.
     pub async fn tick(&self) -> Result<(), String> {
         let Some(deps) = self.deps.clone() else {
@@ -461,6 +573,10 @@ impl FundingArbRuntimeHandle {
             }
             *self.entry_block_reason.lock().await = None;
             let candidates = deps.scanner.scan().await?;
+            let now = Utc::now();
+            // M-FA5: evaluate every candidate, then pick the best one instead
+            // of taking the first in scan order.
+            let mut plans = Vec::new();
             for candidate in candidates {
                 let Some(perp_meta) = deps.meta.get(&candidate.perp_symbol) else {
                     continue;
@@ -473,17 +589,49 @@ impl FundingArbRuntimeHandle {
                     continue;
                 };
                 if let Ok(Some(plan)) =
-                    self.candidate_plan(&candidate, &perp_meta, &spot_meta, Utc::now())
+                    self.candidate_plan(&candidate, &perp_meta, &spot_meta, now)
                 {
-                    self.open_cycle(&plan).await?;
-                    break;
+                    plans.push(plan);
                 }
+            }
+            if let Some(plan) = pick_best_plan(plans) {
+                self.open_cycle(&plan).await?;
             }
             return Ok(());
         };
 
         if (deps.kill_switch_active)().await {
             return self.close_cycle("kill_switch_active").await;
+        }
+        // P2-2 (b): a cycle stranded in an entry-intermediate state (a previous
+        // leg error left it there) must not hang forever — fault with
+        // compensation once it has been stuck longer than the worst-case leg
+        // execution window.
+        if matches!(
+            cycle.state,
+            FundingArbCycleState::EnteringSpot
+                | FundingArbCycleState::EnteringPerp
+                | FundingArbCycleState::CompensatingEntry
+        ) {
+            let timeout = Duration::from_secs(
+                (deps.deployment.max_leg_attempts as u64)
+                    * (self.params.max_unhedged_seconds as u64),
+            );
+            let stuck_since = cycle.updated_at.or(cycle.created_at);
+            if let Some(since) = stuck_since
+                && (Utc::now() - since)
+                    .to_std()
+                    .map(|age| age > timeout)
+                    .unwrap_or(false)
+            {
+                tracing::error!(
+                    strategy_id = %self.strategy_id,
+                    cycle_state = cycle.state.as_str(),
+                    "funding_arb_entry_intermediate_timeout_faulting"
+                );
+                return self.fault_after_unknown("entry_intermediate_timeout").await;
+            }
+            return Ok(());
         }
         if matches!(
             cycle.state,
@@ -497,6 +645,19 @@ impl FundingArbRuntimeHandle {
                 && snapshot.funding_rate <= self.params.exit_funding_rate
             {
                 return self.close_cycle("funding_exit_threshold").await;
+            }
+            // M-FA7: a cycle held past `max_hold_hours` is force-closed — the
+            // funding thesis has a shelf life and a stuck driver must not sit
+            // on an open hedge forever.
+            if let Some(opened_at) = cycle.opened_at {
+                let max_hold = Duration::from_secs(self.params.max_hold_hours as u64 * 3600);
+                if (Utc::now() - opened_at)
+                    .to_std()
+                    .map(|age| age > max_hold)
+                    .unwrap_or(false)
+                {
+                    return self.close_cycle("max_hold_time_reached").await;
+                }
             }
             return self.rebalance_if_needed().await;
         }
@@ -720,17 +881,35 @@ impl FundingArbRuntimeHandle {
                 return Ok(filled_total);
             }
             filled_total += outcome.filled_size;
-            remaining = Self::floor(
-                (size - filled_total).max(Decimal::ZERO),
-                self.lot_size(is_spot).await,
-            );
+            remaining = match self.lot_size(is_spot).await {
+                Ok(lot) => Self::floor((size - filled_total).max(Decimal::ZERO), lot),
+                Err(e) => {
+                    // M-FA2: a missing lot size must fault, not panic the
+                    // floor-divide (and not silently abort the exit).
+                    self.fault("lot_size_unavailable", &e).await?;
+                    return Ok(filled_total);
+                }
+            };
         }
         Ok(filled_total)
     }
 
     /// Open a full cycle: create the durable row, buy the spot leg, then sell
     /// the perp leg sized to the spot fill, and align both.
+    ///
+    /// P2-2 (c): internal errors are routed to `fault` (after compensating any
+    /// residual exposure) instead of propagating — a half-created cycle must
+    /// never be left in an entry-intermediate state that the tick driver would
+    /// otherwise hang on.
     pub async fn open_cycle(&self, plan: &EntryPlan) -> Result<(), String> {
+        if let Err(e) = self.open_cycle_inner(plan).await {
+            self.fault_after_internal_error("open_cycle_failed", &e)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn open_cycle_inner(&self, plan: &EntryPlan) -> Result<(), String> {
         let deps = self.require_deps()?;
         if !self.refresh_authoritative_account().await {
             return Ok(()); // caller blocks entry; mirror Python's `_block_entry`
@@ -855,7 +1034,22 @@ impl FundingArbRuntimeHandle {
 
     /// Align the two legs after entry: refresh authoritative exposure, reduce
     /// the larger leg, and open when the hedge matches.
+    ///
+    /// P2-2 (c): internal errors fault the cycle (with exposure compensation)
+    /// instead of leaving it stranded in `CompensatingEntry`.
     pub async fn align_and_open(
+        &self,
+        spot_size: Decimal,
+        perp_size: Decimal,
+    ) -> Result<(), String> {
+        if let Err(e) = self.align_and_open_inner(spot_size, perp_size).await {
+            self.fault_after_internal_error("align_and_open_failed", &e)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn align_and_open_inner(
         &self,
         spot_size: Decimal,
         perp_size: Decimal,
@@ -891,7 +1085,7 @@ impl FundingArbRuntimeHandle {
             return Ok(());
         }
         let (spot, perp) = self.actual_exposure().await;
-        let spot_lot = self.lot_size(true).await;
+        let spot_lot = self.lot_size(true).await?;
         if spot <= Decimal::ZERO && perp <= Decimal::ZERO {
             self.transition(
                 FundingArbCycleState::Closed,
@@ -935,8 +1129,20 @@ impl FundingArbRuntimeHandle {
             return Ok(());
         }
         let (actual_spot, actual_perp) = self.actual_exposure().await;
-        let perp_lot = self.lot_size(false).await;
-        let spot_lot = self.lot_size(true).await;
+        let perp_lot = match self.lot_size(false).await {
+            Ok(lot) => lot,
+            Err(e) => {
+                self.fault("lot_size_unavailable", &e).await?;
+                return Ok(());
+            }
+        };
+        let spot_lot = match self.lot_size(true).await {
+            Ok(lot) => lot,
+            Err(e) => {
+                self.fault("lot_size_unavailable", &e).await?;
+                return Ok(());
+            }
+        };
         if actual_perp > perp_lot / Decimal::from_i128(2) {
             self.fault(
                 "unexpected_perp_during_spot_compensation",
@@ -980,8 +1186,20 @@ impl FundingArbRuntimeHandle {
             return Ok(());
         }
         let (remaining_spot, remaining_perp) = self.actual_exposure().await;
-        let spot_lot = self.lot_size(true).await;
-        let perp_lot = self.lot_size(false).await;
+        let spot_lot = match self.lot_size(true).await {
+            Ok(lot) => lot,
+            Err(e) => {
+                self.fault("lot_size_unavailable", &e).await?;
+                return Ok(());
+            }
+        };
+        let perp_lot = match self.lot_size(false).await {
+            Ok(lot) => lot,
+            Err(e) => {
+                self.fault("lot_size_unavailable", &e).await?;
+                return Ok(());
+            }
+        };
         if remaining_spot > spot_lot / Decimal::from_i128(2)
             || remaining_perp > perp_lot / Decimal::from_i128(2)
         {
@@ -1043,7 +1261,13 @@ impl FundingArbRuntimeHandle {
             return Ok(());
         }
         let (spot_size, perp_size) = self.actual_exposure().await;
-        let perp_lot = self.lot_size(false).await;
+        let perp_lot = match self.lot_size(false).await {
+            Ok(lot) => lot,
+            Err(e) => {
+                self.fault("lot_size_unavailable", &e).await?;
+                return Ok(());
+            }
+        };
         if perp_size > perp_lot / Decimal::from_i128(2) {
             self.fault("perp_exit_incomplete", &format!("remaining={perp_size}"))
                 .await?;
@@ -1061,7 +1285,13 @@ impl FundingArbRuntimeHandle {
             self.execute_reducing(spot_symbol, Side::Sell, spot_size, true, "spot_exit", false)
                 .await?;
         }
-        let spot_lot = self.lot_size(true).await;
+        let spot_lot = match self.lot_size(true).await {
+            Ok(lot) => lot,
+            Err(e) => {
+                self.fault("lot_size_unavailable", &e).await?;
+                return Ok(());
+            }
+        };
         let (final_spot, final_perp) = self.actual_exposure().await;
         if final_spot > spot_lot / Decimal::from_i128(2)
             || final_perp > perp_lot / Decimal::from_i128(2)
@@ -1093,7 +1323,13 @@ impl FundingArbRuntimeHandle {
             return Ok(());
         }
         let (spot_size, perp_size) = self.actual_exposure().await;
-        let spot_lot = self.lot_size(true).await;
+        let spot_lot = match self.lot_size(true).await {
+            Ok(lot) => lot,
+            Err(e) => {
+                self.fault("lot_size_unavailable", &e).await?;
+                return Ok(());
+            }
+        };
         let denominator = (perp_size * self.params.hedge_ratio).max(spot_lot);
         if denominator <= Decimal::ZERO {
             return Ok(());
@@ -1131,7 +1367,13 @@ impl FundingArbRuntimeHandle {
             return Ok(());
         }
         let (spot_size, perp_size) = self.actual_exposure().await;
-        let spot_lot = self.lot_size(true).await;
+        let spot_lot = match self.lot_size(true).await {
+            Ok(lot) => lot,
+            Err(e) => {
+                self.fault("lot_size_unavailable", &e).await?;
+                return Ok(());
+            }
+        };
         if !self.hedge_matches(spot_size, perp_size, spot_lot) {
             self.fault(
                 "rebalance_incomplete",
@@ -1156,8 +1398,10 @@ impl FundingArbRuntimeHandle {
         perp_size: Decimal,
         event_prefix: &str,
     ) -> Result<(Decimal, Decimal), String> {
-        let spot_lot = self.lot_size(true).await;
-        let perp_lot = self.lot_size(false).await;
+        // M-FA2: propagate — callers route the missing-metadata error to
+        // `fault` (align_and_open via its wrapper) or retry on the next tick.
+        let spot_lot = self.lot_size(true).await?;
+        let perp_lot = self.lot_size(false).await?;
         let target_spot = Self::floor(perp_size * self.params.hedge_ratio, spot_lot);
         let mut spot_size = spot_size;
         let mut perp_size = perp_size;
@@ -1213,23 +1457,23 @@ impl FundingArbRuntimeHandle {
     }
 
     /// The lot size for a leg, resolved from instrument metadata by symbol.
-    async fn lot_size(&self, is_spot: bool) -> Decimal {
+    /// M-FA2: returns an `Err` (never `ZERO`) when the instrument metadata is
+    /// missing — a zero lot size would divide-by-zero inside `floor` sizing
+    /// and panic the driver. Callers route the error to `fault`.
+    async fn lot_size(&self, is_spot: bool) -> Result<Decimal, String> {
         let symbol = {
             let cycle = self.cycle.lock().await.clone();
             match cycle.as_ref() {
                 Some(c) if is_spot => c.spot_symbol.clone(),
                 Some(c) => c.perp_symbol.clone(),
-                None => String::new(),
+                None => return Err("funding-arb cycle is unavailable".into()),
             }
         };
-        if symbol.is_empty() {
-            return Decimal::ZERO;
-        }
         self.deps
             .as_ref()
             .and_then(|d| d.meta.get(&symbol))
             .map(|i| i.lot_size)
-            .unwrap_or(Decimal::ZERO)
+            .ok_or_else(|| format!("instrument metadata unavailable for lot sizing: {symbol}"))
     }
 
     async fn actual_exposure(&self) -> (Decimal, Decimal) {
@@ -1323,14 +1567,32 @@ impl FundingArbRuntimeHandle {
         self.refresh_authoritative_account().await;
         let (spot_size, perp_size) = self.actual_exposure().await;
         if spot_size > Decimal::ZERO || perp_size > Decimal::ZERO {
-            self.reduce_larger_leg(spot_size, perp_size, "unknown_compensation")
-                .await?;
+            // Best-effort compensation: a reduce failure must not prevent the
+            // fault itself (the error is recorded in the fault payload).
+            let _ = self
+                .reduce_larger_leg(spot_size, perp_size, "unknown_compensation")
+                .await;
         }
         self.fault(
             code,
             &format!("unresolved order outcome; spot={spot_size} perp={perp_size}"),
         )
         .await
+    }
+
+    /// Compensate any residual exposure then fault with the given code/message.
+    /// Used when an internal error strands a cycle mid-flight (P2-2c): the
+    /// cycle must be faulted *and* any proven exposure flattened, never left
+    /// in an entry-intermediate state with a naked residual.
+    async fn fault_after_internal_error(&self, code: &str, message: &str) -> Result<(), String> {
+        self.refresh_authoritative_account().await;
+        let (spot_size, perp_size) = self.actual_exposure().await;
+        if spot_size > Decimal::ZERO || perp_size > Decimal::ZERO {
+            let _ = self
+                .reduce_larger_leg(spot_size, perp_size, "error_compensation")
+                .await;
+        }
+        self.fault(code, message).await
     }
 
     async fn release_cycle_binding(&self) {
@@ -1361,6 +1623,19 @@ impl FundingArbRuntimeHandle {
 /// Mid price of a book.
 pub fn mid(book: &L2BookSnapshot) -> Decimal {
     (book.bids[0].price.inner() + book.asks[0].price.inner()).div(Decimal::from_i128(2))
+}
+
+/// M-FA5: choose the best entry plan — highest `expected_edge_bps` first,
+/// then the higher of the two legs' smaller 24h volume (the binding liquidity
+/// leg), then the deeper top book. Pure so the ordering is unit-testable.
+pub fn pick_best_plan(plans: Vec<EntryPlan>) -> Option<EntryPlan> {
+    plans.into_iter().max_by(|a, b| {
+        a.expected_edge_bps
+            .raw()
+            .cmp(&b.expected_edge_bps.raw())
+            .then_with(|| a.liquidity_volume_usd.raw().cmp(&b.liquidity_volume_usd.raw()))
+            .then_with(|| a.top_book_depth_usd.raw().cmp(&b.top_book_depth_usd.raw()))
+    })
 }
 
 /// Combined spread cost in bps across both books.
@@ -1414,6 +1689,13 @@ pub fn decode_funding_arb_config(
         expected_hold_hours: get_u("expected_hold_hours")?,
         round_trip_fee_bps: get_d("round_trip_fee_bps")?,
         max_unhedged_seconds: get_u("max_unhedged_seconds")?,
+        // M-FA7: optional with a 168h default so existing configs (without the
+        // field) keep decoding.
+        max_hold_hours: v
+            .get("max_hold_hours")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as u32)
+            .unwrap_or(168),
     };
     params.validate()?;
     Ok(params)
@@ -1435,6 +1717,7 @@ pub fn default_funding_arb_config() -> serde_json::Value {
         "expected_hold_hours": p.expected_hold_hours,
         "round_trip_fee_bps": p.round_trip_fee_bps.to_string(),
         "max_unhedged_seconds": p.max_unhedged_seconds,
+        "max_hold_hours": p.max_hold_hours,
     })
 }
 
@@ -1447,7 +1730,18 @@ pub fn build_funding_arb_plugin(
         capabilities: crate::strategy::registry::funding_arb_capabilities(),
         factory: Arc::new(
             move |ctx: &crate::strategy::registry::StrategyBuildContext| {
-                let params = decode_funding_arb_config(&ctx.config).unwrap_or_default();
+                // M-FA3: an undecodable config must surface as an explicit
+                // faulted handle (previously `unwrap_or_default` silently
+                // replaced it with defaults — a config typo went unnoticed and
+                // the strategy ran with the wrong risk profile).
+                let params = match decode_funding_arb_config(&ctx.config) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return Arc::new(FaultedRuntimeHandle {
+                            message: format!("funding-arb config decode failed: {e}"),
+                        });
+                    }
+                };
                 let sub_account = ctx.instance.sub_account.clone();
                 let strategy_id = ctx.instance.strategy_id.clone();
                 let config_revision = ctx.config.revision;
@@ -2363,5 +2657,275 @@ mod tests {
                 .any(|(s, _)| *s == FundingArbCycleState::Faulted),
             "inverted perp leg must fault the cycle (A21): {states:?}"
         );
+    }
+
+    /// A filled spot order with the given cloid, used to prove a leg traded
+    /// during crash recovery (P2-2).
+    fn filled_order(cloid: &str, size: &str) -> Order {
+        let mut order = Order::new(
+            cloid.into(),
+            "BTC".into(),
+            Side::Buy,
+            Size::new(Decimal::from_str_strict(size).unwrap()),
+            None,
+            OrderType::Market,
+            TimeInForce::Ioc,
+        );
+        order.status = OrderStatus::Filled;
+        order.filled_size = Size::new(Decimal::from_str_strict(size).unwrap());
+        order.cloid = cloid.into();
+        order
+    }
+
+    #[tokio::test]
+    async fn recovery_flattens_spot_after_intermediate_crash() {
+        // P2-2 regression: a crash after the spot leg filled (cycle stuck in
+        // EnteringPerp) must be recovered into a flatten — not blindly faulted
+        // (which used to leave the bought spot naked).
+        let env = ScriptedEnv::new();
+        {
+            let mut st = env.state.lock().unwrap();
+            // The spot leg provably traded: balance moved + the exchange order
+            // is Filled by cloid.
+            st.spot_total = Decimal::from_str_strict("1").unwrap();
+            st.orders.push(filled_order("c_spot", "1"));
+            let mut cycle = cycle_in_state(FundingArbCycleState::EnteringPerp);
+            cycle.spot_entry_cloid = Some("c_spot".into());
+            st.current_cycle = Some(cycle);
+        }
+        let handle = scripted_runtime(&env);
+        handle.recover_active_cycle().await.unwrap();
+
+        let st = env.state.lock().unwrap();
+        let last = st.cycle_states.last().cloned().unwrap();
+        assert_eq!(
+            last.0,
+            FundingArbCycleState::Closed,
+            "recovered intermediate cycle must flatten to Closed (P2-2): {:?}",
+            st.cycle_states
+        );
+        assert_eq!(
+            st.spot_total.to_string(),
+            "0",
+            "the bought spot must be sold back on recovery (P2-2)"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_faults_unprovable_intermediate_cycle() {
+        // P2-2: an intermediate cycle with neither a provable fill nor any
+        // exposure must fault (fail-closed) — no resurrection.
+        let env = ScriptedEnv::new();
+        {
+            let mut st = env.state.lock().unwrap();
+            let mut cycle = cycle_in_state(FundingArbCycleState::EnteringSpot);
+            cycle.spot_entry_cloid = Some("c_ghost".into()); // no such order
+            st.current_cycle = Some(cycle);
+        }
+        let handle = scripted_runtime(&env);
+        handle.recover_active_cycle().await.unwrap();
+        let states = env.state.lock().unwrap().cycle_states.clone();
+        assert!(
+            states
+                .iter()
+                .any(|(s, _)| *s == FundingArbCycleState::Faulted),
+            "unprovable intermediate cycle must fault (P2-2): {states:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_faults_stuck_entering_perp_after_timeout() {
+        // P2-2 (b): a cycle stranded in EnteringPerp longer than
+        // max_leg_attempts × max_unhedged_seconds must fault, not hang.
+        let env = ScriptedEnv::new();
+        let handle = scripted_runtime(&env);
+        // Bind an EnteringPerp cycle whose updated_at is far in the past.
+        handle
+            .cycle
+            .lock()
+            .await
+            .replace(cycle_in_state(FundingArbCycleState::EnteringPerp));
+        if let Some(cycle) = handle.cycle.lock().await.as_mut() {
+            cycle.updated_at = Some(Utc::now() - chrono::Duration::hours(1));
+        }
+        handle.tick().await.unwrap();
+        let states = env.state.lock().unwrap().cycle_states.clone();
+        assert!(
+            states
+                .iter()
+                .any(|(s, _)| *s == FundingArbCycleState::Faulted),
+            "stuck EnteringPerp must fault after the timeout (P2-2): {states:?}"
+        );
+    }
+
+    #[test]
+    fn pick_best_plan_orders_by_edge_then_liquidity_then_depth() {
+        // M-FA5: the best plan is the highest expected edge; ties break on the
+        // smaller-leg volume (liquidity), then book depth.
+        let plan = |edge: &str, volume: &str, depth: &str| EntryPlan {
+            perp_symbol: "BTC".into(),
+            spot_symbol: "@1".into(),
+            spot_display: "BTC/USDC".into(),
+            base_token: "BTC".into(),
+            quote_token: "USDC".into(),
+            funding_rate: Decimal::from_str_lenient("0.001").unwrap(),
+            basis_bps: Decimal::from_str_lenient("10").unwrap(),
+            expected_edge_bps: Decimal::from_str_lenient(edge).unwrap(),
+            liquidity_volume_usd: Decimal::from_str_lenient(volume).unwrap(),
+            top_book_depth_usd: Decimal::from_str_lenient(depth).unwrap(),
+            perp_size: Decimal::ONE,
+            spot_size: Decimal::ONE,
+            perp_lot_size: Decimal::from_str_lenient("0.001").unwrap(),
+            spot_lot_size: Decimal::from_str_lenient("0.001").unwrap(),
+        };
+        // Edge dominates.
+        let best = pick_best_plan(vec![
+            plan("30", "1000", "100"),
+            plan("60", "1", "1"),
+        ])
+        .unwrap();
+        assert_eq!(best.expected_edge_bps.to_string(), "60");
+        // Same edge → higher liquidity wins.
+        let best = pick_best_plan(vec![
+            plan("50", "1000", "500"),
+            plan("50", "5000", "10"),
+        ])
+        .unwrap();
+        assert_eq!(best.liquidity_volume_usd.to_string(), "5000");
+        // Same edge + liquidity → deeper book wins.
+        let best = pick_best_plan(vec![
+            plan("50", "1000", "100"),
+            plan("50", "1000", "900"),
+        ])
+        .unwrap();
+        assert_eq!(best.top_book_depth_usd.to_string(), "900");
+        assert!(pick_best_plan(vec![]).is_none());
+    }
+
+    struct MissingMeta;
+    impl FundingArbInstrumentMeta for MissingMeta {
+        fn get(&self, _symbol: &str) -> Option<InstrumentInfo> {
+            None
+        }
+    }
+
+    fn scripted_runtime_with_meta(
+        env: &ScriptedEnv,
+        meta: Arc<dyn FundingArbInstrumentMeta>,
+    ) -> FundingArbRuntimeHandle {
+        let deps = Arc::new(FundingArbRuntimeDependencies {
+            execution: Arc::new(env.clone()),
+            scanner: Arc::new(env.clone()),
+            tracker: Arc::new(env.clone()),
+            cycles: Arc::new(env.clone()),
+            meta,
+            trading_ready: Box::new(|| Box::pin(async { true })),
+            kill_switch_active: Box::new(|| Box::pin(async { false })),
+            account_allows_risk_increase: Box::new(|| Box::pin(async { true })),
+            reconcile: Box::new(|| Box::pin(async { true })),
+            deployment: FundingArbDeployment {
+                max_notional_usd: Decimal::from_str_lenient("500").unwrap(),
+                poll_interval_seconds: 5.0,
+                order_status_poll_interval_seconds: 0.01,
+                max_leg_attempts: 3,
+                market_stale_seconds: 5.0,
+                min_spot_24h_volume_usd: Decimal::from_str_lenient("1000").unwrap(),
+                min_perp_24h_volume_usd: Decimal::from_str_lenient("10000").unwrap(),
+                min_top_book_depth_usd: Decimal::from_str_lenient("100").unwrap(),
+                max_combined_spread_bps: Decimal::from_str_lenient("100").unwrap(),
+            },
+            account_address: "0xabc".into(),
+        });
+        FundingArbRuntimeHandle::new(
+            "fa_1".into(),
+            FundingArbParams::default(),
+            1,
+            "0xabc".into(),
+            Some(deps),
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn missing_lot_size_faults_instead_of_panicking() {
+        // M-FA2 regression: a missing instrument lot size must fault the cycle
+        // — previously `lot_size()` returned ZERO and `floor(_, ZERO)` divided
+        // by zero (panic) inside the close path.
+        let env = ScriptedEnv::new();
+        env.state.lock().unwrap().current_cycle = Some(cycle_in_state(FundingArbCycleState::Open));
+        env.state.lock().unwrap().perp_position = Decimal::from_str_strict("-1").unwrap(); // short
+        env.state.lock().unwrap().spot_total = Decimal::from_str_strict("1").unwrap();
+        let handle = scripted_runtime_with_meta(&env, Arc::new(MissingMeta));
+        handle
+            .cycle
+            .lock()
+            .await
+            .replace(cycle_in_state(FundingArbCycleState::Open));
+        handle.close_cycle("test").await.unwrap();
+        let states = env.state.lock().unwrap().cycle_states.clone();
+        assert!(
+            states
+                .iter()
+                .any(|(s, _)| *s == FundingArbCycleState::Faulted),
+            "missing lot size must fault, not panic (M-FA2): {states:?}"
+        );
+    }
+
+    #[test]
+    fn plugin_factory_faults_on_undecodable_config() {
+        // M-FA3 regression: an undecodable config must surface an explicit
+        // faulted handle — previously `unwrap_or_default` silently ran the
+        // strategy with default params.
+        let plugin = build_funding_arb_plugin(Some(deps()));
+        let ctx = crate::strategy::registry::StrategyBuildContext {
+            instance: crate::strategy::registry::StrategyInstanceDefinition {
+                strategy_id: "fa_1".into(),
+                strategy_type: "funding_arb".into(),
+                sub_account: "0xabc".into(),
+                symbol: "BTC".into(),
+                desired_state: MarketMakerLifecycle::Running,
+                desired_config_revision: 1,
+                revision: 1,
+            },
+            config: StrategyConfigSnapshot {
+                strategy_id: "fa_1".into(),
+                revision: 1,
+                // entry_funding_rate is not a decimal → decode must fail.
+                values: serde_json::json!({ "entry_funding_rate": "not-a-decimal" }),
+            },
+        };
+        let handle = (plugin.factory)(&ctx);
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let err = rt.block_on(handle.start()).unwrap_err();
+        assert!(
+            err.contains("config decode failed"),
+            "decode failure must be explicit (M-FA3): {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_force_closes_cycle_held_past_max_hold() {
+        // M-FA7: a cycle open longer than max_hold_hours is force-closed by
+        // the tick driver.
+        let env = ScriptedEnv::new();
+        let handle = scripted_runtime(&env);
+        handle
+            .cycle
+            .lock()
+            .await
+            .replace(cycle_in_state(FundingArbCycleState::Open));
+        if let Some(cycle) = handle.cycle.lock().await.as_mut() {
+            cycle.opened_at = Some(Utc::now() - chrono::Duration::hours(200));
+        }
+        handle.tick().await.unwrap();
+        let st = env.state.lock().unwrap();
+        let last = st.cycle_states.last().cloned().unwrap();
+        assert_eq!(
+            last.0,
+            FundingArbCycleState::Closed,
+            "over-held cycle must be force-closed (M-FA7): {:?}",
+            st.cycle_states
+        );
+        assert!(st.cycle_states.iter().any(|(_, e)| e == "exit_started"));
     }
 }

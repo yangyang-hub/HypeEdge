@@ -7,6 +7,8 @@
 //! sequence (submit → ack → fill/cancel, timeout → SUBMIT_UNKNOWN → cloid
 //! resolution) is unit-tested against scripted responses.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use serde_json::Value;
 
@@ -73,10 +75,19 @@ impl HyperliquidExchangeClient {
         info_url: impl Into<String>,
         account_address: impl Into<String>,
     ) -> Self {
+        // C3: the signed HTTP path must never hang forever on a dead socket —
+        // bound the request with a 10s timeout and a 5s connect timeout (aligned
+        // with the market-data RestClient). Builder failure is impossible with
+        // this static configuration, so `.expect` is a compile-time invariant.
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .connect_timeout(Duration::from_secs(5))
+            .build()
+            .expect("reqwest client builder with static timeouts cannot fail");
         Self {
             private_key,
             is_mainnet,
-            http: reqwest::Client::new(),
+            http,
             exchange_url: exchange_url.into(),
             info_url: info_url.into(),
             account_address: account_address.into().to_lowercase(),

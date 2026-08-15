@@ -24,3 +24,4 @@ md-5 = { workspace = true }
 hypeedge_domain = { path = "../domain" }
 hypeedge_infra = { path = "../infra" }
 reqwest = { workspace = true }
+prometheus = { workspace = true }

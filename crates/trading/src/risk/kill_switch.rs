@@ -29,6 +29,18 @@ pub struct KillSwitch {
 
 impl KillSwitch {
     pub fn new(bus: Arc<EventBus>, kill_switch_enabled: bool) -> Self {
+        // L-RK5: a disabled kill switch is a risk red line being OFF — `check()`
+        // will pass on every order even after `trigger()`. The config layer
+        // (mainnet forcing `kill_switch_enabled == true`) is enforced elsewhere;
+        // here we make the disabled state loud at construction. `trigger()`
+        // itself is intentionally unaffected: it still latches, persists,
+        // spawns the cancel-all hook and publishes the event.
+        if !kill_switch_enabled {
+            tracing::warn!(
+                "kill_switch_disabled: kill switch is DISABLED — the halt-all red line is off; \
+                 check() will not block placements, though trigger() still cancels working orders"
+            );
+        }
         Self {
             active: Mutex::new(false),
             reason: Mutex::new(None),
@@ -193,6 +205,55 @@ mod tests {
         ks.trigger("test").await;
         // check() ignores the latch when disabled.
         assert!(ks.check().await.is_ok());
+    }
+
+    #[test]
+    fn disabled_construction_warns() {
+        // L-RK5 regression: constructing a kill switch with `kill_switch_enabled
+        // == false` must raise a loud warning — the halt-all red line is off.
+        let events = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let subscriber = CaptureSubscriber(events.clone());
+        tracing::subscriber::with_default(subscriber, || {
+            let bus = Arc::new(EventBus::new(16));
+            let _ks = KillSwitch::new(bus, false);
+        });
+        let events = events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| e.contains("kill_switch_disabled")),
+            "expected a kill_switch_disabled warning, got {events:?}"
+        );
+    }
+
+    /// Minimal [`tracing::Subscriber`] that collects event payloads as strings.
+    struct CaptureSubscriber(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl tracing::Subscriber for CaptureSubscriber {
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _span: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(0)
+        }
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut visitor = MessageVisitor(String::new());
+            event.record(&mut visitor);
+            self.0.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _span: &tracing::Id) {}
+        fn exit(&self, _span: &tracing::Id) {}
+    }
+
+    /// Collects the `message` field of an event (the `tracing::warn!` text).
+    struct MessageVisitor(String);
+
+    impl tracing::field::Visit for MessageVisitor {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0.push_str(&format!("{value:?}"));
+            }
+        }
     }
 
     #[tokio::test]

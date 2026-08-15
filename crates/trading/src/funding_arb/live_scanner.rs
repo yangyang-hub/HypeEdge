@@ -4,9 +4,11 @@
 //! exchange coins through the instrument cache.
 
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use hypeedge_domain::decimal::Decimal;
+use hypeedge_domain::error::HypeEdgeError;
 use hypeedge_domain::models::L2BookSnapshot;
 
 use super::runtime::FundingArbInstrumentMeta;
@@ -51,20 +53,60 @@ impl FundingArbInstrumentMeta for InstrumentCacheFundingArbMeta {
     }
 }
 
+/// The subset of [`RestClient`] the live scanner needs. Kept as a trait so the
+/// scanner is testable with a counting fake (M-FA4) while the public
+/// constructor still accepts the concrete `Arc<RestClient>`.
+#[async_trait]
+trait ScannerRestSource: Send + Sync {
+    async fn get_meta(&self) -> Result<serde_json::Value, HypeEdgeError>;
+    async fn get_spot_meta(&self) -> Result<serde_json::Value, HypeEdgeError>;
+    async fn get_meta_and_asset_ctxs(&self) -> Result<serde_json::Value, HypeEdgeError>;
+}
+
+#[async_trait]
+impl ScannerRestSource for RestClient {
+    async fn get_meta(&self) -> Result<serde_json::Value, HypeEdgeError> {
+        RestClient::get_meta(self).await
+    }
+    async fn get_spot_meta(&self) -> Result<serde_json::Value, HypeEdgeError> {
+        RestClient::get_spot_meta(self).await
+    }
+    async fn get_meta_and_asset_ctxs(&self) -> Result<serde_json::Value, HypeEdgeError> {
+        RestClient::get_meta_and_asset_ctxs(self).await
+    }
+}
+
+/// How long one `metaAndAssetCtxs` fetch is reused (M-FA4). Volumes move on
+/// the minute scale; a 30s cache is safely fresh while cutting N-pair scans to
+/// one meta request per scan window.
+const ASSET_CTXS_CACHE_SECONDS: u64 = 30;
+
 /// Live scanner over the shared market-data provider + REST client.
 pub struct LiveFundingArbScanner {
     provider: Arc<LiveMarketDataProvider>,
-    rest: Arc<RestClient>,
+    rest: Arc<dyn ScannerRestSource>,
     /// Perp symbol → (spot exchange symbol, spot display name).
     spot_map: tokio::sync::Mutex<Vec<(String, String, String)>>,
+    /// M-FA4: one cached `metaAndAssetCtxs` response per scan window — the
+    /// per-pair `volumes()` lookups share it instead of re-fetching.
+    asset_ctxs_cache: tokio::sync::Mutex<Option<(Instant, serde_json::Value)>>,
 }
 
 impl LiveFundingArbScanner {
     pub fn new(provider: Arc<LiveMarketDataProvider>, rest: Arc<RestClient>) -> Self {
+        Self::new_with_source(provider, rest)
+    }
+
+    /// Test seam: inject any `ScannerRestSource` (counting fake).
+    fn new_with_source(
+        provider: Arc<LiveMarketDataProvider>,
+        rest: Arc<dyn ScannerRestSource>,
+    ) -> Self {
         Self {
             provider,
             rest,
             spot_map: tokio::sync::Mutex::new(Vec::new()),
+            asset_ctxs_cache: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -156,6 +198,15 @@ impl FundingArbMarketScanner for LiveFundingArbScanner {
     async fn scan(&self) -> Result<Vec<FundingArbMarketSnapshot>, String> {
         self.refresh_spot_map().await?;
         let funding = self.provider.all_funding().await;
+        // M-FA4: fetch the shared asset-ctxs once per scan (cached 30s) and
+        // feed every pair from it — previously each pair re-fetched it.
+        let ctxs = match self.asset_ctxs().await {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!(error = %e, "funding_arb_asset_ctxs_unavailable");
+                serde_json::json!({}) // all volumes read as 0 → no candidate passes
+            }
+        };
         let mut out = Vec::new();
         let pairs = self.spot_map.lock().await.clone();
         for (perp, spot, display) in pairs {
@@ -172,7 +223,7 @@ impl FundingArbMarketScanner for LiveFundingArbScanner {
             ) else {
                 continue;
             };
-            let volumes = self.volumes(&perp, &spot, &display).await;
+            let volumes = self.volumes(&ctxs, &perp, &spot, &display);
             out.push(FundingArbMarketSnapshot {
                 perp_symbol: perp,
                 spot_symbol: spot,
@@ -200,7 +251,11 @@ impl FundingArbMarketScanner for LiveFundingArbScanner {
         ) else {
             return Ok(None);
         };
-        let volumes = self.volumes(perp_symbol, spot_symbol, spot_symbol).await;
+        let ctxs = match self.asset_ctxs().await {
+            Ok(v) => v,
+            Err(_) => serde_json::json!({}),
+        };
+        let volumes = self.volumes(&ctxs, perp_symbol, spot_symbol, spot_symbol);
         Ok(Some(FundingArbMarketSnapshot {
             perp_symbol: perp_symbol.to_string(),
             spot_symbol: spot_symbol.to_string(),
@@ -215,18 +270,34 @@ impl FundingArbMarketScanner for LiveFundingArbScanner {
 }
 
 impl LiveFundingArbScanner {
-    /// 24h notional volumes from the asset-ctxs (perp `dayNtlVlm`) and spot
-    /// (`dayNtlVlm` on spot pairs). Falls back to 0.
-    async fn volumes(
+    /// The shared `metaAndAssetCtxs` response, cached for
+    /// [`ASSET_CTXS_CACHE_SECONDS`] (M-FA4: one request per scan window, not
+    /// one per pair).
+    async fn asset_ctxs(&self) -> Result<serde_json::Value, String> {
+        let mut cache = self.asset_ctxs_cache.lock().await;
+        if let Some((fetched_at, value)) = cache.as_ref()
+            && fetched_at.elapsed() < Duration::from_secs(ASSET_CTXS_CACHE_SECONDS)
+        {
+            return Ok(value.clone());
+        }
+        let value = self
+            .rest
+            .get_meta_and_asset_ctxs()
+            .await
+            .map_err(|e| e.to_string())?;
+        *cache = Some((Instant::now(), value.clone()));
+        Ok(value)
+    }
+
+    /// 24h notional volumes from a pre-fetched asset-ctxs payload (perp
+    /// `dayNtlVlm` and spot `dayNtlVlm` on spot pairs). Falls back to 0.
+    fn volumes(
         &self,
+        ctxs: &serde_json::Value,
         perp: &str,
         spot_exchange: &str,
         spot_display: &str,
     ) -> (Decimal, Decimal) {
-        let ctxs = match self.rest.get_meta_and_asset_ctxs().await {
-            Ok(v) => v,
-            Err(_) => return (Decimal::ZERO, Decimal::ZERO),
-        };
         let mut perp_v = Decimal::ZERO;
         let mut spot_v = Decimal::ZERO;
         if let Some(assets) = ctxs.get("assetCtxs").and_then(|a| a.as_array()) {
@@ -262,3 +333,118 @@ impl LiveFundingArbScanner {
 /// A helper to suppress the unused L2BookSnapshot import if it's unused.
 #[allow(unused)]
 fn _book(_: &L2BookSnapshot) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Counting REST source: answers the meta/spot-meta/asset-ctxs calls with
+    /// fixture payloads and counts `metaAndAssetCtxs` fetches (M-FA4).
+    struct CountingSource {
+        ctxs_calls: AtomicUsize,
+    }
+    #[async_trait]
+    impl ScannerRestSource for CountingSource {
+        async fn get_meta(&self) -> Result<serde_json::Value, HypeEdgeError> {
+            Ok(serde_json::json!({
+                "universe": [{"name": "BTC"}, {"name": "ETH"}]
+            }))
+        }
+        async fn get_spot_meta(&self) -> Result<serde_json::Value, HypeEdgeError> {
+            Ok(serde_json::json!({
+                "tokens": [
+                    {"index": 0, "name": "BTC"},
+                    {"index": 1, "name": "USDC"},
+                    {"index": 2, "name": "ETH"}
+                ],
+                "universe": [
+                    {"name": "@1", "tokens": [0, 1]},
+                    {"name": "@2", "tokens": [2, 1]}
+                ]
+            }))
+        }
+        async fn get_meta_and_asset_ctxs(&self) -> Result<serde_json::Value, HypeEdgeError> {
+            self.ctxs_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(serde_json::json!({
+                "assetCtxs": [{"coin": "BTC", "dayNtlVlm": "100000"}],
+                "spotAssetCtxs": [{"coin": "@1", "dayNtlVlm": "50000"}]
+            }))
+        }
+    }
+
+    struct NoopCandleClient;
+    #[async_trait]
+    impl crate::market_data::live_provider::CandleHistoryClient for NoopCandleClient {
+        async fn backfill_candles(
+            &self,
+            _: &str,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<hypeedge_domain::models::Candle>, HypeEdgeError> {
+            Ok(vec![])
+        }
+        async fn backfill_funding(
+            &self,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<Vec<hypeedge_domain::models::FundingRate>, HypeEdgeError> {
+            Ok(vec![])
+        }
+    }
+
+    fn provider() -> Arc<LiveMarketDataProvider> {
+        Arc::new(LiveMarketDataProvider::new(
+            Arc::new(hypeedge_infra::event_bus::EventBus::new(16)),
+            Arc::new(NoopCandleClient),
+            Arc::new(tokio::sync::Mutex::new(crate::market_data::BookManager::new(20))),
+        ))
+    }
+
+    #[tokio::test]
+    async fn scan_fetches_asset_ctxs_once_across_pairs_and_scans() {
+        // M-FA4 regression: the shared metaAndAssetCtxs is fetched once per
+        // scan window (cached 30s), not once per pair — two scans over two
+        // pairs must hit the endpoint exactly once.
+        let source = Arc::new(CountingSource {
+            ctxs_calls: AtomicUsize::new(0),
+        });
+        let scanner = LiveFundingArbScanner::new_with_source(provider(), source.clone());
+        scanner.scan().await.unwrap();
+        scanner.scan().await.unwrap();
+        assert_eq!(
+            source.ctxs_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "asset-ctxs must be fetched once per cache window (M-FA4)"
+        );
+    }
+
+    #[test]
+    fn volumes_parse_from_shared_ctxs() {
+        let scanner = LiveFundingArbScanner::new_with_source(provider(), Arc::new(CountingSource {
+            ctxs_calls: AtomicUsize::new(0),
+        }));
+        let ctxs = serde_json::json!({
+            "assetCtxs": [
+                {"coin": "BTC", "dayNtlVlm": "100000"},
+                {"coin": "ETH", "dayNtlVlm": "50000"}
+            ],
+            "spotAssetCtxs": [
+                {"coin": "@1", "dayNtlVlm": "40000"},
+                {"coin": "@2", "dayNtlVlm": "30000"}
+            ]
+        });
+        let (perp, spot) = scanner.volumes(&ctxs, "BTC", "@1", "BTC/USDC");
+        assert_eq!(perp.to_string(), "100000");
+        assert_eq!(spot.to_string(), "40000");
+        let (perp, spot) = scanner.volumes(&ctxs, "ETH", "@2", "ETH/USDC");
+        assert_eq!(perp.to_string(), "50000");
+        assert_eq!(spot.to_string(), "30000");
+        // Unknown pair → 0, never a failure.
+        let (perp, spot) = scanner.volumes(&ctxs, "DOGE", "@9", "DOGE/USDC");
+        assert_eq!(perp.to_string(), "0");
+        assert_eq!(spot.to_string(), "0");
+    }
+}

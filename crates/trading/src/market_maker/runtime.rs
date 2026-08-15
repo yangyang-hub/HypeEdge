@@ -12,13 +12,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
 use hypeedge_domain::decimal::{Decimal, Size, Usd};
-use hypeedge_domain::enums::{MarketMakerLifecycle, QuoteDecision};
+use hypeedge_domain::enums::{MarketMakerLifecycle, QuoteAction, QuoteDecision};
 use hypeedge_domain::events::{DomainEvent, Event, EventType};
 use hypeedge_domain::models::L2BookSnapshot;
 use hypeedge_infra::event_bus::{BoundedMailbox, EventBus};
 use tokio::sync::mpsc;
 
-use super::estimators::{AdverseMarkoutEstimator, DecisionLatencyEstimator};
+use super::estimators::{AdverseMarkoutEstimator, DecisionLatencyEstimator, MarkoutSample};
 use super::models::{ActionBudgetSnapshot, InventorySnapshot, MarketFeatures, MarketMakerConfig};
 use super::policy::MarketMakerPolicy;
 use super::shadow::{ShadowActionEstimate, ShadowOrderState};
@@ -200,7 +200,7 @@ impl MarketMakerRuntimeFactory {
             self.event_bus.clone(),
             self.feature_engine.clone(),
             MarketMakerPolicy::new(),
-            QuoteCoordinator::new(QuoteCoordinatorConfig::default()).ok()?,
+            QuoteCoordinator::new(market_maker_coordinator_config()).ok()?,
             inventory,
             budget_provider,
             health,
@@ -213,6 +213,26 @@ impl MarketMakerRuntimeFactory {
         .map(Arc::new)
     }
 }
+
+/// M-MM11: the coordinator tuning used for live market-making. The plain
+/// `QuoteCoordinatorConfig::default()` keeps `min_quote_lifetime` at 500ms and
+/// a zero action shadow cost, which lets the runtime churn quotes and ignore
+/// the address-action quota cost of every transition. The initial safety
+/// envelope (design §14) picks `min_quote_lifetime` in the 2–10s range.
+pub fn market_maker_coordinator_config() -> QuoteCoordinatorConfig {
+    QuoteCoordinatorConfig {
+        min_quote_lifetime: Duration::seconds(2),
+        action_shadow_cost_usdc: Usd::new(
+            Decimal::from_str_lenient(DEFAULT_ACTION_SHADOW_COST_USDC).unwrap(),
+        ),
+        ..QuoteCoordinatorConfig::default()
+    }
+}
+
+/// Default shadow cost of one exchange child action (M-MM11). 0.001 USDC is
+/// the conservative fallback; the budget provider can later supply a dynamic
+/// per-strategy estimate (see `ActionBudgetSnapshot.action_shadow_cost_usdc`).
+pub const DEFAULT_ACTION_SHADOW_COST_USDC: &str = "0.001";
 
 const RELIABLE_EVENTS: &[EventType] = &[
     EventType::OrderFilled,
@@ -495,14 +515,19 @@ impl MarketMakerRuntime {
         let _shadow_actions: Option<ShadowActionEstimate> = None;
         if mode == MarketMakerLifecycle::Shadow {
             let _shadow_actions = Some(self.shadow.lock().await.apply(&plan, now)?);
-        } else if mode == MarketMakerLifecycle::Running
-            && !plan.fenced
-            && plan
+        } else if mode == MarketMakerLifecycle::Running {
+            let has_actions = plan
                 .diffs
                 .iter()
-                .any(|d| d.estimated_incremental_actions() > 0)
-        {
-            self.commands.submit_quote_plan(&plan).await?;
+                .any(|d| d.estimated_incremental_actions() > 0);
+            // H-MM1: protective cancels outrank the fence — a fenced plan that
+            // still carries Cancel diffs (e.g. NoQuote intent after candidate
+            // expiry) must be submitted; only new placements are fenced out.
+            let submit = has_actions
+                && (!plan.fenced || plan.diffs.iter().any(|d| d.action == QuoteAction::Cancel));
+            if submit {
+                self.commands.submit_quote_plan(&plan).await?;
+            }
         }
 
         *self.last_cycle_at.lock().await = Some(now);
@@ -577,6 +602,29 @@ impl MarketMakerRuntime {
                 }
                 Ok(())
             }
+            // L-MM1: feed mature maker-fill markouts into the adverse-markout
+            // estimator so the policy's spread uses observed adverse selection
+            // instead of the conservative default.
+            DomainEvent::MmFillMarkout(markout) => {
+                if markout.strategy_id == self.strategy_id && markout.symbol == self.symbol {
+                    let sample = MarkoutSample {
+                        strategy_id: markout.strategy_id.clone(),
+                        symbol: markout.symbol.clone(),
+                        maker: markout.maker,
+                        horizon_ms: markout.horizon_ms as i64,
+                        horizon_ts: markout.horizon_ts,
+                        ts: markout.ts,
+                        fill_id: markout.fill_id.clone(),
+                        calculation_version: markout.calculation_version.clone(),
+                        signed_markout_bps: markout.signed_markout_bps,
+                    };
+                    self.markout_estimator
+                        .lock()
+                        .await
+                        .observe(&sample, Utc::now());
+                }
+                self.cycle("markout_update").await
+            }
             // Account, budget, reconciliation and connection events are reliable
             // invalidation signals; providers remain authoritative.
             _ => {
@@ -588,15 +636,28 @@ impl MarketMakerRuntime {
 
     /// The coalesced event loop: subscribe to the book (latest), trade
     /// (latest), reliable, and markout mailboxes; dispatch events serially.
+    ///
+    /// H-MM1: a fixed-interval watchdog also runs the cycle when the market
+    /// goes silent, so a stale/unhealthy book or account still drives the
+    /// protective cancel path without waiting for the next event.
     pub async fn run_event_loop(&self, mut stop_rx: mpsc::Receiver<()>) -> Result<(), String> {
         let market_mailbox = self.bus.subscribe_maxsize(EventType::L2BookUpdate, 1);
         let trade_mailbox = self.bus.subscribe_maxsize(EventType::TradeUpdate, 1);
         let reliable_mailbox = self.bus.subscribe_many(RELIABLE_EVENTS);
         let markout_mailbox = self.bus.subscribe_maxsize(EventType::MmFillMarkout, 256);
+        let mut watchdog =
+            tokio::time::interval(tokio::time::Duration::from_secs(WATCHDOG_TICK_SECONDS));
+        watchdog.tick().await; // consume the immediate first tick
 
         loop {
             tokio::select! {
                 _ = stop_rx.recv() => break,
+                _ = watchdog.tick() => {
+                    if let Err(e) = self.cycle("watchdog_tick").await {
+                        tracing::error!(error = %e, "market_maker_watchdog_cycle_error_continuing");
+                        *self.last_reason.lock().await = format!("watchdog_cycle_error: {e}");
+                    }
+                }
                 maybe = recv_first(&market_mailbox, &trade_mailbox, &reliable_mailbox, &markout_mailbox) => {
                     match maybe {
                         Some(event) => {
@@ -627,6 +688,9 @@ impl MarketMakerRuntime {
         Ok(())
     }
 }
+
+/// H-MM1: fixed-interval watchdog period for the market-maker event loop.
+const WATCHDOG_TICK_SECONDS: u64 = 2;
 
 /// Await the first ready event across the four mailboxes.
 async fn recv_first(
@@ -721,18 +785,30 @@ impl StrategyRuntimeHandle for MarketMakerRuntimeHandle {
                 | MarketMakerLifecycle::Faulted
                 | MarketMakerLifecycle::Stopped
         );
-        if cancel_modes
-            || (mode == MarketMakerLifecycle::Shadow && previous == MarketMakerLifecycle::Running)
+        if cancel_modes {
+            drop(current);
+            // H-MM2: protective cancels must never depend on the cycle
+            // succeeding — cancel first, then refresh state via the cycle, and
+            // treat a cycle failure as a logged warning only.
+            let cancel = self
+                .runtime
+                .cancel_live_quotes(&format!("lifecycle_{}", mode.as_str()))
+                .await;
+            if let Err(e) = self
+                .runtime
+                .cycle(&format!("lifecycle_{}", mode.as_str()))
+                .await
+            {
+                tracing::error!(
+                    error = %e,
+                    "market_maker_set_mode_cycle_error_after_cancel"
+                );
+            }
+            cancel?;
+        } else if mode == MarketMakerLifecycle::Shadow && previous == MarketMakerLifecycle::Running
         {
             drop(current);
-            if cancel_modes {
-                self.runtime
-                    .cycle(&format!("lifecycle_{}", mode.as_str()))
-                    .await?;
-            }
-            self.runtime
-                .cancel_live_quotes(&format!("lifecycle_{}", mode.as_str()))
-                .await?;
+            self.runtime.cancel_live_quotes("lifecycle_shadow").await?;
         } else if matches!(
             mode,
             MarketMakerLifecycle::Shadow | MarketMakerLifecycle::Running
@@ -826,8 +902,11 @@ mod tests {
     use super::*;
     use crate::market_maker::models::{InventorySnapshot, MarketMakerConfig};
     use crate::trading::quote_coordinator::QuoteCoordinatorConfig;
+    use crate::trading::quotes::QuoteRiskOwner;
     use hypeedge_domain::decimal::{Price, Size, Usd};
-    use hypeedge_domain::models::L2Level;
+    use hypeedge_domain::enums::{OrderStatus, OrderType, TimeInForce};
+    use hypeedge_domain::models::{L2Level, Order};
+    use uuid::Uuid;
 
     struct FakeInventory(Arc<std::sync::Mutex<Size>>);
     impl InventorySnapshotProvider for FakeInventory {
@@ -899,6 +978,7 @@ mod tests {
     }
     struct FakeCommands {
         plans: Arc<tokio::sync::Mutex<usize>>,
+        cancels: Arc<tokio::sync::Mutex<usize>>,
     }
     #[async_trait]
     impl QuotePlanCommandClient for FakeCommands {
@@ -907,7 +987,59 @@ mod tests {
             Ok(())
         }
         async fn cancel_strategy_quotes(&self, _: &QuoteCancelRequest) -> Result<(), String> {
+            *self.cancels.lock().await += 1;
             Ok(())
+        }
+    }
+
+    struct FakeSlotsWithOwner;
+    #[async_trait]
+    impl QuoteSlotProvider for FakeSlotsWithOwner {
+        async fn get_quote_slots(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<(QuoteSlotView, QuoteSlotView), String> {
+            let owner = || QuoteRiskOwner {
+                order_id: Some("o1".into()),
+                cloid: "c1".into(),
+                price: Price::new(hypeedge_domain::Decimal::from_str_lenient("99.9").unwrap()),
+                remaining_size: Size::new(
+                    hypeedge_domain::Decimal::from_str_lenient("0.5").unwrap(),
+                ),
+                status: hypeedge_domain::enums::OrderStatus::Acknowledged,
+                plan_revision: 0,
+                live_since: Utc::now() - chrono::Duration::seconds(10),
+                exchange_order_id_known: true,
+            };
+            let view = |side: hypeedge_domain::enums::Side| QuoteSlotView {
+                key: crate::trading::quotes::QuoteSlotKey {
+                    strategy_id: "mm_1".into(),
+                    symbol: "BTC".into(),
+                    side,
+                    level: 0,
+                },
+                revision: 0,
+                plan_revision: 0,
+                owners: vec![owner()],
+                last_transition_at: None,
+            };
+            Ok((
+                view(hypeedge_domain::enums::Side::Buy),
+                view(hypeedge_domain::enums::Side::Sell),
+            ))
+        }
+    }
+
+    struct FakeErrSlots;
+    #[async_trait]
+    impl QuoteSlotProvider for FakeErrSlots {
+        async fn get_quote_slots(
+            &self,
+            _: &str,
+            _: &str,
+        ) -> Result<(QuoteSlotView, QuoteSlotView), String> {
+            Err("injected slots failure".into())
         }
     }
 
@@ -928,7 +1060,27 @@ mod tests {
         c
     }
 
+    fn fake_commands(
+        plans: Arc<tokio::sync::Mutex<usize>>,
+        cancels: Arc<tokio::sync::Mutex<usize>>,
+    ) -> Arc<dyn QuotePlanCommandClient> {
+        Arc::new(FakeCommands { plans, cancels })
+    }
+
     async fn make_runtime(commands: Arc<dyn QuotePlanCommandClient>) -> Arc<MarketMakerRuntime> {
+        make_runtime_with_slots(commands, Arc::new(FakeSlots)).await
+    }
+
+    async fn make_runtime_with_owners(
+        commands: Arc<dyn QuotePlanCommandClient>,
+    ) -> Arc<MarketMakerRuntime> {
+        make_runtime_with_slots(commands, Arc::new(FakeSlotsWithOwner)).await
+    }
+
+    async fn make_runtime_with_slots(
+        commands: Arc<dyn QuotePlanCommandClient>,
+        slots: Arc<dyn QuoteSlotProvider>,
+    ) -> Arc<MarketMakerRuntime> {
         let bus = Arc::new(EventBus::new(16));
         let engine = Arc::new(tokio::sync::Mutex::new(
             MarketFeatureEngine::new(5, 5.0, 2048).unwrap(),
@@ -939,7 +1091,6 @@ mod tests {
             Arc::new(FakeInventory(Arc::new(std::sync::Mutex::new(Size::ZERO))));
         let budget: Arc<dyn ActionBudgetSnapshotProvider> = Arc::new(FakeBudget);
         let health: Arc<dyn AccountHealthProvider> = Arc::new(FakeHealth);
-        let slots: Arc<dyn QuoteSlotProvider> = Arc::new(FakeSlots);
         let runtime = MarketMakerRuntime::new(
             "mm_1".into(),
             "s1".into(),
@@ -979,12 +1130,30 @@ mod tests {
         });
     }
 
+    /// A book older than `market_stale_after` (2s) — drives the cancel path.
+    fn stale_book() -> L2BookSnapshot {
+        L2BookSnapshot {
+            symbol: "BTC".into(),
+            bids: vec![L2Level {
+                price: Price::new(hypeedge_domain::Decimal::from_str_lenient("99.5").unwrap()),
+                size: Size::new(hypeedge_domain::Decimal::from_str_lenient("5").unwrap()),
+            }],
+            asks: vec![L2Level {
+                price: Price::new(hypeedge_domain::Decimal::from_str_lenient("100.5").unwrap()),
+                size: Size::new(hypeedge_domain::Decimal::from_str_lenient("5").unwrap()),
+            }],
+            timestamp: 1700000000000,
+            local_ts: Utc::now() - chrono::Duration::seconds(30),
+            version: 1,
+            connection_generation: 0,
+        }
+    }
+
     #[tokio::test]
     async fn running_cycle_submits_quote_plan() {
         let plans = Arc::new(tokio::sync::Mutex::new(0usize));
-        let commands: Arc<dyn QuotePlanCommandClient> = Arc::new(FakeCommands {
-            plans: plans.clone(),
-        });
+        let cancels = Arc::new(tokio::sync::Mutex::new(0usize));
+        let commands = fake_commands(plans.clone(), cancels);
         let runtime = make_runtime(commands).await;
 
         // Set mode + config so the cycle can run.
@@ -1007,9 +1176,8 @@ mod tests {
     #[tokio::test]
     async fn shadow_mode_does_not_submit_live() {
         let plans = Arc::new(tokio::sync::Mutex::new(0usize));
-        let commands: Arc<dyn QuotePlanCommandClient> = Arc::new(FakeCommands {
-            plans: plans.clone(),
-        });
+        let cancels = Arc::new(tokio::sync::Mutex::new(0usize));
+        let commands = fake_commands(plans.clone(), cancels);
         let runtime = make_runtime(commands).await;
         *runtime.mode.lock().await = MarketMakerLifecycle::Shadow;
         *runtime.config.lock().await = Some(valid_config());
@@ -1025,9 +1193,8 @@ mod tests {
     #[tokio::test]
     async fn lifecycle_not_running_forces_no_quote() {
         let plans = Arc::new(tokio::sync::Mutex::new(0usize));
-        let commands: Arc<dyn QuotePlanCommandClient> = Arc::new(FakeCommands {
-            plans: plans.clone(),
-        });
+        let cancels = Arc::new(tokio::sync::Mutex::new(0usize));
+        let commands = fake_commands(plans.clone(), cancels);
         let runtime = make_runtime(commands).await;
         *runtime.mode.lock().await = MarketMakerLifecycle::Paused;
         *runtime.config.lock().await = Some(valid_config());
@@ -1037,6 +1204,140 @@ mod tests {
         assert_eq!(desired.bid.decision, QuoteDecision::NoQuote);
         assert_eq!(desired.bid.reason, "lifecycle_paused");
         assert_eq!(*plans.lock().await, 0);
+    }
+
+    // --- H-MM1: stale market must drive the protective cancel path ---
+
+    #[tokio::test]
+    async fn stale_book_fill_event_emits_cancel_not_empty_diff() {
+        let plans = Arc::new(tokio::sync::Mutex::new(0usize));
+        let cancels = Arc::new(tokio::sync::Mutex::new(0usize));
+        let commands = fake_commands(plans.clone(), cancels);
+        let runtime = make_runtime_with_owners(commands).await;
+        *runtime.mode.lock().await = MarketMakerLifecycle::Running;
+        *runtime.config.lock().await = Some(valid_config());
+        // Stale book: local_ts far older than market_stale_after (2s).
+        *runtime.book.lock().await = Some(stale_book());
+        // A reliable fill event for this strategy triggers the cycle.
+        let event = Event {
+            id: Uuid::new_v4(),
+            occurred_at: Utc::now(),
+            correlation_id: None,
+            payload: DomainEvent::OrderFilled(Order {
+                cloid: "c1".into(),
+                symbol: "BTC".into(),
+                side: hypeedge_domain::enums::Side::Sell,
+                size: Size::new(hypeedge_domain::Decimal::ONE),
+                price: Some(Price::new(
+                    hypeedge_domain::Decimal::from_str_lenient("100").unwrap(),
+                )),
+                order_type: OrderType::Limit,
+                time_in_force: TimeInForce::Alo,
+                status: OrderStatus::Filled,
+                strategy_id: Some("mm_1".into()),
+                sub_account: Some("sub1".into()),
+                reduce_only: false,
+                is_spot: false,
+                risk_reducing: false,
+                max_slippage_bps: 0,
+                exchange_oid: Some("o1".into()),
+                filled_size: Size::new(hypeedge_domain::Decimal::ONE),
+                avg_fill_price: None,
+                submitted_at: None,
+                acknowledged_at: None,
+                filled_at: None,
+                error_message: None,
+                created_at: Utc::now(),
+            }),
+        };
+        runtime.handle_event(&event).await.unwrap();
+        let plan = runtime
+            .last_plan
+            .lock()
+            .await
+            .clone()
+            .expect("stale book must still produce a plan");
+        assert!(
+            !plan.fenced,
+            "decision-time valid_until must not fence the protective plan"
+        );
+        assert!(
+            plan.diffs.iter().any(|d| d.action == QuoteAction::Cancel),
+            "stale book must emit a Cancel diff, not an empty/fenced plan"
+        );
+        assert!(
+            *plans.lock().await > 0,
+            "the protective cancel plan must be submitted"
+        );
+    }
+
+    #[tokio::test]
+    async fn watchdog_tick_cancels_when_market_goes_silent() {
+        let plans = Arc::new(tokio::sync::Mutex::new(0usize));
+        let cancels = Arc::new(tokio::sync::Mutex::new(0usize));
+        let commands = fake_commands(plans.clone(), cancels);
+        let runtime = make_runtime_with_owners(commands).await;
+        *runtime.mode.lock().await = MarketMakerLifecycle::Running;
+        *runtime.config.lock().await = Some(valid_config());
+        *runtime.book.lock().await = Some(stale_book());
+        let (stop_tx, stop_rx) = mpsc::channel(1);
+        let task = tokio::spawn({
+            let runtime = runtime.clone();
+            async move { runtime.run_event_loop(stop_rx).await }
+        });
+        // No events are published at all: only the fixed-interval watchdog
+        // (2s) can run a cycle against the stale book.
+        tokio::time::sleep(std::time::Duration::from_millis(3500)).await;
+        stop_tx.send(()).await.unwrap();
+        task.await.unwrap().expect("event loop must exit cleanly");
+        let plan = runtime
+            .last_plan
+            .lock()
+            .await
+            .clone()
+            .expect("watchdog must have run a cycle");
+        assert!(
+            plan.diffs.iter().any(|d| d.action == QuoteAction::Cancel),
+            "watchdog must cancel stale quotes"
+        );
+        assert!(
+            *plans.lock().await > 0,
+            "watchdog must submit the protective cancel plan"
+        );
+    }
+
+    // --- H-MM2: set_mode cancels even when the cycle fails ---
+
+    #[tokio::test]
+    async fn set_mode_cancels_even_when_cycle_fails() {
+        let plans = Arc::new(tokio::sync::Mutex::new(0usize));
+        let cancels = Arc::new(tokio::sync::Mutex::new(0usize));
+        let commands = fake_commands(plans.clone(), cancels.clone());
+        let runtime = make_runtime_with_slots(commands, Arc::new(FakeErrSlots)).await;
+        *runtime.config.lock().await = Some(valid_config());
+        let handle = MarketMakerRuntimeHandle::new(runtime.clone());
+        handle.set_mode(MarketMakerLifecycle::Paused).await.unwrap();
+        assert_eq!(*runtime.mode.lock().await, MarketMakerLifecycle::Paused);
+        assert_eq!(
+            *cancels.lock().await,
+            1,
+            "set_mode must cancel live quotes even when the cycle errors"
+        );
+    }
+
+    // --- M-MM11: assembled coordinator config is not the lenient default ---
+
+    #[test]
+    fn market_maker_coordinator_config_is_not_default() {
+        let cfg = market_maker_coordinator_config();
+        assert_eq!(cfg.min_quote_lifetime, Duration::seconds(2));
+        assert_eq!(cfg.action_shadow_cost_usdc.to_string(), "0.001");
+        assert!(cfg.action_shadow_cost_usdc.inner() > Decimal::ZERO);
+        // Sanity: the plain default remains the lenient one.
+        assert_eq!(
+            QuoteCoordinatorConfig::default().min_quote_lifetime,
+            Duration::milliseconds(500)
+        );
     }
 
     #[test]

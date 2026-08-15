@@ -318,6 +318,12 @@ impl MarketFeatureEngine {
         }
     }
 
+    /// Return `(short_return, return_variance_per_second)` over the mid window.
+    ///
+    /// Each adjacent-sample log return is normalized by the actual sampling
+    /// interval (seconds), so the variance is comparable across feeds sampled
+    /// at different rates (M-MD8). Duplicate or non-positive timestamps are
+    /// skipped.
     fn return_features(&self, symbol: &str) -> (Decimal, Decimal) {
         let Some(history) = self.mid_history.get(symbol) else {
             return (Decimal::ZERO, Decimal::ZERO);
@@ -325,33 +331,37 @@ impl MarketFeatureEngine {
         if history.len() < 2 {
             return (Decimal::ZERO, Decimal::ZERO);
         }
-        let mids: Vec<Decimal> = history.iter().map(|(_, v)| *v).collect();
-        let short_return = if mids[0] > Decimal::ZERO {
-            (mids[mids.len() - 1] - mids[0]).div(mids[0])
+        let first = history.front().expect("len >= 2");
+        let last = history.back().expect("len >= 2");
+        let short_return = if first.1 > Decimal::ZERO {
+            (last.1 - first.1).div(first.1)
         } else {
             Decimal::ZERO
         };
-        let mut log_returns: Vec<f64> = Vec::new();
-        for pair in mids.windows(2) {
-            if pair[0] > Decimal::ZERO && pair[1] > Decimal::ZERO {
-                log_returns.push(
-                    (pair[1] / pair[0])
-                        .to_string()
-                        .parse::<f64>()
-                        .unwrap_or(0.0)
-                        .ln(),
-                );
+        let mut per_second_returns: Vec<f64> = Vec::new();
+        let pairs: Vec<&(DateTime<Utc>, Decimal)> = history.iter().collect();
+        for pair in pairs.windows(2) {
+            let (t0, p0) = pair[0];
+            let (t1, p1) = pair[1];
+            if *p0 <= Decimal::ZERO || *p1 <= Decimal::ZERO {
+                continue;
             }
+            let dt_seconds = (*t1 - *t0).num_milliseconds() as f64 / 1000.0;
+            if dt_seconds <= 0.0 {
+                continue;
+            }
+            let log_return = (*p1 / *p0).to_string().parse::<f64>().unwrap_or(0.0).ln();
+            per_second_returns.push(log_return / dt_seconds);
         }
-        if log_returns.is_empty() {
+        if per_second_returns.is_empty() {
             return (short_return, Decimal::ZERO);
         }
-        let mean: f64 = log_returns.iter().sum::<f64>() / log_returns.len() as f64;
-        let variance: f64 = log_returns
+        let mean: f64 = per_second_returns.iter().sum::<f64>() / per_second_returns.len() as f64;
+        let variance: f64 = per_second_returns
             .iter()
             .map(|v| (v - mean) * (v - mean))
             .sum::<f64>()
-            / log_returns.len() as f64;
+            / per_second_returns.len() as f64;
         (
             short_return,
             Decimal::from_str_lenient(&format!("{variance}")).unwrap_or(Decimal::ZERO),
@@ -461,5 +471,37 @@ mod tests {
         // short_return = (last-first)/first over the window.
         assert!(sr > Decimal::ZERO);
         assert!(var >= Decimal::ZERO);
+    }
+
+    /// A book snapshot whose mid is `mid` and receive time `ts`.
+    fn book_at(mid: &str, ts: DateTime<Utc>) -> L2BookSnapshot {
+        let mid = Decimal::from_str_lenient(mid).unwrap();
+        let half = Decimal::from_str_lenient("0.5").unwrap();
+        let mut b = book(&(mid - half).to_string(), &(mid + half).to_string());
+        b.local_ts = ts;
+        b
+    }
+
+    #[test]
+    fn variance_is_normalized_by_sample_interval() {
+        // M-MD8: the same mid path sampled at 1s vs 2s must yield a per-second
+        // variance that scales inversely with the interval (2× interval ⇒
+        // per-second returns halve ⇒ variance /4).
+        let mut fast = MarketFeatureEngine::new(5, 1000.0, 2048).unwrap();
+        let mut slow = MarketFeatureEngine::new(5, 1000.0, 2048).unwrap();
+        let now = Utc::now();
+        let mids = ["100", "101", "100.5"];
+        for (i, mid) in mids.iter().enumerate() {
+            fast.observe_book(&book_at(mid, now + chrono::Duration::seconds(i as i64)));
+            slow.observe_book(&book_at(mid, now + chrono::Duration::seconds(i as i64 * 2)));
+        }
+        let (_, v1) = fast.return_features("BTC");
+        let (_, v2) = slow.return_features("BTC");
+        assert!(v1 > Decimal::ZERO && v2 > Decimal::ZERO);
+        let ratio = v1.to_string().parse::<f64>().unwrap() / v2.to_string().parse::<f64>().unwrap();
+        assert!(
+            (ratio - 4.0).abs() < 0.2,
+            "variance must scale with 1/dt² (expected ratio ~4, got {ratio})"
+        );
     }
 }

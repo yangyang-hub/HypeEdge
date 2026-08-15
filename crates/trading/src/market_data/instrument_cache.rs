@@ -262,6 +262,10 @@ pub struct InstrumentMetaCache {
     instruments: std::sync::RwLock<HashMap<String, InstrumentInfo>>,
     spot_aliases: std::sync::RwLock<HashMap<String, String>>,
     loaded: std::sync::atomic::AtomicBool,
+    /// Consecutive refresh failures; surfaced for monitoring (H-MD2).
+    refresh_failures: std::sync::atomic::AtomicU32,
+    /// Monotonic timestamp of the last successful refresh (millis since epoch).
+    last_refresh_at_ms: std::sync::atomic::AtomicI64,
 }
 
 impl InstrumentMetaCache {
@@ -274,11 +278,26 @@ impl InstrumentMetaCache {
             instruments: std::sync::RwLock::new(HashMap::new()),
             spot_aliases: std::sync::RwLock::new(HashMap::new()),
             loaded: std::sync::atomic::AtomicBool::new(false),
+            refresh_failures: std::sync::atomic::AtomicU32::new(0),
+            last_refresh_at_ms: std::sync::atomic::AtomicI64::new(0),
         }
     }
 
     pub fn is_loaded(&self) -> bool {
         self.loaded.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Consecutive failed refresh attempts (H-MD2; for monitoring/alerts).
+    pub fn refresh_failures(&self) -> u32 {
+        self.refresh_failures
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Milliseconds since the Unix epoch of the last successful refresh, or 0
+    /// when metadata was never loaded successfully (H-MD2; for monitoring).
+    pub fn last_refresh_at_ms(&self) -> i64 {
+        self.last_refresh_at_ms
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn get(&self, symbol: &str) -> Option<InstrumentInfo> {
@@ -317,8 +336,19 @@ impl InstrumentMetaCache {
             .map(|i| i.tick_size)
     }
 
-    /// Fetch and atomically replace perpetual + spot metadata.
+    /// Fetch and atomically replace perpetual + spot metadata. Failures are
+    /// counted (and surfaced via [`InstrumentMetaCache::refresh_failures`])
+    /// and never poison the cached data — a failed refresh leaves the previous
+    /// metadata in place (H-MD2).
     pub async fn refresh(&self) -> Result<(), HypeEdgeError> {
+        let result = self.refresh_inner().await;
+        if let Err(e) = &result {
+            self.record_refresh_failure(e);
+        }
+        result
+    }
+
+    async fn refresh_inner(&self) -> Result<(), HypeEdgeError> {
         let perp = self.source.get_meta().await?;
         let spot = self.source.get_spot_meta().await?;
         let (instruments, aliases) = parse_meta(&perp, &spot)?;
@@ -326,6 +356,12 @@ impl InstrumentMetaCache {
         *self.spot_aliases.write().unwrap() = aliases;
         self.loaded
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.refresh_failures
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        self.last_refresh_at_ms.store(
+            chrono::Utc::now().timestamp_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
         tracing::info!(
             instruments = self.instruments.read().unwrap().len(),
             "meta_loaded"
@@ -342,16 +378,27 @@ impl InstrumentMetaCache {
         self.refresh().await
     }
 
-    /// Main loop: fetch on startup, then refresh periodically.
+    /// Main loop: fetch on startup, then refresh periodically (H-MD2). A
+    /// failed refresh never exits the loop — it is counted and logged
+    /// (escalating to error when the failure streak grows) and retried on the
+    /// next interval, so a transient meta outage cannot kill the cache.
     pub async fn run(&self) {
-        if let Err(e) = self.refresh().await {
-            tracing::warn!(error = %e, "meta_fetch_failed");
-        }
+        let _ = self.refresh().await;
         loop {
             tokio::time::sleep(self.refresh_interval).await;
-            if let Err(e) = self.refresh().await {
-                tracing::warn!(error = %e, "meta_fetch_failed");
-            }
+            let _ = self.refresh().await;
+        }
+    }
+
+    fn record_refresh_failure(&self, error: &HypeEdgeError) {
+        let failures = self
+            .refresh_failures
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if failures >= 5 {
+            tracing::error!(error = %error, failures, "meta_fetch_failed_sustained");
+        } else {
+            tracing::warn!(error = %error, failures, "meta_fetch_failed");
         }
     }
 }
@@ -427,6 +474,8 @@ mod tests {
             instruments: std::sync::RwLock::new(instruments),
             spot_aliases: std::sync::RwLock::new(Default::default()),
             loaded: std::sync::atomic::AtomicBool::new(true),
+            refresh_failures: std::sync::atomic::AtomicU32::new(0),
+            last_refresh_at_ms: std::sync::atomic::AtomicI64::new(0),
         };
         use crate::execution::exchange::AssetIndexProvider;
         assert_eq!(cache.asset_index("BTC"), Some(1));
@@ -443,6 +492,8 @@ mod tests {
             instruments: std::sync::RwLock::new(instruments),
             spot_aliases: std::sync::RwLock::new(aliases),
             loaded: std::sync::atomic::AtomicBool::new(true),
+            refresh_failures: std::sync::atomic::AtomicU32::new(0),
+            last_refresh_at_ms: std::sync::atomic::AtomicI64::new(0),
         };
         let info = cache.get("PURR/USDC").unwrap();
         assert!(info.is_spot);
@@ -474,6 +525,8 @@ mod tests {
             instruments: std::sync::RwLock::new(instruments),
             spot_aliases: std::sync::RwLock::new(aliases),
             loaded: std::sync::atomic::AtomicBool::new(true),
+            refresh_failures: std::sync::atomic::AtomicU32::new(0),
+            last_refresh_at_ms: std::sync::atomic::AtomicI64::new(0),
         };
         assert!(cache.resolve_spot("@1").is_some());
         assert!(cache.resolve_spot("BTC").is_none());
@@ -493,6 +546,8 @@ mod tests {
             instruments: std::sync::RwLock::new(instruments),
             spot_aliases: std::sync::RwLock::new(HashMap::new()),
             loaded: std::sync::atomic::AtomicBool::new(true),
+            refresh_failures: std::sync::atomic::AtomicU32::new(0),
+            last_refresh_at_ms: std::sync::atomic::AtomicI64::new(0),
         };
         assert_eq!(cache.get_sz_decimals("BTC"), Some(5));
         assert!(cache.get_tick_size("BTC").is_some());
@@ -514,5 +569,46 @@ mod tests {
         assert_eq!(power_of_ten_neg(0), Decimal::ONE);
         assert_eq!(power_of_ten_neg(2), Decimal::from_scaled(1, 2));
         assert_eq!(power_of_ten_neg(5), Decimal::from_scaled(1, 5));
+    }
+
+    struct FlakySource {
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl InstrumentMetaSource for FlakySource {
+        async fn get_meta(&self) -> Result<serde_json::Value, HypeEdgeError> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(HypeEdgeError::MarketData("boom".into()));
+            }
+            Ok(perp_meta())
+        }
+        async fn get_spot_meta(&self) -> Result<serde_json::Value, HypeEdgeError> {
+            if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+                return Err(HypeEdgeError::MarketData("boom".into()));
+            }
+            Ok(spot_meta())
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_failure_counted_and_reset_on_success() {
+        // H-MD2: a failed refresh is counted and surfaced; a subsequent success
+        // resets the streak and stamps last_refresh_at.
+        let source = Arc::new(FlakySource {
+            fail: std::sync::atomic::AtomicBool::new(true),
+        });
+        let cache = InstrumentMetaCache::new(source.clone(), Some(6.0));
+        assert!(cache.refresh().await.is_err());
+        assert_eq!(cache.refresh_failures(), 1);
+        assert_eq!(cache.last_refresh_at_ms(), 0);
+        assert!(!cache.is_loaded());
+        source
+            .fail
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+        assert!(cache.refresh().await.is_ok());
+        assert_eq!(cache.refresh_failures(), 0);
+        assert!(cache.last_refresh_at_ms() > 0);
+        assert!(cache.is_loaded());
     }
 }

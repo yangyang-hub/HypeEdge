@@ -40,6 +40,14 @@ pub trait StrategyRuntimeHandle: Send + Sync {
     async fn set_mode(&self, mode: MarketMakerLifecycle) -> Result<(), String>;
     async fn apply_config(&self, config: &StrategyConfigSnapshot) -> Result<(), String>;
     async fn stop(&self) -> Result<(), String>;
+
+    /// Whether the runtime's worker task is alive. Defaults to `true`;
+    /// implementations with an internal task (e.g. the trend-follow runner)
+    /// override this so the supervisor can detect a crashed runner and fault
+    /// the instance (M-ST2).
+    fn is_healthy(&self) -> bool {
+        true
+    }
 }
 
 /// A runtime handle that fails every lifecycle operation with a fixed reason.

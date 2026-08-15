@@ -9,8 +9,14 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc, oneshot};
+
+/// Per-action ceiling inside the serial worker (C3): a hung sign+send must not
+/// permanently block the whole queue. The nonce was already allocated and is
+/// never recycled — the outcome degrades to unknown for cloid reconciliation.
+const WORKER_ACTION_TIMEOUT_SECS: u64 = 15;
 
 /// The nonce generator: `max(now_ms, last + 1)` guarantees strict monotonicity
 /// even when two actions land in the same millisecond.
@@ -65,16 +71,24 @@ pub struct ActionRequest {
 }
 
 /// The serial nonce queue.
+#[derive(Clone)]
 pub struct NonceQueue {
     tx: mpsc::Sender<ActionRequest>,
 }
 
 impl NonceQueue {
     pub fn new() -> Self {
-        Self::with_capacity(64)
+        Self::with_action_timeout(64, Duration::from_secs(WORKER_ACTION_TIMEOUT_SECS))
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
+        Self::with_action_timeout(capacity, Duration::from_secs(WORKER_ACTION_TIMEOUT_SECS))
+    }
+
+    /// Construct with an explicit per-action ceiling. Test seam — the default
+    /// 15s bound applies everywhere except tests that need the worker to
+    /// recover quickly from a hung action.
+    pub fn with_action_timeout(capacity: usize, action_timeout: Duration) -> Self {
         let nonce = Arc::new(NonceGenerator::new());
         let (tx, mut rx) = mpsc::channel::<ActionRequest>(capacity);
         let worker_nonce = nonce;
@@ -86,7 +100,24 @@ impl NonceQueue {
         tokio::spawn(async move {
             while let Some(req) = rx.recv().await {
                 let nonce = worker_nonce.next().await;
-                let result = (req.run)(nonce).await;
+                let description = req.description.clone();
+                let result = match tokio::time::timeout(action_timeout, (req.run)(nonce)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        // C3: a hung action must not stall the queue. The nonce
+                        // stays consumed (monotonicity is never violated by
+                        // reuse); the caller classifies the unknown outcome.
+                        tracing::error!(
+                            action = %description,
+                            timeout_ms = action_timeout.as_millis() as u64,
+                            "nonce_worker_action_timeout"
+                        );
+                        Err(format!(
+                            "action timed out after {}ms: {description}",
+                            action_timeout.as_millis()
+                        ))
+                    }
+                };
                 let _ = req.reply.send(result);
             }
         });
@@ -231,5 +262,50 @@ mod tests {
         for w in nonces.windows(2) {
             assert!(w[1] > w[0], "nonces must be strictly increasing");
         }
+    }
+
+    #[tokio::test]
+    async fn hung_action_times_out_and_queue_continues() {
+        // C3 regression: a single hung action must not permanently block the
+        // serial queue. After the per-action ceiling the worker logs and moves
+        // on to the next request; the timed-out reply carries an error.
+        let queue = NonceQueue::with_action_timeout(64, Duration::from_millis(100));
+        let hung = tokio::spawn({
+            let queue = queue.clone();
+            async move {
+                queue
+                    .submit("hang", |_| {
+                        Box::pin(async {
+                            // Never completes on its own.
+                            tokio::time::sleep(Duration::from_secs(3600)).await;
+                            Ok(serde_json::json!({"never": true}))
+                        })
+                    })
+                    .await
+            }
+        });
+        let next = tokio::spawn({
+            let queue = queue.clone();
+            async move {
+                queue
+                    .submit("next", |nonce| {
+                        Box::pin(async move { Ok(serde_json::json!({"ok": nonce})) })
+                    })
+                    .await
+            }
+        });
+
+        let hung_result = hung.await.unwrap();
+        let next_result = next.await.unwrap();
+        assert!(
+            hung_result.is_err(),
+            "hung action must time out with an error, got {hung_result:?}"
+        );
+        assert!(hung_result.unwrap_err().contains("timed out"));
+        let next = next_result.unwrap();
+        assert!(
+            next.get("ok").is_some(),
+            "the action queued behind the hung one must still run: {next:?}"
+        );
     }
 }

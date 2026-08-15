@@ -187,6 +187,17 @@ pub fn normalize_trend_follow_config(values: &Value) -> Result<Value, HypeEdgeEr
         out.insert((*name).to_string(), Value::String(text));
     }
 
+    // M-ST3: every indicator period must be in [1, 500] — a zero period would
+    // otherwise slip through (only fast >= slow was checked before).
+    const MAX_PERIOD: i64 = 500;
+    for name in TF_INTEGER_FIELDS {
+        let value = out[*name].as_i64().unwrap_or(0);
+        if !(1..=MAX_PERIOD).contains(&value) {
+            return Err(HypeEdgeError::StrategyRegistration {
+                message: format!("{name} must be in [1, {MAX_PERIOD}], got {value}"),
+            });
+        }
+    }
     let fast: i64 = out["fast_ema_period"].as_i64().unwrap_or(0);
     let slow: i64 = out["slow_ema_period"].as_i64().unwrap_or(0);
     if fast >= slow {
@@ -246,6 +257,7 @@ const FA_INTEGER_FIELDS: &[&str] = &[
     "max_basis_bps",
     "expected_hold_hours",
     "max_unhedged_seconds",
+    "max_hold_hours",
 ];
 const FA_DECIMAL_FIELDS: &[&str] = &[
     "entry_funding_rate",
@@ -258,6 +270,11 @@ const FA_DECIMAL_FIELDS: &[&str] = &[
 ];
 const FA_STRING_FIELDS: &[&str] = &["spot_coin"];
 
+/// Funding-arb integer fields that are optional on input and defaulted by the
+/// normalize step (newer fields absent from older clients / persisted rows).
+/// `FundingArbParams`/`decode_funding_arb_config` apply the same 168h default.
+const FA_NEW_INTEGER_DEFAULTS: &[(&str, i64)] = &[("max_hold_hours", 168)];
+
 /// Auto market symbol sentinel (mirrors `AUTO_SPOT_MARKET`).
 pub const AUTO_SPOT_MARKET: &str = "AUTO/USDC";
 
@@ -268,6 +285,13 @@ pub fn normalize_funding_arb_config(values: &Value) -> Result<Value, HypeEdgeErr
     supplied
         .entry("spot_coin".to_string())
         .or_insert_with(|| Value::String(AUTO_SPOT_MARKET.to_string()));
+    // Fill defaults for optional new fields before the field-set check so an
+    // older client (or a persisted row without the column) still normalizes.
+    for (name, default) in FA_NEW_INTEGER_DEFAULTS {
+        supplied
+            .entry((*name).to_string())
+            .or_insert_with(|| json!(*default));
+    }
 
     let all_fields: Vec<&str> = FA_INTEGER_FIELDS
         .iter()
@@ -276,17 +300,15 @@ pub fn normalize_funding_arb_config(values: &Value) -> Result<Value, HypeEdgeErr
         .copied()
         .collect();
     let keys: std::collections::HashSet<&str> = supplied.keys().map(|k| k.as_str()).collect();
-    if keys != all_fields.iter().copied().collect() {
-        let missing: Vec<&str> = all_fields
-            .iter()
-            .copied()
-            .filter(|k| !keys.contains(k))
-            .collect();
-        let extra: Vec<&str> = keys
-            .iter()
-            .copied()
-            .filter(|k| !all_fields.contains(k))
-            .collect();
+    let all: std::collections::HashSet<&str> = all_fields.iter().copied().collect();
+    let required: std::collections::HashSet<&str> = all
+        .iter()
+        .copied()
+        .filter(|k| !FA_NEW_INTEGER_DEFAULTS.iter().any(|(name, _)| name == k))
+        .collect();
+    if !required.is_subset(&keys) || !keys.is_subset(&all) {
+        let missing: Vec<&str> = required.difference(&keys).copied().collect();
+        let extra: Vec<&str> = keys.difference(&all).copied().collect();
         return Err(HypeEdgeError::StrategyRegistration {
             message: format!(
                 "Invalid funding-arb config fields: missing={missing:?} extra={extra:?}"
@@ -394,6 +416,14 @@ pub fn normalize_funding_arb_config(values: &Value) -> Result<Value, HypeEdgeErr
             message: "max_unhedged_seconds must be in [1, 60]".into(),
         });
     }
+    // M-FA7: the hard hold ceiling must be a valid (1 hour .. 1 year) window,
+    // matching `FundingArbParams::validate`.
+    let max_hold = int_of(&out, "max_hold_hours")?;
+    if !(1..=8760).contains(&max_hold) {
+        return Err(HypeEdgeError::StrategyRegistration {
+            message: "max_hold_hours must be in [1, 8760]".into(),
+        });
+    }
     Ok(Value::Object(out))
 }
 
@@ -418,6 +448,7 @@ pub fn default_funding_arb_config() -> Value {
         "expected_hold_hours": 8,
         "round_trip_fee_bps": "20",
         "max_unhedged_seconds": 15,
+        "max_hold_hours": 168,
     }))
     .expect("default funding-arb config is valid")
 }
@@ -625,10 +656,73 @@ mod tests {
     }
 
     #[test]
+    fn tf_rejects_zero_and_huge_periods() {
+        // M-ST3: period=0 must be rejected even when fast < slow.
+        let mut v = default_trend_follow_config_values();
+        v["fast_ema_period"] = json!(0);
+        let err = normalize_trend_follow_config(&v).unwrap_err();
+        assert!(err.to_string().contains("fast_ema_period"), "got: {err}");
+        let mut v = default_trend_follow_config_values();
+        v["atr_period"] = json!(0);
+        assert!(normalize_trend_follow_config(&v).is_err());
+        // Upper bound 500.
+        let mut v = default_trend_follow_config_values();
+        v["slow_ema_period"] = json!(501);
+        assert!(normalize_trend_follow_config(&v).is_err());
+    }
+
+    #[test]
     fn fa_default_config_valid() {
         let d = default_funding_arb_config();
         assert_eq!(d["spot_coin"], Value::String(AUTO_SPOT_MARKET.into()));
         assert_eq!(d["max_slippage_bps"].as_i64(), Some(50));
+        assert_eq!(d["max_hold_hours"].as_i64(), Some(168));
+    }
+
+    #[test]
+    fn fa_max_hold_hours_is_optional_with_default() {
+        // M-FA7: `max_hold_hours` must be configurable via the API, but a
+        // config from an older client (without the field) still normalizes —
+        // the 168h default matches FundingArbParams::default() and the runtime
+        // decode.
+        let mut v = default_funding_arb_config();
+        v.as_object_mut().unwrap().remove("max_hold_hours");
+        let normalized = normalize_funding_arb_config(&v).unwrap();
+        assert_eq!(
+            normalized["max_hold_hours"].as_i64(),
+            Some(168),
+            "absent max_hold_hours must default to 168"
+        );
+    }
+
+    #[test]
+    fn fa_max_hold_hours_roundtrips() {
+        let mut v = default_funding_arb_config();
+        v["max_hold_hours"] = json!(720);
+        let normalized = normalize_funding_arb_config(&v).unwrap();
+        assert_eq!(normalized["max_hold_hours"].as_i64(), Some(720));
+        // Same semantic value as a string is accepted too.
+        v["max_hold_hours"] = Value::String("720".into());
+        let normalized = normalize_funding_arb_config(&v).unwrap();
+        assert_eq!(normalized["max_hold_hours"].as_i64(), Some(720));
+        // Boundary values are valid.
+        v["max_hold_hours"] = json!(1);
+        assert!(normalize_funding_arb_config(&v).is_ok());
+        v["max_hold_hours"] = json!(8760);
+        assert!(normalize_funding_arb_config(&v).is_ok());
+    }
+
+    #[test]
+    fn fa_rejects_out_of_range_max_hold_hours() {
+        for bad in [0, 8761] {
+            let mut v = default_funding_arb_config();
+            v["max_hold_hours"] = json!(bad);
+            let err = normalize_funding_arb_config(&v).unwrap_err();
+            assert!(
+                err.to_string().contains("max_hold_hours"),
+                "got: {err}"
+            );
+        }
     }
 
     #[test]

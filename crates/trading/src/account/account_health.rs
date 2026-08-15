@@ -174,9 +174,20 @@ impl AccountHealthSnapshot {
         ]
     }
 
-    /// Every dimension must be fresh to allow a risk increase.
+    /// M-RK1: the UserStream dimension does not participate in the risk gate
+    /// when it has never been observed (no authenticated user-stream is wired,
+    /// so "no stream" must not permanently block entry). An *observed* stale or
+    /// unhealthy UserStream still blocks.
+    fn dimension_participates(result: &FreshnessResult) -> bool {
+        !(result.dimension == AccountHealthDimension::UserStream
+            && result.status == FreshnessStatus::Unknown)
+    }
+
+    /// Every participating dimension must be fresh to allow a risk increase.
     pub fn allows_risk_increase(&self) -> bool {
-        self.dimensions().iter().all(|r| r.is_fresh())
+        self.dimensions()
+            .iter()
+            .all(|r| !Self::dimension_participates(r) || r.is_fresh())
     }
 
     /// Any missing critical account fact requires maker quotes to be removed.
@@ -184,11 +195,13 @@ impl AccountHealthSnapshot {
         !self.allows_risk_increase()
     }
 
-    /// Stable reasons for each non-fresh dimension, e.g. `inventory:stale`.
+    /// Stable reasons for each non-fresh participating dimension, e.g.
+    /// `inventory:stale`. Non-participating (never-observed UserStream)
+    /// dimensions are excluded for consistency with [`Self::allows_risk_increase`].
     pub fn blocking_reasons(&self) -> Vec<String> {
         self.dimensions()
             .iter()
-            .filter(|r| !r.is_fresh())
+            .filter(|r| Self::dimension_participates(r) && !r.is_fresh())
             .map(|r| {
                 format!(
                     "{}:{}",
@@ -1044,7 +1057,41 @@ mod tests {
         let provider = LayeredAccountHealthProvider::default();
         let snapshot = provider.get_account_health(Some(at(100)));
         let reasons = snapshot.blocking_reasons();
-        assert_eq!(reasons.len(), 4);
+        // M-RK1: the never-observed UserStream dimension does not participate,
+        // so only inventory/clearinghouse/reconciliation block.
+        assert_eq!(reasons.len(), 3);
         assert!(reasons.iter().all(|r| r.ends_with("not_observed")));
+        assert!(reasons.iter().all(|r| !r.starts_with("user_stream:")));
+    }
+
+    #[test]
+    fn unobserved_user_stream_does_not_block_risk() {
+        // M-RK1: with no user stream wired (never observed), the UserStream
+        // dimension must not make `allows_risk_increase` permanently false —
+        // the other three dimensions drive the gate.
+        let provider = LayeredAccountHealthProvider::default();
+        for dimension in [
+            AccountHealthDimension::Inventory,
+            AccountHealthDimension::Clearinghouse,
+            AccountHealthDimension::Reconciliation,
+        ] {
+            provider.record_success(dimension, Some(at(96)));
+        }
+        let snapshot = provider.get_account_health(Some(at(100)));
+        assert!(
+            snapshot.allows_risk_increase(),
+            "unobserved user stream must not block risk increase (M-RK1)"
+        );
+        assert!(!snapshot.requires_cancel());
+
+        // An observed-but-stale UserStream still blocks (the stream exists and
+        // is broken).
+        provider.record_success(AccountHealthDimension::UserStream, Some(at(50)));
+        let snapshot = provider.get_account_health(Some(at(100)));
+        assert!(!snapshot.allows_risk_increase());
+        assert!(snapshot
+            .blocking_reasons()
+            .iter()
+            .any(|r| r.starts_with("user_stream:")));
     }
 }

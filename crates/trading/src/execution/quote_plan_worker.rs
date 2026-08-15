@@ -157,6 +157,11 @@ pub trait QuoteDispatchGuardProvider: Send + Sync {
     async fn context(&self, child: &QuoteDispatchChild) -> DispatchGuardContext;
 }
 
+/// Initial backoff after a transient failure (P2-4/H-EX1).
+const BACKOFF_BASE: Duration = Duration::from_millis(100);
+/// Backoff ceiling so a permanently failing worker retries at most every 30s.
+const BACKOFF_MAX: Duration = Duration::from_secs(30);
+
 /// The worker: claim → guard → dispatch → record, with a bounded poll loop.
 pub struct QuotePlanWorker {
     store: Arc<dyn QuotePlanStore>,
@@ -165,7 +170,8 @@ pub struct QuotePlanWorker {
     budget: Arc<std::sync::Mutex<ActionBudgetController>>,
     poll_interval: Duration,
     worker_id: String,
-    stopped: std::sync::atomic::AtomicBool,
+    /// Shared stop flag (Arc so a cloned worker handle can stop the loop).
+    stopped: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl QuotePlanWorker {
@@ -184,23 +190,49 @@ impl QuotePlanWorker {
             budget,
             poll_interval: Duration::from_secs_f64(poll_interval_seconds),
             worker_id: worker_id.unwrap_or_else(|| "quote-plan-worker".into()),
-            stopped: std::sync::atomic::AtomicBool::new(false),
+            stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
-    /// Run the claim→dispatch loop until stopped.
+    /// Run the claim→dispatch loop until stopped. P2-4/H-EX1: a single
+    /// transient failure (claim or dispatch error) must not kill the worker —
+    /// errors back off exponentially and the loop continues.
     pub async fn run(&self) -> Result<(), HypeEdgeError> {
         tracing::info!(worker_id = %self.worker_id, "quote_plan_worker_started");
+        let mut backoff = BACKOFF_BASE;
         while !self.stopped.load(std::sync::atomic::Ordering::Relaxed) {
-            match self.claim_one().await? {
-                Some(child) => self.dispatch(child).await?,
-                None => {
+            match self.claim_one().await {
+                Ok(Some(child)) => {
+                    backoff = BACKOFF_BASE;
+                    if let Err(e) = self.dispatch(child).await {
+                        tracing::error!(
+                            worker_id = %self.worker_id,
+                            error = %e,
+                            backoff_ms = backoff.as_millis() as u64,
+                            "quote_plan_worker_dispatch_retry"
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff = (backoff * 2).min(BACKOFF_MAX);
+                    }
+                }
+                Ok(None) => {
+                    backoff = BACKOFF_BASE;
                     tokio::select! {
                         _ = tokio::time::sleep(self.poll_interval) => {}
                         _ = tokio::task::yield_now() => {
                             // Re-check the stop flag promptly.
                         }
                     }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        worker_id = %self.worker_id,
+                        error = %e,
+                        backoff_ms = backoff.as_millis() as u64,
+                        "quote_plan_worker_claim_retry"
+                    );
+                    tokio::time::sleep(backoff).await;
+                    backoff = (backoff * 2).min(BACKOFF_MAX);
                 }
             }
         }
@@ -298,6 +330,22 @@ impl QuotePlanWorker {
     }
 }
 
+/// Cloning shares the stop flag (`Arc<AtomicBool>`), so a cloned handle can
+/// stop the loop running on another handle.
+impl Clone for QuotePlanWorker {
+    fn clone(&self) -> Self {
+        Self {
+            store: self.store.clone(),
+            executor: self.executor.clone(),
+            guards: self.guards.clone(),
+            budget: self.budget.clone(),
+            poll_interval: self.poll_interval,
+            worker_id: self.worker_id.clone(),
+            stopped: self.stopped.clone(),
+        }
+    }
+}
+
 fn budget_action(action: ChildActionType) -> BudgetAction {
     match action {
         ChildActionType::Place => BudgetAction::Place,
@@ -335,6 +383,7 @@ mod tests {
     use super::*;
     use std::collections::VecDeque;
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrdering};
 
     fn child() -> QuoteDispatchChild {
         QuoteDispatchChild {
@@ -431,6 +480,8 @@ mod tests {
         claims: StdMutex<VecDeque<Option<QuoteDispatchChild>>>,
         recorded: StdMutex<Vec<RecordedAttempt>>,
         finished: StdMutex<Vec<(i64, String)>>,
+        /// Number of consecutive `claim_child` failures to inject first.
+        claim_errors: AtomicU32,
     }
 
     impl FakeStore {
@@ -439,6 +490,7 @@ mod tests {
                 claims: StdMutex::new(claims.into()),
                 recorded: StdMutex::new(Vec::new()),
                 finished: StdMutex::new(Vec::new()),
+                claim_errors: AtomicU32::new(0),
             }
         }
         fn recorded(&self) -> Vec<RecordedAttempt> {
@@ -453,6 +505,17 @@ mod tests {
             _worker_id: &str,
             _now: DateTime<Utc>,
         ) -> Result<Option<QuoteDispatchChild>, HypeEdgeError> {
+            let injected = self
+                .claim_errors
+                .fetch_update(AtomicOrdering::SeqCst, AtomicOrdering::SeqCst, |n| {
+                    n.checked_sub(1)
+                })
+                .is_ok();
+            if injected {
+                return Err(HypeEdgeError::Postgres {
+                    message: "transient claim failure".into(),
+                });
+            }
             Ok(self.claims.lock().unwrap().pop_front().unwrap_or(None))
         }
         async fn record_attempt(
@@ -657,5 +720,38 @@ mod tests {
         );
         worker.stop();
         assert!(worker.stopped.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn transient_claim_error_backs_off_and_worker_continues() {
+        // H-EX1 regression: one transient DB error must not kill the worker —
+        // run() backs off and keeps processing subsequent children.
+        let store = Arc::new(FakeStore::new(vec![Some(child()), None]));
+        store.claim_errors.store(1, AtomicOrdering::SeqCst);
+        let executor = Arc::new(FakeExecutor::new());
+        let worker = QuotePlanWorker::new(
+            store.clone(),
+            executor.clone(),
+            Arc::new(AllowGuards),
+            budget_controller(),
+            0.05,
+            None,
+        );
+        let run_worker = worker.clone();
+        let run = tokio::spawn(async move { run_worker.run().await });
+
+        // Give the injected claim failure + 100ms base backoff + retry time.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let recorded = store.recorded();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "worker must continue after the transient failure"
+        );
+        assert_eq!(recorded[0].1, "succeeded");
+        assert_eq!(executor.submitted.lock().unwrap().len(), 1);
+
+        worker.stop();
+        run.await.unwrap().unwrap();
     }
 }

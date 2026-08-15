@@ -85,33 +85,115 @@ impl QuoteCoordinator {
         now: DateTime<Utc>,
     ) -> Result<QuotePlan, String> {
         Self::validate_views(desired, bid_view, ask_view)?;
-        if let Some(fence_reason) = Self::fence_reason(desired, bid_view, ask_view, now) {
-            return Ok(fenced_plan(desired, fence_reason));
+        // L-ST1: never place a crossing quote — downgrade crossed sides to
+        // NoQuote (which cancels any live owner) instead of placing them.
+        let working = Self::reject_crossed(desired);
+        if let Some(fence_reason) = Self::fence_reason(&working, bid_view, ask_view, now) {
+            // H-MM1: protective cancels outrank fences. A NoQuote intent must
+            // still produce Cancel diffs so an expired/stale candidate cannot
+            // pin live quotes on the book; only new placements are suppressed.
+            let diffs = self.fenced_diffs(&working, bid_view, ask_view)?;
+            return Ok(fenced_plan(&working, fence_reason, diffs));
         }
         if tick_size <= Decimal::ZERO {
             return Err("tick size must be positive".into());
         }
         let diffs = vec![
-            self.diff_slot(&desired.bid, bid_view, tick_size, now)?,
-            self.diff_slot(&desired.ask, ask_view, tick_size, now)?,
+            self.diff_slot(&working.bid, bid_view, tick_size, now)?,
+            self.diff_slot(&working.ask, ask_view, tick_size, now)?,
         ];
         Ok(QuotePlan {
-            strategy_id: desired.strategy_id.clone(),
-            symbol: desired.symbol.clone(),
-            session_id: desired.session_id.clone(),
-            config_version: desired.config_version,
-            revision: desired.revision,
-            market_version: desired.market_version,
-            connection_generation: desired.connection_generation,
-            valid_until: desired.valid_until,
+            strategy_id: working.strategy_id.clone(),
+            symbol: working.symbol.clone(),
+            session_id: working.session_id.clone(),
+            config_version: working.config_version,
+            revision: working.revision,
+            market_version: working.market_version,
+            connection_generation: working.connection_generation,
+            valid_until: working.valid_until,
             diffs,
-            fair_price: Some(desired.fair_price),
-            reservation_price: Some(desired.reservation_price),
-            inventory_notional: desired.inventory_notional,
-            budget_mode: desired.budget_mode,
+            fair_price: Some(working.fair_price),
+            reservation_price: Some(working.reservation_price),
+            inventory_notional: working.inventory_notional,
+            budget_mode: working.budget_mode,
             fenced: false,
             fence_reason: None,
         })
+    }
+
+    /// L-ST1: if both sides desire a quote and bid >= ask, downgrade both to
+    /// NoQuote and warn. Returning a plan with cancels is safer than erroring:
+    /// a coordinator error would leave live quotes on a crossed book.
+    fn reject_crossed(desired: &DesiredQuoteSet) -> DesiredQuoteSet {
+        let crossed = desired.bid.decision == QuoteDecision::Quote
+            && desired.ask.decision == QuoteDecision::Quote
+            && desired
+                .bid
+                .price
+                .zip(desired.ask.price)
+                .is_some_and(|(bid, ask)| bid.inner() >= ask.inner());
+        if !crossed {
+            return desired.clone();
+        }
+        tracing::warn!(
+            strategy_id = %desired.strategy_id,
+            symbol = %desired.symbol,
+            bid_price = ?desired.bid.price.map(|p| p.to_string()),
+            ask_price = ?desired.ask.price.map(|p| p.to_string()),
+            "market_maker_crossed_quote_rejected"
+        );
+        let mut working = desired.clone();
+        working.bid = no_quote_desired(working.bid, "crossed_quote_rejected");
+        working.ask = no_quote_desired(working.ask, "crossed_quote_rejected");
+        working
+    }
+
+    /// Diffs allowed while fenced: only protective cancels (plus blocked-unknown
+    /// markers for reconciliation). New placements are suppressed by the fence.
+    fn fenced_diffs(
+        &self,
+        desired: &DesiredQuoteSet,
+        bid_view: &QuoteSlotView,
+        ask_view: &QuoteSlotView,
+    ) -> Result<Vec<QuoteDiff>, String> {
+        let mut diffs = Vec::new();
+        for (quote, view) in [(&desired.bid, bid_view), (&desired.ask, ask_view)] {
+            if view.has_unknown() || view.has_orphaned_owner() {
+                let reason = if view.has_unknown() {
+                    "unknown_risk_owner_requires_reconciliation"
+                } else {
+                    "orphaned_live_owner_requires_recovery"
+                };
+                diffs.push(self.make_diff(
+                    quote,
+                    view.current_owner()?.cloned(),
+                    QuoteAction::BlockedUnknown,
+                    vec![],
+                    reason,
+                ));
+                continue;
+            }
+            if quote.decision != QuoteDecision::NoQuote {
+                continue; // fence suppresses new placements
+            }
+            match view.current_owner()? {
+                Some(owner) => diffs.push(self.make_diff(
+                    quote,
+                    Some(owner.clone()),
+                    QuoteAction::Cancel,
+                    vec!["cancel".into()],
+                    &quote.reason,
+                )),
+                None => diffs.push(self.make_diff(
+                    quote,
+                    None,
+                    QuoteAction::NoAction,
+                    vec![],
+                    &quote.reason,
+                )),
+            }
+        }
+        Ok(diffs)
     }
 
     fn validate_views(
@@ -219,19 +301,23 @@ impl QuoteCoordinator {
         let Some(desired_price) = desired.price else {
             return Err("QUOTE requires price".into());
         };
-        let Some(desired_size) = desired.size else {
-            return Err("QUOTE requires size".into());
-        };
         let owner = owner.unwrap();
         let age = now - owner.live_since;
         let price_ticks = (desired_price.inner() - owner.price.inner()).abs() / tick_size;
-        let size_delta = (desired_size.inner() - owner.remaining_size.inner()).abs();
+        // M-MM9: a partial fill must never re-quote the full original size.
+        // Cap the replacement at `remaining * (1 + shrink hysteresis)` so the
+        // order shrinks instead of snapping back to the pre-fill quantity.
+        let effective = Self::clamp_to_partial_fill(desired, owner);
+        let effective_size = effective
+            .size
+            .ok_or_else(|| "QUOTE requires size".to_string())?;
+        let size_delta = (effective_size.inner() - owner.remaining_size.inner()).abs();
         let within_hysteresis = price_ticks
             <= Decimal::from_i128(self.config.price_hysteresis_ticks as i128)
             && size_delta <= self.config.size_hysteresis.inner();
         if within_hysteresis {
             return Ok(self.make_diff(
-                desired,
+                &effective,
                 Some(owner.clone()),
                 QuoteAction::Keep,
                 vec![],
@@ -240,7 +326,7 @@ impl QuoteCoordinator {
         }
         if age < self.config.min_quote_lifetime {
             return Ok(self.make_diff(
-                desired,
+                &effective,
                 Some(owner.clone()),
                 QuoteAction::Keep,
                 vec![],
@@ -251,7 +337,7 @@ impl QuoteCoordinator {
             && now - last < self.config.refresh_cooldown
         {
             return Ok(self.make_diff(
-                desired,
+                &effective,
                 Some(owner.clone()),
                 QuoteAction::Keep,
                 vec![],
@@ -260,10 +346,10 @@ impl QuoteCoordinator {
         }
         let forced_by_age = age >= self.config.max_quote_age;
         let replace_cost = self.transition_cost(2);
-        let net = Usd::new(desired.gross_edge_usdc.inner() - replace_cost.inner());
+        let net = Usd::new(effective.gross_edge_usdc.inner() - replace_cost.inner());
         if !forced_by_age && net.inner() <= self.config.replace_hysteresis_usdc.inner() {
             return Ok(self.make_diff(
-                desired,
+                &effective,
                 Some(owner.clone()),
                 QuoteAction::Keep,
                 vec![],
@@ -276,12 +362,32 @@ impl QuoteCoordinator {
             "replace_hysteresis_passed"
         };
         Ok(self.make_diff(
-            desired,
+            &effective,
             Some(owner.clone()),
             QuoteAction::CancelThenPlace,
             vec!["cancel".into(), "place".into()],
             reason,
         ))
+    }
+
+    /// M-MM9: clamp a desired quote size after a partial fill. When the owner
+    /// has less remaining than desired, the replacement size is bounded by
+    /// `remaining * (1 + shrink_hysteresis)` — enough to keep quoting without
+    /// re-placing the full pre-fill quantity.
+    fn clamp_to_partial_fill(desired: &DesiredQuote, owner: &QuoteRiskOwner) -> DesiredQuote {
+        const SHRINK_HYSTERESIS: &str = "0.2"; // 20% above remaining
+        let Some(size) = desired.size else {
+            return desired.clone();
+        };
+        let remaining = owner.remaining_size.inner();
+        if size.inner() <= remaining {
+            return desired.clone(); // no partial fill (or desired already smaller)
+        }
+        let budget =
+            remaining * (Decimal::ONE + Decimal::from_str_lenient(SHRINK_HYSTERESIS).unwrap());
+        let mut clamped = desired.clone();
+        clamped.size = Some(Size::new(size.inner().min(budget)));
+        clamped
     }
 
     fn transition_cost(&self, child_count: usize) -> Usd {
@@ -314,7 +420,11 @@ impl QuoteCoordinator {
     }
 }
 
-fn fenced_plan(desired: &DesiredQuoteSet, fence_reason: String) -> QuotePlan {
+fn fenced_plan(
+    desired: &DesiredQuoteSet,
+    fence_reason: String,
+    diffs: Vec<QuoteDiff>,
+) -> QuotePlan {
     QuotePlan {
         strategy_id: desired.strategy_id.clone(),
         symbol: desired.symbol.clone(),
@@ -324,7 +434,7 @@ fn fenced_plan(desired: &DesiredQuoteSet, fence_reason: String) -> QuotePlan {
         market_version: desired.market_version,
         connection_generation: desired.connection_generation,
         valid_until: desired.valid_until,
-        diffs: vec![],
+        diffs,
         fair_price: Some(desired.fair_price),
         reservation_price: Some(desired.reservation_price),
         inventory_notional: desired.inventory_notional,
@@ -332,6 +442,15 @@ fn fenced_plan(desired: &DesiredQuoteSet, fence_reason: String) -> QuotePlan {
         fenced: true,
         fence_reason: Some(fence_reason),
     }
+}
+
+/// Downgrade a desired quote to NoQuote, dropping price/size (L-ST1).
+fn no_quote_desired(mut quote: DesiredQuote, reason: &str) -> DesiredQuote {
+    quote.decision = QuoteDecision::NoQuote;
+    quote.price = None;
+    quote.size = None;
+    quote.reason = reason.to_string();
+    quote
 }
 
 #[cfg(test)]
@@ -583,5 +702,148 @@ mod tests {
             plan.diffs[0].reason,
             "unknown_risk_owner_requires_reconciliation"
         );
+    }
+
+    // --- H-MM1: a fence must not suppress the NoQuote → Cancel intent ---
+
+    #[test]
+    fn expired_candidate_still_cancels_no_quote() {
+        let coord = QuoteCoordinator::new(QuoteCoordinatorConfig::default()).unwrap();
+        let mut set = desired_set(QuoteDecision::NoQuote, QuoteDecision::NoQuote);
+        set.valid_until = Utc::now() - Duration::seconds(1); // expired candidate
+        let mut view = empty_view(Side::Buy);
+        view.owners = vec![QuoteRiskOwner {
+            order_id: Some("o1".into()),
+            cloid: "c1".into(),
+            price: Price::new(Decimal::from_str_lenient("99.99").unwrap()),
+            remaining_size: Size::new(Decimal::ONE),
+            status: OrderStatus::Acknowledged,
+            plan_revision: 0,
+            live_since: Utc::now() - Duration::seconds(10),
+            exchange_order_id_known: true,
+        }];
+        let plan = coord
+            .coordinate(
+                &set,
+                &view,
+                &empty_view(Side::Sell),
+                Decimal::from_str_lenient("0.01").unwrap(),
+                Utc::now(),
+            )
+            .unwrap();
+        // Still fenced (candidate expired), but the protective cancel goes out.
+        assert!(plan.fenced);
+        assert_eq!(plan.fence_reason.as_deref(), Some("candidate_expired"));
+        assert_eq!(plan.diffs[0].action, QuoteAction::Cancel);
+        // Empty side with NO_QUOTE → NO_ACTION.
+        assert_eq!(plan.diffs[1].action, QuoteAction::NoAction);
+    }
+
+    #[test]
+    fn stale_revision_fence_suppresses_placements_not_cancels() {
+        let coord = QuoteCoordinator::new(QuoteCoordinatorConfig::default()).unwrap();
+        let mut set = desired_set(QuoteDecision::NoQuote, QuoteDecision::Quote);
+        set.revision = 1; // <= plan_revision of a view → fenced
+        let mut view = empty_view(Side::Buy);
+        view.plan_revision = 2;
+        let plan = coord
+            .coordinate(
+                &set,
+                &view,
+                &empty_view(Side::Sell),
+                Decimal::from_str_lenient("0.01").unwrap(),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(plan.fenced);
+        assert_eq!(plan.fence_reason.as_deref(), Some("stale_plan_revision"));
+        // The NoQuote side stays silent (no owner); the Quote side must NOT be
+        // placed while fenced — no Place action anywhere.
+        assert!(plan.diffs.iter().all(|d| d.action != QuoteAction::Place));
+    }
+
+    // --- M-MM9: a partial fill must not re-quote the full original size ---
+
+    #[test]
+    fn partial_fill_requote_size_does_not_exceed_remaining() {
+        let coord = QuoteCoordinator::new(QuoteCoordinatorConfig::default()).unwrap();
+        let set = desired_set(QuoteDecision::Quote, QuoteDecision::Quote);
+        let mut view = empty_view(Side::Buy);
+        view.owners = vec![QuoteRiskOwner {
+            order_id: Some("o1".into()),
+            cloid: "c1".into(),
+            price: Price::new(Decimal::from_str_lenient("99.99").unwrap()), // == desired
+            remaining_size: Size::new(Decimal::from_str_lenient("0.5").unwrap()), // half filled
+            status: OrderStatus::Acknowledged,
+            plan_revision: 0,
+            live_since: Utc::now() - Duration::seconds(20), // past max_quote_age
+            exchange_order_id_known: true,
+        }];
+        let plan = coord
+            .coordinate(
+                &set,
+                &view,
+                &empty_view(Side::Sell),
+                Decimal::from_str_lenient("0.01").unwrap(),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(plan.diffs[0].action, QuoteAction::CancelThenPlace);
+        let re_size = plan.diffs[0].desired.size.unwrap().inner();
+        let remaining = Decimal::from_str_lenient("0.5").unwrap();
+        let budget = remaining * Decimal::from_str_lenient("1.2").unwrap();
+        assert!(
+            re_size <= budget,
+            "re-quote size {re_size} must not exceed remaining budget {budget}"
+        );
+        assert!(
+            re_size < Decimal::ONE,
+            "re-quote must shrink below the pre-fill size 1.0 (got {re_size})"
+        );
+    }
+
+    // --- L-ST1: crossed bid/ask are rejected (downgraded to NoQuote) ---
+
+    #[test]
+    fn crossed_quotes_are_rejected() {
+        let coord = QuoteCoordinator::new(QuoteCoordinatorConfig::default()).unwrap();
+        let mut set = desired_set(QuoteDecision::Quote, QuoteDecision::Quote);
+        set.bid.price = Some(Price::new(Decimal::from_str_lenient("100.5").unwrap()));
+        set.ask.price = Some(Price::new(Decimal::from_str_lenient("100.4").unwrap())); // crossed
+        let plan = coord
+            .coordinate(
+                &set,
+                &empty_view(Side::Buy),
+                &empty_view(Side::Sell),
+                Decimal::from_str_lenient("0.01").unwrap(),
+                Utc::now(),
+            )
+            .unwrap();
+        assert!(
+            plan.diffs.iter().all(|d| d.action != QuoteAction::Place),
+            "crossed quotes must never be placed"
+        );
+        assert!(
+            plan.diffs
+                .iter()
+                .all(|d| d.reason == "crossed_quote_rejected")
+        );
+    }
+
+    #[test]
+    fn non_crossed_quotes_are_not_downgraded() {
+        let coord = QuoteCoordinator::new(QuoteCoordinatorConfig::default()).unwrap();
+        let set = desired_set(QuoteDecision::Quote, QuoteDecision::Quote);
+        let plan = coord
+            .coordinate(
+                &set,
+                &empty_view(Side::Buy),
+                &empty_view(Side::Sell),
+                Decimal::from_str_lenient("0.01").unwrap(),
+                Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(plan.diffs[0].action, QuoteAction::Place);
+        assert_eq!(plan.diffs[1].action, QuoteAction::Place);
     }
 }

@@ -7,7 +7,7 @@
 //! (design doc §8.1) depend on equity/peak_equity → max drawdown, per-coin
 //! position → max position %, and per-strategy PnL → max strategy loss %.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use chrono::{DateTime, Utc};
@@ -32,8 +32,9 @@ struct TrackerState {
     fill_count: u64,
     last_update_ts: Option<DateTime<Utc>>,
     last_spot_update_ts: Option<DateTime<Utc>>,
-    /// Exchange fill ids applied exactly once.
-    authoritative_fill_ids: Vec<String>,
+    /// Exchange fill ids applied exactly once (dedup set — L-RK2: a Vec grew
+    /// without bound as the account traded).
+    authoritative_fill_ids: HashSet<String>,
     /// Provisional fill fees keyed by cloid (replaced by authoritative fees).
     provisional_fill_fees: HashMap<String, Usd>,
 }
@@ -57,7 +58,7 @@ impl AccountTracker {
                 fill_count: 0,
                 last_update_ts: None,
                 last_spot_update_ts: None,
-                authoritative_fill_ids: Vec::new(),
+                authoritative_fill_ids: HashSet::new(),
                 provisional_fill_fees: HashMap::new(),
             }),
         }
@@ -159,7 +160,14 @@ impl AccountTracker {
     }
 
     /// Apply a committed exchange fill exactly once to the live projection.
-    /// Returns `false` if the `external_event_id` was already applied.
+    /// Returns `false` if the `external_event_id` was already applied or if
+    /// the fill is malformed (spot fill with a perp projection, or a perp fill
+    /// without a position projection).
+    ///
+    /// M-RK5: validation happens **before** the external id is recorded, so a
+    /// rejected fill does not consume its id — a later corrected event for the
+    /// same id can still be applied (previously the id was recorded first and a
+    /// malformed fill permanently shadowed the good one via the dedup set).
     pub fn apply_authoritative_fill(
         &self,
         external_event_id: &str,
@@ -167,15 +175,9 @@ impl AccountTracker {
         position: Option<&Position>,
     ) -> bool {
         let mut st = self.inner.lock().unwrap();
-        if st
-            .authoritative_fill_ids
-            .iter()
-            .any(|id| id == external_event_id)
-        {
+        if st.authoritative_fill_ids.contains(external_event_id) {
             return false;
         }
-        st.authoritative_fill_ids
-            .push(external_event_id.to_string());
 
         if fill.is_spot {
             if position.is_some() {
@@ -185,7 +187,12 @@ impl AccountTracker {
             }
         } else {
             let Some(position) = position else {
-                tracing::error!(cloid = %fill.cloid, "perpetual fills require a position projection");
+                // Fail-closed (M-RK5): a perp fill without an authoritative
+                // position projection must never be guessed — treating it as a
+                // zero-size position would delete the tracked position as if it
+                // were a close. The caller passes `None` when the projector
+                // could not determine `position_size`.
+                tracing::error!(cloid = %fill.cloid, "perpetual fills require a position projection (fail-closed; refusing to apply)");
                 return false;
             };
             if position.is_flat() {
@@ -195,17 +202,30 @@ impl AccountTracker {
                     .insert(position.symbol.clone(), position.clone());
             }
         }
+        // Validation passed — only now consume the external id.
+        st.authoritative_fill_ids.insert(external_event_id.to_string());
 
+        // M-RK4: the provisional fee is keyed by cloid and accumulates across
+        // multiple partial fills of the same order. Each authoritative fill
+        // nets against the *remaining* provisional amount already counted, so
+        // `total_fees` converges to the authoritative sum and `fill_count` is
+        // not double-counted when several fills share one cloid.
         let authoritative_fee = fill.fee.inner().abs();
-        match st.provisional_fill_fees.remove(&fill.cloid) {
-            Some(provisional) => {
-                st.total_fees =
-                    Usd::new(st.total_fees.inner() + authoritative_fee - provisional.inner());
+        let consumed = st
+            .provisional_fill_fees
+            .get(&fill.cloid)
+            .map(|p| p.inner().min(authoritative_fee))
+            .unwrap_or(Decimal::ZERO);
+        st.total_fees = Usd::new(st.total_fees.inner() + authoritative_fee - consumed);
+        if let Some(provisional) = st.provisional_fill_fees.get_mut(&fill.cloid) {
+            let remaining = provisional.inner() - consumed;
+            if remaining > Decimal::ZERO {
+                *provisional = Usd::new(remaining);
+            } else {
+                st.provisional_fill_fees.remove(&fill.cloid);
             }
-            None => {
-                st.total_fees = Usd::new(st.total_fees.inner() + authoritative_fee);
-                st.fill_count += 1;
-            }
+        } else {
+            st.fill_count += 1;
         }
         st.last_update_ts = DateTime::from_timestamp_millis(fill.timestamp);
         tracing::debug!(
@@ -396,6 +416,10 @@ impl AccountTracker {
 
     /// Full tracker status for the `/api/v1/account` route.
     pub fn get_status(&self) -> serde_json::Value {
+        // L-RK1: `get_leverage()` takes the inner mutex itself — computing it
+        // *before* holding the guard here avoids a nested-lock self-deadlock
+        // (the previous code called it while the guard was held).
+        let leverage = format!("{:.2}", self.get_leverage());
         let st = self.inner.lock().unwrap();
         let positions: serde_json::Map<String, serde_json::Value> = st
             .positions
@@ -435,7 +459,7 @@ impl AccountTracker {
             "fill_count": st.fill_count,
             "position_count": st.positions.len(),
             "spot_balance_count": st.spot_balances.len(),
-            "leverage": format!("{:.2}", self.get_leverage()),
+            "leverage": leverage,
             "positions": positions,
             "spot_balances": spot_balances,
             "last_update": st.last_update_ts.map(|t| t.to_rfc3339()),
@@ -450,8 +474,19 @@ fn record_fill_accounting(st: &mut TrackerState, fill: &Fill, _provisional: bool
     // `provisional` flag), so a later authoritative fill for the same cloid
     // does a net correction in `apply_authoritative_fill` instead of adding
     // the fee and fill_count a second time.
-    st.provisional_fill_fees
-        .insert(fill.cloid.clone(), Usd::new(fill.fee.inner().abs()));
+    //
+    // M-RK4: multiple partial fills of the same order share a cloid, so the
+    // provisional amount **accumulates** (entry exists → += fee) instead of
+    // overwriting — otherwise the authoritative net-correction would only
+    // offset the last partial fill and the earlier fees would be double
+    // counted.
+    let fee = Usd::new(fill.fee.inner().abs());
+    match st.provisional_fill_fees.get_mut(&fill.cloid) {
+        Some(accumulated) => *accumulated = Usd::new(accumulated.inner() + fee.inner()),
+        None => {
+            st.provisional_fill_fees.insert(fill.cloid.clone(), fee);
+        }
+    }
     st.last_update_ts = Some(Utc::now());
     tracing::debug!(
         symbol = %fill.symbol,
@@ -694,5 +729,105 @@ mod tests {
         // Zero-balance tokens are filtered out.
         t.update_spot_balances(&[b("USDC", "0", "0")], ts);
         assert!(t.get_spot_balance("USDC").is_none());
+    }
+
+    fn pos(symbol: &str, size: &str) -> Position {
+        Position {
+            symbol: symbol.into(),
+            size: Size::new(D::from_str_strict(size).unwrap()),
+            entry_price: Some(Price::new(D::from_str_strict("50000").unwrap())),
+            mark_price: Some(Price::new(D::from_str_strict("50000").unwrap())),
+            unrealized_pnl: None,
+            leverage: 0,
+            liquidation_price: None,
+            sub_account: None,
+            strategy_id: None,
+        }
+    }
+
+    #[test]
+    fn same_cloid_partial_fills_accumulate_provisional_fees() {
+        // M-RK4 regression: two partial fills of the same order (same cloid)
+        // must accumulate the provisional fee, so the authoritative
+        // net-correction converges to the true fee total instead of double
+        // counting the earlier partial.
+        let t = AccountTracker::new();
+        let mut p1 = fill("BTC", Side::Buy, "0.5", "50000", "c1");
+        p1.is_spot = true;
+        let mut p2 = fill("BTC", Side::Buy, "0.5", "50000", "c1");
+        p2.is_spot = true;
+        t.update_fill(&p1, true);
+        t.update_fill(&p2, true);
+        assert_eq!(t.total_fees().to_string(), "0.2", "two partials accumulate");
+        assert_eq!(t.fill_count(), 2);
+
+        let mut a1 = fill("BTC", Side::Buy, "0.5", "50000", "c1");
+        a1.is_spot = true;
+        let mut a2 = fill("BTC", Side::Buy, "0.5", "50000", "c1");
+        a2.is_spot = true;
+        assert!(t.apply_authoritative_fill("evt-a1", &a1, None));
+        assert!(t.apply_authoritative_fill("evt-a2", &a2, None));
+
+        assert_eq!(
+            t.total_fees().to_string(),
+            "0.2",
+            "authoritative reconciliation must net to the true fee total (M-RK4)"
+        );
+        assert_eq!(
+            t.fill_count(),
+            2,
+            "fill_count must not double-count partial fills of one cloid (M-RK4)"
+        );
+    }
+
+    #[test]
+    fn rejected_fill_does_not_consume_external_id() {
+        // M-RK5 regression: a malformed fill (spot fill carrying a perp
+        // projection) must not consume its external id — the corrected event
+        // with the same id must still be applied.
+        let t = AccountTracker::new();
+        let mut spot = fill("BTC", Side::Buy, "1.0", "50000", "c1");
+        spot.is_spot = true;
+        // Spot fill with a position projection is invalid.
+        assert!(!t.apply_authoritative_fill("evt-1", &spot, Some(&pos("BTC", "1"))));
+        // The same id applied correctly must succeed (id not consumed).
+        assert!(t.apply_authoritative_fill("evt-1", &spot, None));
+        assert_eq!(t.fill_count(), 1);
+    }
+
+    #[test]
+    fn perp_fill_without_position_projection_is_fail_closed() {
+        // M-RK5: a perp fill with no position projection must be rejected
+        // (fail-closed) rather than deleting the tracked position as if the
+        // position were closed. And the id must not be consumed.
+        let t = AccountTracker::new();
+        let entry = fill("BTC", Side::Buy, "1.0", "50000", "c1");
+        t.update_fill(&entry, false);
+        assert_eq!(t.get_position("BTC").unwrap().size.to_string(), "1");
+
+        let mut fill_no_pos = fill("BTC", Side::Sell, "1.0", "51000", "c1");
+        fill_no_pos.fee = Usd::new(D::from_str_strict("0.5").unwrap());
+        assert!(
+            !t.apply_authoritative_fill("evt-close", &fill_no_pos, None),
+            "a perp fill without a position projection must be rejected"
+        );
+        // The position survives — it was NOT treated as a close.
+        assert_eq!(t.get_position("BTC").unwrap().size.to_string(), "1");
+
+        // The same id with a valid (flat) projection applies cleanly later.
+        assert!(t.apply_authoritative_fill("evt-close", &fill_no_pos, Some(&pos("BTC", "0"))));
+        assert!(t.get_position("BTC").is_none(), "real close removes the position");
+    }
+
+    #[test]
+    fn get_status_does_not_deadlock() {
+        // L-RK1 regression: `get_status` used to call `get_leverage()` while
+        // holding the inner mutex — a self-deadlock. It must return promptly.
+        let t = AccountTracker::new();
+        t.update_fill(&fill("BTC", Side::Buy, "1.0", "50000", "c1"), false);
+        let status = t.get_status();
+        assert_eq!(status["fill_count"], 1);
+        assert_eq!(status["position_count"], 1);
+        assert!(status["leverage"].as_str().is_some());
     }
 }

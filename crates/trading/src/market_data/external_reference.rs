@@ -23,6 +23,10 @@ pub struct ExternalReferenceConfig {
     pub max_external_weight: Decimal,
     pub basis_ewma_alpha: Decimal,
     pub stale_after_ms: u64,
+    /// Max age of the basis calibration (ms); older calibrations are frozen —
+    /// not applied to the adjusted price and dropping the external weight
+    /// (M-MD10).
+    pub basis_max_age_ms: u64,
     pub max_perp_spot_divergence_bps: Decimal,
     pub max_mark_book_divergence_bps: Decimal,
 }
@@ -36,6 +40,7 @@ impl ExternalReferenceConfig {
         max_external_weight: Decimal,
         basis_ewma_alpha: Decimal,
         stale_after_ms: u64,
+        basis_max_age_ms: u64,
         max_perp_spot_divergence_bps: Decimal,
         max_mark_book_divergence_bps: Decimal,
     ) -> Self {
@@ -46,6 +51,7 @@ impl ExternalReferenceConfig {
             max_external_weight,
             basis_ewma_alpha,
             stale_after_ms,
+            basis_max_age_ms,
             max_perp_spot_divergence_bps,
             max_mark_book_divergence_bps,
         }
@@ -63,6 +69,8 @@ pub struct LatestExternalReferenceProvider {
     settings: ExternalReferenceConfig,
     quotes: HashMap<(String, ExternalMarket), ExternalVenueQuote>,
     basis_log_ewma: HashMap<String, f64>,
+    /// When the basis was last calibrated, for the max-age freeze (M-MD10).
+    basis_last_update: HashMap<String, DateTime<Utc>>,
     version: HashMap<String, u64>,
 }
 
@@ -72,6 +80,7 @@ impl LatestExternalReferenceProvider {
             settings,
             quotes: HashMap::new(),
             basis_log_ewma: HashMap::new(),
+            basis_last_update: HashMap::new(),
             version: HashMap::new(),
         }
     }
@@ -114,6 +123,10 @@ impl LatestExternalReferenceProvider {
                 None => observation,
             };
             self.basis_log_ewma.insert(symbol.to_string(), next);
+            // M-MD10: stamp the calibration so consumers can freeze it when it
+            // ages past `basis_max_age_ms`.
+            self.basis_last_update
+                .insert(symbol.to_string(), Utc::now());
             *self.version.entry(symbol.to_string()).or_default() += 1;
         }
         self.get_external_reference(symbol, Utc::now())
@@ -247,16 +260,37 @@ impl LatestExternalReferenceProvider {
             conf = 0.0;
             effective_weight = 0.0;
         }
+        // M-MD10: an aged basis calibration is frozen — not applied to the
+        // adjusted price and dropping the external weight entirely. With no
+        // calibration at all the basis is 0 (adjusted == raw), which is not a
+        // freeze condition.
+        let basis_fresh = match self.basis_last_update.get(symbol) {
+            Some(t) => (now - *t).num_milliseconds() <= self.settings.basis_max_age_ms as i64,
+            None => true,
+        };
+        if !basis_fresh {
+            tracing::debug!(symbol, "external_basis_frozen_stale");
+            conf = 0.0;
+            effective_weight = 0.0;
+        }
 
         let basis = self.basis_log_ewma.get(symbol).copied().unwrap_or(0.0);
-        let adjusted = Decimal::from_f64(dec_to_f64(raw) * basis.exp()).unwrap_or_default();
         let basis_bps = Decimal::from_f64((basis.exp() - 1.0) * 10_000.0).unwrap_or_default();
+        // The adjusted price is only meaningful while the basis is applied;
+        // with zero weight the external price must not influence decisions.
+        let adjusted_price = if effective_weight > 0.0 {
+            Some(Price::new(
+                Decimal::from_f64(dec_to_f64(raw) * basis.exp()).unwrap_or_default(),
+            ))
+        } else {
+            None
+        };
 
         ExternalReferenceSnapshot {
             source: "binance_spot_perpetual".into(),
             symbol: symbol.to_string(),
             raw_price: Some(Price::new(raw)),
-            adjusted_price: Some(Price::new(adjusted)),
+            adjusted_price,
             basis_bps,
             effective_weight: Decimal::from_f64(effective_weight).unwrap_or_default(),
             confidence: Decimal::from_f64(conf).unwrap_or_default(),
@@ -357,6 +391,7 @@ mod tests {
             max_external_weight: Decimal::from_scaled(35, 2),
             basis_ewma_alpha: Decimal::from_scaled(2, 2),
             stale_after_ms: 1500,
+            basis_max_age_ms: 300_000,
             max_perp_spot_divergence_bps: Decimal::from_scaled(25, 0),
             max_mark_book_divergence_bps: Decimal::from_scaled(25, 0),
         }
@@ -504,6 +539,39 @@ mod tests {
         let snapshot = provider.get_external_reference("BTC", Utc::now());
         assert!(snapshot.basis_bps != Decimal::ZERO);
         // Adjusted price reflects the basis.
+        assert!(snapshot.adjusted_price.is_some());
+    }
+
+    #[test]
+    fn stale_basis_is_frozen_and_weight_dropped() {
+        // M-MD10: once the basis calibration is older than basis_max_age_ms,
+        // the adjusted price is None and the external weight drops to zero —
+        // even while quotes are healthy.
+        let mut cfg = settings();
+        cfg.basis_max_age_ms = 100;
+        let mut provider = LatestExternalReferenceProvider::new(cfg);
+        provider.update_quote(quote("BTC", ExternalMarket::Spot, "49950", "50050", 1));
+        provider.update_quote(quote("BTC", ExternalMarket::Perpetual, "50000", "50100", 1));
+        provider.update_hyperliquid_mid("BTC", Decimal::from_scaled(50250, 0));
+        let fresh = provider.get_external_reference("BTC", Utc::now());
+        assert_eq!(fresh.quality, ExternalQuality::Healthy);
+        assert!(fresh.adjusted_price.is_some());
+        assert!(fresh.effective_weight > Decimal::ZERO);
+        // Age the calibration past the max age.
+        let aged = provider
+            .get_external_reference("BTC", Utc::now() + chrono::Duration::milliseconds(500));
+        assert_eq!(aged.effective_weight, Decimal::ZERO);
+        assert!(
+            aged.adjusted_price.is_none(),
+            "frozen basis → no adjusted price"
+        );
+        // Without any basis calibration the basis is 0 (adjusted == raw) — not
+        // a freeze condition.
+        let mut no_basis = LatestExternalReferenceProvider::new(settings());
+        no_basis.update_quote(quote("ETH", ExternalMarket::Spot, "19950", "20050", 1));
+        no_basis.update_quote(quote("ETH", ExternalMarket::Perpetual, "20000", "20100", 1));
+        let snapshot = no_basis.get_external_reference("ETH", Utc::now());
+        assert!(snapshot.effective_weight > Decimal::ZERO);
         assert!(snapshot.adjusted_price.is_some());
     }
 

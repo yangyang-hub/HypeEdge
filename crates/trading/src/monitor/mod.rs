@@ -4,15 +4,19 @@
 //!
 //! The metrics here are operational projections only. Callers must derive
 //! values from authoritative runtime/Postgres facts; Prometheus and ClickHouse
-//! are never used as order, PnL, quota, or configuration truth. This crate
-//! stays prometheus-free: [`MarketMakingMetrics`] is the write interface, and
-//! an in-memory implementation records observations for tests and wiring.
+//! are never used as order, PnL, quota, or configuration truth.
+//! [`MarketMakingMetrics`] is the write interface; [`InMemoryMarketMakingMetrics`]
+//! is a bounded, deterministic recording implementation for tests and wiring,
+//! and [`PrometheusMarketMakingMetrics`] mirrors the same interface onto the
+//! default Prometheus registry.
 
 pub mod alerts;
+pub mod prometheus;
 
 use hypeedge_domain::decimal::Decimal;
 
 pub use alerts::{AlertDispatcher, AlertPayload, AlertSeverity, LogAlertDispatcher};
+pub use prometheus::PrometheusMarketMakingMetrics;
 
 /// The freshness source for one market-making fact.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -268,9 +272,23 @@ type ReferencePriceRecord = (String, String, Decimal, Decimal);
 /// One recorded quote-uptime observation.
 type QuoteUptimeRecord = (String, String, String, Decimal);
 
+/// Maximum number of observations retained per metric dimension (P5-2): the
+/// in-memory implementation is bounded so a long-running process cannot grow
+/// its memory without limit.
+const IN_MEMORY_METRICS_CAP: usize = 256;
+
+/// Push `item`, evicting the oldest observation when `vec` is at capacity.
+fn push_bounded<T>(vec: &mut Vec<T>, item: T, cap: usize) {
+    if vec.len() >= cap {
+        vec.remove(0);
+    }
+    vec.push(item);
+}
+
 /// In-memory [`MarketMakingMetrics`] that records observations in bounded
 /// maps — deterministic, testable, and the default when no Prometheus registry
-/// is wired.
+/// is wired. Each dimension retains at most [`IN_MEMORY_METRICS_CAP`] of the
+/// most recent observations.
 #[derive(Debug, Default)]
 pub struct InMemoryMarketMakingMetrics {
     freshness: std::sync::Mutex<Vec<FreshnessRecord>>,
@@ -306,14 +324,18 @@ impl MarketMakingMetrics for InMemoryMarketMakingMetrics {
         max_age_seconds: f64,
         healthy: bool,
     ) {
-        self.freshness.lock().unwrap().push((
-            strategy_id.to_string(),
-            symbol.to_string(),
-            source,
-            age_seconds,
-            max_age_seconds,
-            healthy,
-        ));
+        push_bounded(
+            &mut self.freshness.lock().unwrap(),
+            (
+                strategy_id.to_string(),
+                symbol.to_string(),
+                source,
+                age_seconds,
+                max_age_seconds,
+                healthy,
+            ),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn set_reference_prices(
@@ -326,21 +348,33 @@ impl MarketMakingMetrics for InMemoryMarketMakingMetrics {
         if fair <= Decimal::ZERO || reservation <= Decimal::ZERO {
             return Err("reference prices must be positive".into());
         }
-        self.reference_prices.lock().unwrap().push((
-            strategy_id.to_string(),
-            symbol.to_string(),
-            fair,
-            reservation,
-        ));
+        push_bounded(
+            &mut self.reference_prices.lock().unwrap(),
+            (
+                strategy_id.to_string(),
+                symbol.to_string(),
+                fair,
+                reservation,
+            ),
+            IN_MEMORY_METRICS_CAP,
+        );
         Ok(())
     }
 
     fn set_external_reference(&self, observation: &ExternalReferenceObservation) {
-        self.external.lock().unwrap().push(observation.clone());
+        push_bounded(
+            &mut self.external.lock().unwrap(),
+            observation.clone(),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn set_quote(&self, observation: &QuoteObservation) {
-        self.quotes.lock().unwrap().push(observation.clone());
+        push_bounded(
+            &mut self.quotes.lock().unwrap(),
+            observation.clone(),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn set_quote_uptime(
@@ -353,21 +387,33 @@ impl MarketMakingMetrics for InMemoryMarketMakingMetrics {
         if ratio < Decimal::ZERO || ratio > Decimal::ONE {
             return Err("quote uptime ratio must be in [0, 1]".into());
         }
-        self.quote_uptime.lock().unwrap().push((
-            strategy_id.to_string(),
-            symbol.to_string(),
-            window.to_string(),
-            ratio,
-        ));
+        push_bounded(
+            &mut self.quote_uptime.lock().unwrap(),
+            (
+                strategy_id.to_string(),
+                symbol.to_string(),
+                window.to_string(),
+                ratio,
+            ),
+            IN_MEMORY_METRICS_CAP,
+        );
         Ok(())
     }
 
     fn set_inventory(&self, observation: &InventoryObservation) {
-        self.inventory.lock().unwrap().push(observation.clone());
+        push_bounded(
+            &mut self.inventory.lock().unwrap(),
+            observation.clone(),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn set_action_budget(&self, observation: &ActionBudgetObservation) {
-        self.budget.lock().unwrap().push(observation.clone());
+        push_bounded(
+            &mut self.budget.lock().unwrap(),
+            observation.clone(),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn record_execution_outcome(
@@ -377,47 +423,53 @@ impl MarketMakingMetrics for InMemoryMarketMakingMetrics {
         outcome: ExecutionOutcome,
         count: u64,
     ) {
-        self.outcomes.lock().unwrap().push((
-            strategy_id.to_string(),
-            symbol.to_string(),
-            outcome,
-            count,
-        ));
+        push_bounded(
+            &mut self.outcomes.lock().unwrap(),
+            (strategy_id.to_string(), symbol.to_string(), outcome, count),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn set_unknown_orders(&self, strategy_id: &str, symbol: &str, count: u64) {
-        self.unknown_orders.lock().unwrap().push((
-            strategy_id.to_string(),
-            symbol.to_string(),
-            count,
-        ));
+        push_bounded(
+            &mut self.unknown_orders.lock().unwrap(),
+            (strategy_id.to_string(), symbol.to_string(), count),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn observe_latency(&self, strategy_id: &str, symbol: &str, stage: LatencyStage, seconds: f64) {
-        self.latency.lock().unwrap().push((
-            strategy_id.to_string(),
-            symbol.to_string(),
-            stage,
-            seconds,
-        ));
+        push_bounded(
+            &mut self.latency.lock().unwrap(),
+            (strategy_id.to_string(), symbol.to_string(), stage, seconds),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn set_reconciliation_diff(&self, strategy_id: &str, symbol: &str, severity: &str, count: u64) {
-        self.reconciliation.lock().unwrap().push((
-            strategy_id.to_string(),
-            symbol.to_string(),
-            severity.to_string(),
-            count,
-        ));
+        push_bounded(
+            &mut self.reconciliation.lock().unwrap(),
+            (
+                strategy_id.to_string(),
+                symbol.to_string(),
+                severity.to_string(),
+                count,
+            ),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn set_runtime(&self, strategy_id: &str, symbol: &str, state: &str, config_version: i64) {
-        self.runtime.lock().unwrap().push((
-            strategy_id.to_string(),
-            symbol.to_string(),
-            state.to_string(),
-            config_version,
-        ));
+        push_bounded(
+            &mut self.runtime.lock().unwrap(),
+            (
+                strategy_id.to_string(),
+                symbol.to_string(),
+                state.to_string(),
+                config_version,
+            ),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn set_canary_directive(
@@ -427,23 +479,32 @@ impl MarketMakingMetrics for InMemoryMarketMakingMetrics {
         directive: &str,
         enabled: bool,
     ) {
-        self.canary.lock().unwrap().push((
-            strategy_id.to_string(),
-            symbol.to_string(),
-            directive.to_string(),
-            enabled,
-        ));
+        push_bounded(
+            &mut self.canary.lock().unwrap(),
+            (
+                strategy_id.to_string(),
+                symbol.to_string(),
+                directive.to_string(),
+                enabled,
+            ),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn set_postgres_available(&self, available: bool) {
-        self.postgres_available.lock().unwrap().push(available);
+        push_bounded(
+            &mut self.postgres_available.lock().unwrap(),
+            available,
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 
     fn record_emergency_cancel_failure(&self, sub_account: &str) {
-        self.emergency_failures
-            .lock()
-            .unwrap()
-            .push(sub_account.to_string());
+        push_bounded(
+            &mut self.emergency_failures.lock().unwrap(),
+            sub_account.to_string(),
+            IN_MEMORY_METRICS_CAP,
+        );
     }
 }
 
@@ -536,5 +597,27 @@ mod tests {
         });
         assert_eq!(m.inventory.lock().unwrap()[0].band, InventoryBand::Soft);
         assert_eq!(m.budget.lock().unwrap()[0].mode, "normal");
+    }
+
+    #[test]
+    fn in_memory_metrics_are_bounded() {
+        // P5-2: each dimension keeps at most IN_MEMORY_METRICS_CAP records,
+        // evicting the oldest.
+        let m = InMemoryMarketMakingMetrics::new();
+        for i in 0..(IN_MEMORY_METRICS_CAP + 100) {
+            m.observe_freshness("s", "BTC", FreshnessSource::Feed, i as f64, 6.0, true);
+            m.record_emergency_cancel_failure("0xabc");
+        }
+        let freshness = m.freshness.lock().unwrap();
+        assert_eq!(freshness.len(), IN_MEMORY_METRICS_CAP);
+        assert_eq!(
+            freshness.first().unwrap().3 as usize,
+            100,
+            "oldest record evicted, newest kept"
+        );
+        assert_eq!(
+            m.emergency_failures.lock().unwrap().len(),
+            IN_MEMORY_METRICS_CAP
+        );
     }
 }

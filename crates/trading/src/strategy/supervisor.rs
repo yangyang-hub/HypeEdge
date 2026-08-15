@@ -139,11 +139,14 @@ impl StrategySupervisor {
 
     /// Rebuild a handle from the durable definition via the registry
     /// (`_start_locked`): runs through WARMING → SHADOW → RUNNING regardless of
-    /// the transition table.
+    /// the transition table. `expected_revision` is the caller's optimistic
+    /// concurrency token forwarded to the `set_desired` fence (M-ST8); when
+    /// absent, the just-fetched instance revision is used.
     async fn start_locked(
         &self,
         instance: &StrategyInstanceDefinition,
         target: MarketMakerLifecycle,
+        expected_revision: Option<u64>,
     ) -> Result<(), String> {
         let config = self
             .state_store
@@ -169,7 +172,7 @@ impl StrategySupervisor {
                 &instance.strategy_id,
                 Some(target),
                 None,
-                Some(instance.revision),
+                expected_revision.or(Some(instance.revision)),
             )
             .await?;
         let _ = self
@@ -187,6 +190,27 @@ impl StrategySupervisor {
             .lock()
             .await
             .insert(instance.strategy_id.clone(), handle);
+        Ok(())
+    }
+
+    /// Capability gate (H-ST2): a target state must be within the type's
+    /// declared capabilities. Shadow is rejected for types that declare
+    /// `supports_shadow == false`; types without a plugin declaration are
+    /// treated as legacy/unmanaged and allowed through.
+    fn check_target_capability(
+        &self,
+        instance: &StrategyInstanceDefinition,
+        target: MarketMakerLifecycle,
+    ) -> Result<(), String> {
+        if target == MarketMakerLifecycle::Shadow
+            && let Some(caps) = self.registry.capabilities(&instance.strategy_type)
+            && !caps.supports_shadow
+        {
+            return Err(format!(
+                "strategy type {} does not support shadow mode (capability gate)",
+                instance.strategy_type
+            ));
+        }
         Ok(())
     }
 
@@ -210,12 +234,18 @@ impl StrategySupervisor {
             .get_instance(strategy_id)
             .await?
             .ok_or_else(|| format!("unknown strategy {strategy_id}"))?;
+        self.check_target_capability(&instance, target)?;
         // Ensure allocation.
         let _allocation = self
             .allocations
             .acquire(strategy_id, &instance.sub_account, &instance.symbol)
             .await?;
-        self.start_locked(&instance, target).await?;
+        if let Err(e) = self.start_locked(&instance, target, expected_revision).await {
+            // M-ST4: a failed start must not leak the (sub_account, symbol)
+            // lease.
+            let _ = self.allocations.release(strategy_id).await;
+            return Err(e);
+        }
         // Refresh runtime state (set_desired may bump the instance revision).
         let runtime =
             self.state_store
@@ -228,7 +258,6 @@ impl StrategySupervisor {
                     revision: 0,
                     reason: None,
                 });
-        let _ = expected_revision;
         Ok(runtime)
     }
 
@@ -326,7 +355,7 @@ impl StrategySupervisor {
         // Rebuild the handle if missing (start_locked passes through to desired).
         if self.handle(strategy_id).await.is_none() {
             let instance = self.state_store.get_instance(strategy_id).await?.unwrap();
-            self.start_locked(&instance, desired).await?;
+            self.start_locked(&instance, desired, None).await?;
         } else if let Some(handle) = self.handle(strategy_id).await {
             handle.set_mode(desired).await?;
         }
@@ -362,7 +391,16 @@ impl StrategySupervisor {
             .get_instance(strategy_id)
             .await?
             .ok_or_else(|| format!("unknown strategy {strategy_id}"))?;
-        self.start_locked(&instance, target).await?;
+        self.check_target_capability(&instance, target)?;
+        // M-ST4: resume is a start-like path and must hold the lease.
+        let _allocation = self
+            .allocations
+            .acquire(strategy_id, &instance.sub_account, &instance.symbol)
+            .await?;
+        if let Err(e) = self.start_locked(&instance, target, None).await {
+            let _ = self.allocations.release(strategy_id).await;
+            return Err(e);
+        }
         self.state_store
             .get_runtime(strategy_id)
             .await?
@@ -475,7 +513,7 @@ impl StrategySupervisor {
             )
             .await?;
         let instance = self.state_store.get_instance(strategy_id).await?.unwrap();
-        self.start_locked(&instance, target).await?;
+        self.start_locked(&instance, target, None).await?;
         Ok(())
     }
 
@@ -510,70 +548,181 @@ impl StrategySupervisor {
                 expected_revision,
             )
             .await?;
+        // H-ST3: keep desired/effective consistent. restore() (re)builds the
+        // runtime from `desired_config_revision`, so an activation that only
+        // bumps the effective revision would silently roll back to the old
+        // config on the next restart.
+        self.state_store
+            .set_desired(strategy_id, None, Some(config_revision), expected_revision)
+            .await?;
         Ok(())
     }
 
-    /// Reconciliation on restart: restore all instances.
+    /// Reconciliation on restart: restore all instances. One broken instance
+    /// (M-ST7) is latched to FAULTED and logged; the remaining instances are
+    /// still restored.
     pub async fn restore(&self) -> Result<Vec<StrategyRuntimeState>, String> {
         let instances = self.state_store.list_instances().await?;
         let mut states = Vec::new();
         for instance in instances {
-            let runtime = self
-                .state_store
-                .get_runtime(&instance.strategy_id)
-                .await?
-                .unwrap_or(StrategyRuntimeState {
-                    strategy_id: instance.strategy_id.clone(),
-                    actual_state: MarketMakerLifecycle::Stopped,
-                    effective_config_revision: None,
-                    revision: 0,
-                    reason: None,
-                });
-            match runtime.actual_state {
-                MarketMakerLifecycle::Faulted => {
-                    // Latch to FAULTED.
-                    self.state_store
+            match self.restore_one(&instance).await {
+                Ok(runtime) => states.push(runtime),
+                Err(e) => {
+                    tracing::error!(
+                        strategy_id = %instance.strategy_id,
+                        error = %e,
+                        "strategy_restore_instance_failed"
+                    );
+                    // Do not let one bad instance abort the restore of the rest.
+                    let _ = self
+                        .state_store
                         .set_desired(
                             &instance.strategy_id,
                             Some(MarketMakerLifecycle::Faulted),
                             None,
                             None,
                         )
-                        .await?;
-                }
-                MarketMakerLifecycle::Stopped => {
-                    self.allocations.release(&instance.strategy_id).await?;
-                }
-                MarketMakerLifecycle::Paused | MarketMakerLifecycle::Draining => {
-                    let target = if instance.desired_state == MarketMakerLifecycle::Shadow {
-                        MarketMakerLifecycle::Shadow
-                    } else {
-                        MarketMakerLifecycle::Running
-                    };
-                    self.start_locked(&instance, target).await?;
-                    // Re-apply pause/drain.
-                    if let Some(handle) = self.handle(&instance.strategy_id).await {
-                        handle.set_mode(runtime.actual_state).await?;
-                    }
-                }
-                _ => {
-                    let target = if instance.desired_state == MarketMakerLifecycle::Shadow {
-                        MarketMakerLifecycle::Shadow
-                    } else {
-                        MarketMakerLifecycle::Running
-                    };
-                    self.start_locked(&instance, target).await?;
+                        .await;
+                    let _ = self
+                        .state_store
+                        .set_runtime(
+                            &instance.strategy_id,
+                            Some(MarketMakerLifecycle::Faulted),
+                            None,
+                            false,
+                            Some(&format!("restore_failed:{e}")),
+                            None,
+                        )
+                        .await;
+                    let _ = self.allocations.release(&instance.strategy_id).await;
+                    // Keep the one-state-per-instance contract for callers.
+                    states.push(StrategyRuntimeState {
+                        strategy_id: instance.strategy_id.clone(),
+                        actual_state: MarketMakerLifecycle::Faulted,
+                        effective_config_revision: None,
+                        revision: 0,
+                        reason: Some(format!("restore_failed:{e}")),
+                    });
                 }
             }
-            states.push(runtime);
         }
         Ok(states)
+    }
+
+    /// Restore a single instance to its desired lifecycle, holding the
+    /// (sub_account, symbol) lease while it runs (M-ST4).
+    async fn restore_one(
+        &self,
+        instance: &StrategyInstanceDefinition,
+    ) -> Result<StrategyRuntimeState, String> {
+        let runtime = self
+            .state_store
+            .get_runtime(&instance.strategy_id)
+            .await?
+            .unwrap_or(StrategyRuntimeState {
+                strategy_id: instance.strategy_id.clone(),
+                actual_state: MarketMakerLifecycle::Stopped,
+                effective_config_revision: None,
+                revision: 0,
+                reason: None,
+            });
+        match runtime.actual_state {
+            MarketMakerLifecycle::Faulted => {
+                // Latch to FAULTED.
+                self.state_store
+                    .set_desired(
+                        &instance.strategy_id,
+                        Some(MarketMakerLifecycle::Faulted),
+                        None,
+                        None,
+                    )
+                    .await?;
+                self.allocations.release(&instance.strategy_id).await?;
+            }
+            MarketMakerLifecycle::Stopped => {
+                self.allocations.release(&instance.strategy_id).await?;
+            }
+            MarketMakerLifecycle::Paused | MarketMakerLifecycle::Draining => {
+                let target = self.resolve_restore_target(instance);
+                let _allocation = self
+                    .allocations
+                    .acquire(
+                        &instance.strategy_id,
+                        &instance.sub_account,
+                        &instance.symbol,
+                    )
+                    .await?;
+                self.start_locked(instance, target, None).await?;
+                // Re-apply pause/drain.
+                if let Some(handle) = self.handle(&instance.strategy_id).await {
+                    handle.set_mode(runtime.actual_state).await?;
+                }
+            }
+            _ => {
+                let target = self.resolve_restore_target(instance);
+                let _allocation = self
+                    .allocations
+                    .acquire(
+                        &instance.strategy_id,
+                        &instance.sub_account,
+                        &instance.symbol,
+                    )
+                    .await?;
+                self.start_locked(instance, target, None).await?;
+            }
+        }
+        Ok(runtime)
+    }
+
+    /// Map a persisted `desired_state` of SHADOW to the restored target. Types
+    /// that do not support shadow (H-ST2) come back up as running; everything
+    /// else restores to the desired state.
+    fn resolve_restore_target(&self, instance: &StrategyInstanceDefinition) -> MarketMakerLifecycle {
+        if instance.desired_state == MarketMakerLifecycle::Shadow {
+            let supports = self
+                .registry
+                .capabilities(&instance.strategy_type)
+                .map(|caps| caps.supports_shadow)
+                .unwrap_or(false);
+            if supports {
+                return MarketMakerLifecycle::Shadow;
+            }
+        }
+        MarketMakerLifecycle::Running
     }
 
     pub async fn runtime_snapshot(
         &self,
         strategy_id: &str,
     ) -> Result<Option<StrategyRuntimeState>, String> {
+        // M-ST2 lightweight supervision: a lifecycle query is a cheap chance to
+        // notice a crashed runner task. If the handle's worker died without a
+        // supervised stop, fault the instance (and log loudly) so the operator
+        // sees it instead of a silently dead strategy.
+        if let Some(handle) = self.handle(strategy_id).await
+            && !handle.is_healthy()
+        {
+            tracing::error!(
+                strategy_id,
+                "strategy_runner_unhealthy_faulting"
+            );
+            let reason = "runner_crashed";
+            self.state_store
+                .set_runtime(
+                    strategy_id,
+                    Some(MarketMakerLifecycle::Faulted),
+                    None,
+                    false,
+                    Some(reason),
+                    None,
+                )
+                .await?;
+            self.state_store
+                .set_desired(strategy_id, Some(MarketMakerLifecycle::Faulted), None, None)
+                .await?;
+            handle.stop().await?;
+            self.handles.lock().await.remove(strategy_id);
+        }
         self.state_store.get_runtime(strategy_id).await
     }
 }
@@ -878,6 +1027,276 @@ mod tests {
         let supervisor =
             StrategySupervisor::new(registry.clone(), store.clone(), allocations.clone());
         (registry, store, allocations, supervisor)
+    }
+
+    /// A registry with real plugin capabilities (trend_follow: no shadow;
+    /// market_maker: shadow) whose factory records the config revision each
+    /// built handle was created from (for restart-load assertions).
+    async fn setup_with_plugins() -> (
+        Arc<StrategyRegistry>,
+        Arc<InMemoryStrategyStateStore>,
+        Arc<InMemoryStrategyAllocationManager>,
+        StrategySupervisor,
+        Arc<std::sync::Mutex<Vec<u64>>>,
+    ) {
+        use crate::strategy::registry::{
+            StrategyBuildContext, StrategyTypePlugin, market_maker_capabilities,
+            trend_follow_capabilities,
+        };
+        let mut registry = StrategyRegistry::new();
+        let built = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let tf_built = built.clone();
+        registry.register_plugin(StrategyTypePlugin {
+            strategy_type: "trend_follow".to_string(),
+            capabilities: trend_follow_capabilities(),
+            factory: Arc::new(move |ctx: &StrategyBuildContext| {
+                tf_built.lock().unwrap().push(ctx.config.revision);
+                Arc::new(RecordingHandle {
+                    modes: tokio::sync::Mutex::new(Vec::new()),
+                })
+            }),
+        });
+        registry.register_plugin(StrategyTypePlugin {
+            strategy_type: "market_maker".to_string(),
+            capabilities: market_maker_capabilities(),
+            factory: Arc::new(|_| {
+                Arc::new(RecordingHandle {
+                    modes: tokio::sync::Mutex::new(Vec::new()),
+                })
+            }),
+        });
+        let registry = Arc::new(registry);
+        let store = Arc::new(InMemoryStrategyStateStore::new());
+        let allocations = Arc::new(InMemoryStrategyAllocationManager::new());
+        let supervisor =
+            StrategySupervisor::new(registry.clone(), store.clone(), allocations.clone());
+        (registry, store, allocations, supervisor, built)
+    }
+
+    async fn seed_plugin_instance(
+        store: &Arc<InMemoryStrategyStateStore>,
+        strategy_id: &str,
+        strategy_type: &str,
+        symbol: &str,
+        config_revision: u64,
+    ) {
+        store
+            .insert_instance(StrategyInstanceDefinition {
+                strategy_id: strategy_id.into(),
+                strategy_type: strategy_type.into(),
+                sub_account: "sub1".into(),
+                symbol: symbol.into(),
+                desired_state: MarketMakerLifecycle::Stopped,
+                desired_config_revision: config_revision,
+                revision: 0,
+            })
+            .await;
+        store
+            .insert_config(StrategyConfigSnapshot {
+                strategy_id: strategy_id.into(),
+                revision: config_revision,
+                values: serde_json::json!({"fast_ema_period": 12}),
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn start_shadow_rejected_for_trend_follow() {
+        // H-ST2: the capability gate must reject Shadow for trend_follow
+        // (accepting it would silently run the strategy for real).
+        let (_, store, allocations, sup, _) = setup_with_plugins().await;
+        seed_plugin_instance(&store, "tf_1", "trend_follow", "BTC", 1).await;
+
+        let err = sup
+            .start("tf_1", MarketMakerLifecycle::Shadow, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("shadow"), "got: {err}");
+        // The gate must reject before acquiring the lease.
+        assert!(
+            allocations.get("tf_1").await.unwrap().is_none(),
+            "a rejected start must not hold an allocation"
+        );
+
+        // Running is still allowed.
+        sup.start("tf_1", MarketMakerLifecycle::Running, None)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn start_shadow_allowed_for_market_maker() {
+        // H-ST2: market_maker declares supports_shadow and is unaffected.
+        let (_, store, _, sup, _) = setup_with_plugins().await;
+        seed_plugin_instance(&store, "mm_1", "market_maker", "ETH", 1).await;
+
+        let started = sup
+            .start("mm_1", MarketMakerLifecycle::Shadow, None)
+            .await
+            .unwrap();
+        assert_eq!(started.actual_state, MarketMakerLifecycle::Shadow);
+    }
+
+    #[tokio::test]
+    async fn activate_config_updates_desired_and_survives_restart() {
+        // H-ST3: activation must keep desired_config_revision == effective so a
+        // restart reloads the new config instead of rolling back.
+        let (registry, store, allocations, sup, built) = setup_with_plugins().await;
+        seed_plugin_instance(&store, "tf_1", "trend_follow", "BTC", 1).await;
+        sup.start("tf_1", MarketMakerLifecycle::Running, None)
+            .await
+            .unwrap();
+        store
+            .insert_config(StrategyConfigSnapshot {
+                strategy_id: "tf_1".into(),
+                revision: 2,
+                values: serde_json::json!({"fast_ema_period": 21}),
+            })
+            .await;
+
+        sup.activate_config("tf_1", 2, None).await.unwrap();
+
+        let instance = store.get_instance("tf_1").await.unwrap().unwrap();
+        assert_eq!(
+            instance.desired_config_revision, 2,
+            "desired must track the activated config"
+        );
+        let runtime = store.get_runtime("tf_1").await.unwrap().unwrap();
+        assert_eq!(runtime.effective_config_revision, Some(2));
+
+        // Simulate a restart: a fresh supervisor over the same durable store
+        // must rebuild the handle from config revision 2.
+        let restarted = StrategySupervisor::new(registry, store.clone(), allocations.clone());
+        restarted.restore().await.unwrap();
+        assert_eq!(
+            *built.lock().unwrap(),
+            vec![1, 2],
+            "restore must rebuild with the activated config revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_acquires_allocation_and_failure_does_not_leak() {
+        // M-ST4: restore acquires the lease for a running instance; a start
+        // that fails after acquiring must release it again.
+        let (_, store, allocations, sup, _) = setup_with_plugins().await;
+        seed_plugin_instance(&store, "tf_1", "trend_follow", "BTC", 1).await;
+        store
+            .set_runtime(
+                "tf_1",
+                Some(MarketMakerLifecycle::Running),
+                None,
+                false,
+                Some("pre_restart"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        sup.restore().await.unwrap();
+        assert!(
+            allocations.get("tf_1").await.unwrap().is_some(),
+            "restore must hold the (sub_account, symbol) lease"
+        );
+
+        // A second instance whose config is missing → start fails → lease must
+        // not leak.
+        store
+            .insert_instance(StrategyInstanceDefinition {
+                strategy_id: "tf_bad".into(),
+                strategy_type: "trend_follow".into(),
+                sub_account: "sub1".into(),
+                symbol: "SOL".into(),
+                desired_state: MarketMakerLifecycle::Stopped,
+                desired_config_revision: 99,
+                revision: 0,
+            })
+            .await;
+        let err = sup
+            .start("tf_bad", MarketMakerLifecycle::Running, None)
+            .await
+            .unwrap_err();
+        assert!(err.contains("config 99 missing"), "got: {err}");
+        assert!(
+            allocations.get("tf_bad").await.unwrap().is_none(),
+            "a failed start must release its lease"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_continues_after_instance_failure() {
+        // M-ST7: one instance with a broken config must be latched to FAULTED
+        // while the remaining instances are still restored.
+        let (_, store, _, sup, _) = setup_with_plugins().await;
+        // Good instance.
+        seed_plugin_instance(&store, "tf_good", "trend_follow", "BTC", 1).await;
+        store
+            .set_runtime(
+                "tf_good",
+                Some(MarketMakerLifecycle::Running),
+                None,
+                false,
+                Some("pre_restart"),
+                None,
+            )
+            .await
+            .unwrap();
+        // Broken instance: runtime says running but its config revision is gone.
+        store
+            .insert_instance(StrategyInstanceDefinition {
+                strategy_id: "tf_bad".into(),
+                strategy_type: "trend_follow".into(),
+                sub_account: "sub1".into(),
+                symbol: "SOL".into(),
+                desired_state: MarketMakerLifecycle::Stopped,
+                desired_config_revision: 99,
+                revision: 0,
+            })
+            .await;
+        store
+            .set_runtime(
+                "tf_bad",
+                Some(MarketMakerLifecycle::Running),
+                None,
+                false,
+                Some("pre_restart"),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let states = sup.restore().await.expect("restore must not abort");
+
+        let good = store.get_runtime("tf_good").await.unwrap().unwrap();
+        assert_eq!(good.actual_state, MarketMakerLifecycle::Running);
+        let bad = store.get_runtime("tf_bad").await.unwrap().unwrap();
+        assert_eq!(bad.actual_state, MarketMakerLifecycle::Faulted);
+        assert!(
+            bad.reason.as_deref().unwrap_or("").contains("restore_failed"),
+            "fault reason must explain the restore failure, got {:?}",
+            bad.reason
+        );
+        assert_eq!(states.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn start_honors_expected_revision() {
+        // M-ST8: start() must forward the caller's expected_revision into the
+        // set_desired fence (stale callers get a revision conflict).
+        let (_, store, _, sup, _) = setup_with_plugins().await;
+        seed_plugin_instance(&store, "tf_1", "trend_follow", "BTC", 1).await;
+
+        // Instance revision is 0 at seed → a start with expected=0 succeeds.
+        sup.start("tf_1", MarketMakerLifecycle::Running, Some(0))
+            .await
+            .unwrap();
+
+        // The start bumped the revision; the same expected token is now stale.
+        let err = sup
+            .start("tf_1", MarketMakerLifecycle::Running, Some(0))
+            .await
+            .unwrap_err();
+        assert!(err.contains("revision conflict"), "got: {err}");
     }
 
     #[tokio::test]

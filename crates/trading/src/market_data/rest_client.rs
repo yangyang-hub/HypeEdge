@@ -477,6 +477,39 @@ impl crate::account::InfoClient for RestClient {
             .ok_or_else(|| "historicalOrders: expected array".into())
     }
 
+    /// M-RK7: server-side windowed page of historical orders.
+    ///
+    /// Hyperliquid's `historicalOrders` accepts `startTime`/`endTime` and caps
+    /// a single response at ~2000 rows, so a client-side-filtered full pull
+    /// would truncate deep history. This override pushes the window to the
+    /// exchange; the ingestor's recovery loop then pages forward on the last
+    /// `statusTimestamp`, recovering arbitrarily deep order history. Note the
+    /// exchange expects the window under a `req` object for this endpoint
+    /// (unlike `userFillsByTime`, which is flat).
+    async fn historical_orders_paged(
+        &self,
+        account: &str,
+        start_ms: i64,
+        end_ms: i64,
+    ) -> Result<Vec<Value>, String> {
+        if start_ms >= end_ms {
+            return Ok(Vec::new());
+        }
+        let resp = self
+            .post_info(
+                "historicalOrders",
+                Some(&json!({
+                    "req": { "user": account, "startTime": start_ms, "endTime": end_ms }
+                })),
+                1,
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        resp.as_array()
+            .cloned()
+            .ok_or_else(|| "historicalOrders: expected array".into())
+    }
+
     async fn user_fills_by_time(
         &self,
         account: &str,
@@ -577,6 +610,7 @@ fn int_of(row: &Value, key: &str) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::account::exchange_ingestor::InfoClient;
 
     #[test]
     fn interval_conversion() {
@@ -604,5 +638,160 @@ mod tests {
         let client = RestClient::new("http://127.0.0.1:1", limiter, 500).unwrap();
         assert_eq!(client.base_url, "http://127.0.0.1:1");
         assert_eq!(client.backfill_batch_size, 500);
+    }
+
+    /// Read one HTTP/1.1 request head + body from a raw stream. Does not touch
+    /// the write half (the caller writes the response afterwards).
+    async fn read_http_request(stream: &mut tokio::net::TcpStream) -> (String, String) {
+        use tokio::io::AsyncReadExt;
+        let mut head = Vec::new();
+        let mut byte = [0u8; 1];
+        loop {
+            match stream.read(&mut byte).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    head.push(byte[0]);
+                    if head.ends_with(b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        let head_str = String::from_utf8_lossy(&head).to_string();
+        let content_length = head_str
+            .lines()
+            .find_map(|l| {
+                let (name, value) = l.split_once(':')?;
+                if name.trim().eq_ignore_ascii_case("content-length") {
+                    value.trim().parse::<usize>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0);
+        let mut body = vec![0u8; content_length];
+        if content_length > 0 {
+            let _ = stream.read_exact(&mut body).await;
+        }
+        (head_str, String::from_utf8_lossy(&body).to_string())
+    }
+
+    /// Reply with a JSON body over a raw HTTP/1.1 stream, then close. Errors
+    /// during teardown are ignored (the client may already be gone).
+    async fn respond_json(stream: &mut tokio::net::TcpStream, value: &Value) {
+        use tokio::io::AsyncWriteExt;
+        let body = value.to_string();
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = stream.write_all(resp.as_bytes()).await;
+        let _ = stream.shutdown().await;
+    }
+
+    /// A minimal in-test `/info` server: serves one canned JSON response per
+    /// accepted connection and records each request body it received. Returns
+    /// the base URL (the listener is owned by the spawned task) and a channel
+    /// that receives the recorded request bodies.
+    async fn serve_info(
+        responses: Vec<Value>,
+    ) -> (String, tokio::sync::oneshot::Receiver<Vec<Value>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let mut bodies = Vec::new();
+            for response in responses {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let (_head, body) = read_http_request(&mut sock).await;
+                bodies.push(serde_json::from_str(&body).unwrap_or(Value::Null));
+                respond_json(&mut sock, &response).await;
+            }
+            let _ = tx.send(bodies);
+        });
+        (addr, rx)
+    }
+
+    #[tokio::test]
+    async fn historical_orders_paged_windows_and_advances_cursor() {
+        // M-RK7: the override must (1) send a server-side windowed request
+        // (req.startTime/req.endTime), (2) return each page as-is, and (3) let
+        // the caller's cursor advance — the second request must carry
+        // startTime == the last statusTimestamp of the first page, so deep
+        // history is never truncated at the ~2000-row server cap.
+        use crate::account::exchange_ingestor::order_status_timestamp_ms;
+
+        let page1_rows: Vec<Value> = (0..2000u64)
+            .map(|i| json!({ "statusTimestamp": 1_000_000 + i as i64, "oid": i, "coin": "BTC" }))
+            .collect();
+        let page2_rows: Vec<Value> = (0..500u64)
+            .map(|i| json!({ "statusTimestamp": 1_002_000 + i as i64, "oid": i, "coin": "BTC" }))
+            .collect();
+        let (addr, rx) = serve_info(vec![json!(&page1_rows), json!(&page2_rows)]).await;
+        let limiter = Arc::new(RateLimiter::new(1200, 100));
+        let client = RestClient::new(&format!("http://{addr}"), limiter, 500).unwrap();
+
+        let window_end = 2_000_000i64;
+        let page1 = client
+            .historical_orders_paged("0xabc", 999, window_end)
+            .await
+            .unwrap();
+        assert_eq!(page1.len(), 2000, "first page capped like the exchange");
+        let last1 = order_status_timestamp_ms(page1.last().unwrap());
+        assert_eq!(last1, 1_001_999);
+
+        let page2 = client
+            .historical_orders_paged("0xabc", last1, window_end)
+            .await
+            .unwrap();
+        assert_eq!(page2.len(), 500, "second page returns the remainder");
+        assert!(
+            order_status_timestamp_ms(page2.first().unwrap()) > last1,
+            "cursor must not regress"
+        );
+
+        let bodies = rx.await.unwrap();
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[0]["type"], "historicalOrders");
+        assert_eq!(bodies[0]["req"]["user"], "0xabc");
+        assert_eq!(bodies[0]["req"]["startTime"], 999);
+        assert_eq!(bodies[0]["req"]["endTime"], window_end);
+        assert_eq!(
+            bodies[1]["req"]["startTime"], last1,
+            "cursor advanced to the last statusTimestamp of the previous page"
+        );
+    }
+
+    #[tokio::test]
+    async fn historical_orders_paged_empty_window_is_noop() {
+        let limiter = Arc::new(RateLimiter::new(1200, 100));
+        let client = RestClient::new("http://127.0.0.1:1", limiter, 500).unwrap();
+        // start >= end: returns empty without any HTTP round trip.
+        let out = client
+            .historical_orders_paged("0xabc", 5_000, 5_000)
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+        let out = client
+            .historical_orders_paged("0xabc", 9_000, 5_000)
+            .await
+            .unwrap();
+        assert!(out.is_empty());
+    }
+
+    #[tokio::test]
+    async fn historical_orders_paged_non_array_response_errors() {
+        let (addr, rx) = serve_info(vec![json!({ "error": "boom" })]).await;
+        let limiter = Arc::new(RateLimiter::new(1200, 100));
+        let client = RestClient::new(&format!("http://{addr}"), limiter, 500).unwrap();
+        let err = client
+            .historical_orders_paged("0xabc", 0, 1_000)
+            .await
+            .unwrap_err();
+        assert!(err.contains("expected array"), "got: {err}");
+        let bodies = rx.await.unwrap();
+        assert_eq!(bodies[0]["req"]["startTime"], 0);
+        assert_eq!(bodies[0]["req"]["endTime"], 1_000);
     }
 }
