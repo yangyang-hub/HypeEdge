@@ -36,6 +36,11 @@ impl AccountSnapshotSink for PostgresAccountSnapshotStore {
         let account = &snapshot.account_state;
         let sub_account = account.sub_account.as_deref();
 
+        // NOTE (C2): `action_credits_remaining` is intentionally NOT written —
+        // `PolledAccountSnapshot` carries no `userRateLimit` field, so the
+        // column stays NULL. `AccountStateRow.action_credits_remaining` is an
+        // `Option<i64>` so the DB risk scope's `SELECT * FROM account_state`
+        // decodes NULL instead of failing the whole placement path.
         sqlx::query(
             r#"
             INSERT INTO account_state (

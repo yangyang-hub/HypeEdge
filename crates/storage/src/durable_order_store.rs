@@ -75,6 +75,36 @@ impl PostgresDurableOrderStore {
 
         let mut tx: Transaction<'_, Postgres> = pool.begin().await.map_err(map_sqlx)?;
 
+        // Idempotency (M-PG): a placement retried for an already-persisted cloid
+        // (crash between commit and the in-memory store, or a duplicate submit)
+        // must not duplicate the order row. Reuse the persisted outcome; the
+        // `UNIQUE (cloid)` constraint stays as the concurrent-race fallback.
+        let existing: Option<OrderRow> =
+            sqlx::query_as::<_, OrderRow>("SELECT * FROM orders WHERE cloid = $1 FOR UPDATE")
+                .bind(&order.cloid)
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(map_sqlx)?;
+        if let Some(existing) = existing {
+            let status = OrderStatus::from_str(&existing.status).unwrap_or(OrderStatus::Pending);
+            if status == OrderStatus::Rejected {
+                order.status = OrderStatus::Rejected;
+                order.error_message = existing.error_message.clone();
+                return Ok(risk_fail(
+                    existing
+                        .error_message
+                        .as_deref()
+                        .unwrap_or("duplicate_rejected_placement"),
+                    vec!["duplicate_cloid".into()],
+                ));
+            }
+            return Ok(RiskCheckResult {
+                passed: true,
+                reason: None,
+                checked_limits: vec!["duplicate_cloid_idempotent".into()],
+            });
+        }
+
         let mut effective_risk = risk_result.clone();
         let mut dispatch = dispatch;
         if dispatch && risk_result.passed && self.risk_limits.is_some() {
@@ -397,9 +427,13 @@ impl PostgresDurableOrderStore {
                 symbol_sells += order.size.inner();
             }
         }
+        // H-PG3: buys add to the resulting size (mirrors the correct formula at
+        // the notional loop below: `(position_size + buys).abs()`). The old
+        // `(existing_size - symbol_buys)` under-counted same-direction buys and
+        // let over-limit add-ons past the gate (fail-open).
         let worst_symbol_size = existing_size
             .abs()
-            .max((existing_size - symbol_buys).abs())
+            .max((existing_size + symbol_buys).abs())
             .max((existing_size - symbol_sells).abs());
 
         if equity <= Decimal::ZERO {
@@ -536,11 +570,6 @@ impl PostgresDurableOrderStore {
         {
             return Ok(supplied);
         }
-        if let Some(price) = order.price
-            && price.inner() > Decimal::ZERO
-        {
-            return Ok(price.inner());
-        }
         let mark: Option<BigDecimal> = if order.sub_account.is_none() {
             sqlx::query_scalar(
                 "SELECT mark_price FROM positions WHERE symbol = $1 AND sub_account IS NULL LIMIT 1",
@@ -559,12 +588,29 @@ impl PostgresDurableOrderStore {
             .await
             .map_err(map_sqlx)?
         };
-        match mark {
-            Some(m) => bd_to_dec(m).map_err(|e| HypeEdgeError::Postgres {
-                message: e.to_string(),
-            }),
-            None => Ok(Decimal::ZERO),
+        let mark: Option<Decimal> = match mark {
+            Some(m) => Some(
+                bd_to_dec(m).map_err(|e| HypeEdgeError::Postgres {
+                    message: e.to_string(),
+                })?,
+            ),
+            None => None,
+        };
+        // A16: 无外部参考价时，不得让 marketable 订单用自己的 limit 价低估名义金额。
+        // 有 mark 时对卖单取 max(limit, mark)、买单取 min(limit, mark)（对齐
+        // risk/checker.rs 的 conservative_fallback_price）；无 mark 时保留 limit
+        // 作为最后回退（主防线在 engine 侧快照门，engine 已 fail-closed 拒绝）。
+        if let Some(price) = order.price
+            && price.inner() > Decimal::ZERO
+        {
+            let limit = price.inner();
+            return Ok(match mark {
+                Some(m) if order.side == Side::Sell => limit.max(m),
+                Some(m) => limit.min(m),
+                None => limit,
+            });
         }
+        Ok(mark.unwrap_or(Decimal::ZERO))
     }
 
     /// Persist an order state transition (port of `persist_transition`).
@@ -777,7 +823,7 @@ impl PostgresDurableOrderStore {
                         risk_reducing, max_slippage_bps, filled_size, revision, error_message,
                         exchange_oid, submitted_at, acknowledged_at, filled_at,
                         created_at, updated_at
-                    ) VALUES ($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,$23,now(),now())
+                    ) VALUES ($1,NULL,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$20,$21,$22,now(),now())
                     "#,
                 )
                 .bind(order_id)
@@ -1098,7 +1144,7 @@ mod tests {
     fn row(status: &str) -> OrderRow {
         OrderRow {
             order_id: Uuid::new_v4(),
-            command_id: Uuid::new_v4(),
+            command_id: Some(Uuid::new_v4()),
             cloid: "0x0000000000000000000000000000000000000000000000000000000000000001".into(),
             symbol: "BTC".into(),
             side: "buy".into(),

@@ -108,12 +108,26 @@ impl PendingRow {
     }
 }
 
-/// One line of the JSONL spool: `{"table": "...", "row": {...}}`.
+/// One line of the JSONL spool: `{"table": "...", "key": "...", "row": {...}}`.
 #[derive(Deserialize)]
 struct SpoolEntry {
     table: String,
+    /// The enqueue-time dedup key. Replay arms the same in-process filters the
+    /// live path uses so a redelivered event is not double-written after a
+    /// restart (C8/H-CH3/H-CH4/M-CH). `Option` so spools written before the
+    /// key was introduced still deserialize; replay then recomputes the key.
+    #[serde(default)]
+    key: Option<String>,
     row: serde_json::Value,
 }
+
+/// ClickHouse insert timeout (M-CH): a hung insert must fail into the spool
+/// instead of blocking the writer (and the event bus) forever.
+const INSERT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Hard cap for the spool file in bytes (M-CH): beyond this the writer stops
+/// appending (logging loudly) rather than growing the disk without bound.
+const SPOOL_MAX_BYTES: u64 = 256 * 1024 * 1024;
 
 /// The ClickHouse writer task.
 pub struct ClickHouseWriter {
@@ -128,6 +142,13 @@ pub struct ClickHouseWriter {
     spooled_count: u64,
     /// In-process dedup of redelivered market-data events (C8).
     dedup: DedupFilter,
+    /// Last-seen funding values per `(coin, hour)` (H-CH3): a funding update
+    /// whose rate/premium/oi/mark are unchanged within the same hour is not
+    /// re-written, cutting the per-hour amplification from the WS
+    /// `activeAssetCtx` stream (~1 write/hour/coin instead of one per frame).
+    funding_seen: HashMap<(String, i64), (f64, f64, f64, f64)>,
+    /// Spool size cap in bytes (M-CH).
+    spool_max_bytes: u64,
 }
 
 /// How a drain cycle ended (A12): `Flush` means flush-and-continue; `Closed`
@@ -164,6 +185,8 @@ impl ClickHouseWriter {
             row_count: 0,
             spooled_count: 0,
             dedup: DedupFilter::new(100_000),
+            funding_seen: HashMap::new(),
+            spool_max_bytes: SPOOL_MAX_BYTES,
         }
     }
 
@@ -232,20 +255,24 @@ impl ClickHouseWriter {
     fn enqueue(&mut self, payload: &DomainEvent) {
         match payload {
             DomainEvent::L2BookUpdate(b) => {
+                // H-CH4: `level` is numbered per side (bids 0..19 / asks
+                // 0..19), and the dedup key carries the side — `(timestamp,
+                // symbol, side, level)` — so a bid and an ask never collide on
+                // the same key and per-side levels stay addressable.
                 let levels = b
                     .bids
                     .iter()
-                    .map(|l| (1u8, l))
-                    .chain(b.asks.iter().map(|l| (2u8, l)))
                     .enumerate()
-                    .map(|(i, (side, l))| {
+                    .map(|(i, l)| (1u8, i as u16, l))
+                    .chain(b.asks.iter().enumerate().map(|(i, l)| (2u8, i as u16, l)))
+                    .map(|(side, level, l)| {
                         (
-                            format!("{}|{}|{}", b.timestamp, b.symbol, i),
+                            format!("{}|{}|{}|{}", b.timestamp, b.symbol, side, level),
                             PendingRow::L2Book(L2BookRow {
                                 ts: dt_ms(b.timestamp),
                                 coin: b.symbol.clone(),
                                 side,
-                                level: i as u16,
+                                level,
                                 px: l.price.inner().to_string().parse().unwrap_or(0.0),
                                 sz: l.size.inner().to_string().parse().unwrap_or(0.0),
                             }),
@@ -271,32 +298,60 @@ impl ClickHouseWriter {
                     tid: t.tid,
                 }),
             ),
-            DomainEvent::CandleUpdate(c) => self.push_if_new(
-                "candles",
-                &format!("{}|{}|{}", c.timestamp, c.symbol, c.interval),
-                PendingRow::Candle(CandleRow {
-                    ts: dt_ms(c.timestamp),
-                    coin: c.symbol.clone(),
-                    interval: c.interval.clone(),
-                    open: c.open.inner().to_string().parse().unwrap_or(0.0),
-                    high: c.high.inner().to_string().parse().unwrap_or(0.0),
-                    low: c.low.inner().to_string().parse().unwrap_or(0.0),
-                    close: c.close.inner().to_string().parse().unwrap_or(0.0),
-                    volume: c.volume.inner().to_string().parse().unwrap_or(0.0),
-                }),
-            ),
-            DomainEvent::FundingUpdate(f) => self.push_if_new(
-                "funding",
-                &format!("{}|{}", f.timestamp, f.symbol),
-                PendingRow::Funding(FundingRow {
-                    ts: dt_ms(f.timestamp),
-                    coin: f.symbol.clone(),
-                    funding_rate: f.funding_rate,
-                    premium: f.premium,
-                    oi: f.open_interest,
-                    mark_px: f.mark_price.inner().to_string().parse().unwrap_or(0.0),
-                }),
-            ),
+            DomainEvent::CandleUpdate(c) => {
+                // H-CH4: the dedup key includes `close, volume`, so a forming
+                // candle's first frame does not shadow the definitive closed
+                // frame — every value change is a new key, and the final frame
+                // (with the true close) wins the last write.
+                let close: f64 = c.close.inner().to_string().parse().unwrap_or(0.0);
+                let volume: f64 = c.volume.inner().to_string().parse().unwrap_or(0.0);
+                self.push_if_new(
+                    "candles",
+                    &format!(
+                        "{}|{}|{}|{}|{}",
+                        c.timestamp, c.symbol, c.interval, close, volume
+                    ),
+                    PendingRow::Candle(CandleRow {
+                        ts: dt_ms(c.timestamp),
+                        coin: c.symbol.clone(),
+                        interval: c.interval.clone(),
+                        open: c.open.inner().to_string().parse().unwrap_or(0.0),
+                        high: c.high.inner().to_string().parse().unwrap_or(0.0),
+                        low: c.low.inner().to_string().parse().unwrap_or(0.0),
+                        close,
+                        volume,
+                    }),
+                )
+            }
+            DomainEvent::FundingUpdate(f) => {
+                // H-CH3: funding is hourly-settled; the WS stream pushes
+                // `activeAssetCtx` frames at a much higher cadence. Track the
+                // last-seen value per `(coin, hour)` and only write when it
+                // changes (fixes the ~2360× per-hour amplification).
+                let hour = funding_hour_key(f.timestamp);
+                let values = (
+                    f.funding_rate,
+                    f.premium,
+                    f.open_interest,
+                    f.mark_price.inner().to_string().parse().unwrap_or(0.0),
+                );
+                let changed = self.funding_seen.get(&(f.symbol.clone(), hour)) != Some(&values);
+                self.funding_seen.insert((f.symbol.clone(), hour), values);
+                if changed {
+                    self.push_if_new(
+                        "funding",
+                        &format!("{}|{}", f.timestamp, f.symbol),
+                        PendingRow::Funding(FundingRow {
+                            ts: dt_ms(f.timestamp),
+                            coin: f.symbol.clone(),
+                            funding_rate: f.funding_rate,
+                            premium: f.premium,
+                            oi: f.open_interest,
+                            mark_px: f.mark_price.inner().to_string().parse().unwrap_or(0.0),
+                        }),
+                    );
+                }
+            }
             DomainEvent::MidPriceUpdate(m) => self.push_if_new(
                 "mid_prices",
                 &format!("{}|{}", m.timestamp, m.symbol),
@@ -353,9 +408,48 @@ impl ClickHouseWriter {
     }
 
     /// Append the failed batch to the spool file (JSONL). One line per table +
-    /// payload; a later retry drain can replay them.
+    /// payload + enqueue-time dedup key; a later retry drain can replay them.
+    /// The spool is size-capped (M-CH): past `spool_max_bytes` new lines are
+    /// dropped with a loud log instead of growing the disk without bound.
     fn append_spool(&mut self, rows: &[PendingRow]) {
         use std::io::Write;
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|row| {
+                let key = row_dedup_key(row.table(), row).unwrap_or_default();
+                let line = match row {
+                    PendingRow::L2Book(r) => {
+                        serde_json::json!({"table": "l2_book", "key": key, "row": r})
+                    }
+                    PendingRow::Trade(r) => {
+                        serde_json::json!({"table": "trades", "key": key, "row": r})
+                    }
+                    PendingRow::Candle(r) => {
+                        serde_json::json!({"table": "candles", "key": key, "row": r})
+                    }
+                    PendingRow::Funding(r) => {
+                        serde_json::json!({"table": "funding", "key": key, "row": r})
+                    }
+                    PendingRow::MidPrice(r) => {
+                        serde_json::json!({"table": "mid_prices", "key": key, "row": r})
+                    }
+                };
+                line.to_string()
+            })
+            .collect();
+        let added: usize = lines.iter().map(|l| l.len() + 1).sum();
+        let current = std::fs::metadata(&self.spool_path)
+            .map(|m| m.len() as usize)
+            .unwrap_or(0);
+        if (current + added) as u64 > self.spool_max_bytes {
+            tracing::error!(
+                path = %self.spool_path.display(),
+                bytes = current + added,
+                cap = self.spool_max_bytes,
+                "spool_size_cap_exceeded_dropping_batch"
+            );
+            return;
+        }
         let mut file = match std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -367,21 +461,17 @@ impl ClickHouseWriter {
                 return;
             }
         };
-        for row in rows {
-            let line = match row {
-                PendingRow::L2Book(r) => serde_json::json!({"table": "l2_book", "row": r}),
-                PendingRow::Trade(r) => serde_json::json!({"table": "trades", "row": r}),
-                PendingRow::Candle(r) => serde_json::json!({"table": "candles", "row": r}),
-                PendingRow::Funding(r) => serde_json::json!({"table": "funding", "row": r}),
-                PendingRow::MidPrice(r) => serde_json::json!({"table": "mid_prices", "row": r}),
-            };
+        for line in lines {
             let _ = writeln!(file, "{}", line);
         }
     }
 
     /// Replay rows previously spooled to the JSONL file (C5): read each line,
     /// group by table, insert; on success remove the spool so a replayed batch
-    /// is never replayed again (dedup is also enforced by the in-memory filter).
+    /// is never replayed again. Replay first passes through the same dedup the
+    /// live path applies (M-CH): the enqueue-time key arms the in-process
+    /// filter so a redelivered event is not double-written after a restart, and
+    /// funding rows apply the same-hour value-change filter.
     async fn replay_spool(&mut self) -> Result<(), String> {
         let content = match std::fs::read_to_string(&self.spool_path) {
             Ok(c) => c,
@@ -416,6 +506,25 @@ impl ClickHouseWriter {
                 _ => None,
             };
             if let Some(row) = row {
+                // Dedup pass: skip duplicate spool lines and arm the same keys
+                // the live path marks (C8/H-CH3/H-CH4/M-CH).
+                let key = entry
+                    .key
+                    .filter(|k| !k.is_empty())
+                    .or_else(|| row_dedup_key(entry.table.as_str(), &row));
+                if let Some(key) = key
+                    && self.dedup.check_and_mark(entry.table.as_str(), &key)
+                {
+                    continue;
+                }
+                if let PendingRow::Funding(r) = &row {
+                    let hour = funding_hour_key(millis_of(r.ts));
+                    let values = (r.funding_rate, r.premium, r.oi, r.mark_px);
+                    if self.funding_seen.get(&(r.coin.clone(), hour)) == Some(&values) {
+                        continue;
+                    }
+                    self.funding_seen.insert((r.coin.clone(), hour), values);
+                }
                 batches.entry(entry.table).or_default().push(row);
             }
         }
@@ -460,7 +569,47 @@ fn dt_ms(millis: i64) -> OffsetDateTime {
         + time::Duration::milliseconds(sub_ms)
 }
 
+/// Unix millis of an `OffsetDateTime` — the exact round-trip of [`dt_ms`].
+fn millis_of(dt: OffsetDateTime) -> i64 {
+    dt.unix_timestamp() * 1000 + i64::from(dt.millisecond())
+}
+
+/// The hour bucket (in millis) a timestamp belongs to — used by the funding
+/// value-change filter (H-CH3).
+fn funding_hour_key(ts_ms: i64) -> i64 {
+    ts_ms.div_euclid(3_600_000)
+}
+
+/// The dedup key for a spooled row, matching the live `enqueue` keys exactly
+/// so replay arms the same in-process filters (C8, H-CH3, H-CH4, M-CH).
+fn row_dedup_key(table: &str, row: &PendingRow) -> Option<String> {
+    match (table, row) {
+        ("l2_book", PendingRow::L2Book(r)) => Some(format!(
+            "{}|{}|{}|{}",
+            millis_of(r.ts),
+            r.coin,
+            r.side,
+            r.level
+        )),
+        ("trades", PendingRow::Trade(r)) => Some(format!("{}|{}", r.tid, r.coin)),
+        ("candles", PendingRow::Candle(r)) => Some(format!(
+            "{}|{}|{}|{}|{}",
+            millis_of(r.ts),
+            r.coin,
+            r.interval,
+            r.close,
+            r.volume
+        )),
+        ("funding", PendingRow::Funding(r)) => Some(format!("{}|{}", millis_of(r.ts), r.coin)),
+        ("mid_prices", PendingRow::MidPrice(r)) => Some(format!("{}|{}", millis_of(r.ts), r.coin)),
+        _ => None,
+    }
+}
+
 /// Insert a batch of rows into a table via the crate's `insert` handle.
+/// Bounded by [`INSERT_TIMEOUT`] (M-CH): a hung ClickHouse insert returns an
+/// error so the caller (flush) routes the batch into the spool instead of
+/// blocking the writer forever.
 async fn insert_rows<T: Row + Serialize>(
     client: &Client,
     table: &str,
@@ -470,12 +619,22 @@ async fn insert_rows<T: Row + Serialize>(
     if rows.is_empty() {
         return Ok(());
     }
-    let mut insert = client.insert(table).map_err(|e| e.to_string())?;
-    for row in rows {
-        insert.write(&row).await.map_err(|e| e.to_string())?;
+    let result = tokio::time::timeout(INSERT_TIMEOUT, async {
+        let mut insert = client.insert(table).map_err(|e| e.to_string())?;
+        for row in rows {
+            insert.write(&row).await.map_err(|e| e.to_string())?;
+        }
+        insert.end().await.map_err(|e| e.to_string())?;
+        Ok::<(), String>(())
+    })
+    .await;
+    match result {
+        Ok(inner) => inner,
+        Err(_) => {
+            tracing::warn!(table, "clickhouse_insert_timeout");
+            Err("clickhouse insert timed out".into())
+        }
     }
-    insert.end().await.map_err(|e| e.to_string())?;
-    Ok(())
 }
 
 /// Dispatch a `PendingRow` batch to the matching table's `insert_rows`.
@@ -665,6 +824,159 @@ mod tests {
             matches!(result, DrainResult::Closed),
             "closed mailbox must yield Closed, got {result:?}"
         );
+    }
+
+    #[test]
+    fn funding_same_hour_same_value_not_repeated() {
+        // H-CH3 regression: the WS `activeAssetCtx` stream pushes funding
+        // frames at a far higher cadence than the hourly settlement. A frame
+        // whose (rate, premium, oi, mark) is unchanged within the same hour
+        // must not produce another row (~2360× amplification pre-fix).
+        let base = 1_700_000_000_000i64; // some Unix-millis timestamp
+        let mk = |rate: f64, ts: i64| {
+            DomainEvent::FundingUpdate(hypeedge_domain::models::FundingRate {
+                symbol: "BTC".into(),
+                funding_rate: rate,
+                premium: 0.0001,
+                mark_price: Price::new(Decimal::from_str_strict("65000.5").unwrap()),
+                open_interest: 1000.0,
+                timestamp: ts,
+            })
+        };
+        let mut writer = ClickHouseWriter::new(
+            "http://localhost:8123",
+            "hypeedge",
+            "default",
+            "",
+            1000,
+            Duration::from_secs(5),
+            std::path::PathBuf::from("/tmp/ch_funding_test.jsonl"),
+        );
+        writer.enqueue(&mk(0.00005, base)); // first frame of the hour → write
+        writer.enqueue(&mk(0.00005, base + 1000)); // same hour, same value → skip
+        writer.enqueue(&mk(0.00005, base + 2000)); // same hour, same value → skip
+        assert_eq!(
+            writer.rows.len(),
+            1,
+            "unchanged same-hour value must not re-write"
+        );
+        writer.enqueue(&mk(0.00006, base + 3000)); // value changed → write
+        assert_eq!(
+            writer.rows.len(),
+            2,
+            "changed value in same hour must write"
+        );
+        writer.enqueue(&mk(0.00006, base + 3_600_000)); // next hour, same value → write
+        assert_eq!(
+            writer.rows.len(),
+            3,
+            "new hour must write even with same value"
+        );
+    }
+
+    #[test]
+    fn candle_dedup_key_includes_close_and_volume() {
+        // H-CH4 regression: a forming candle's first frame used to shadow every
+        // later frame (the dedup key was timestamp|symbol|interval), so the
+        // definitive closed frame was never written. The key now carries
+        // close+volume: value changes write, identical redeliveries dedup.
+        let c = |close: &str, volume: &str, ts: i64| {
+            DomainEvent::CandleUpdate(hypeedge_domain::models::Candle {
+                symbol: "BTC".into(),
+                interval: "1m".into(),
+                open: Price::new(Decimal::from_str_strict("100").unwrap()),
+                high: Price::new(Decimal::from_str_strict("101").unwrap()),
+                low: Price::new(Decimal::from_str_strict("99").unwrap()),
+                close: Price::new(Decimal::from_str_strict(close).unwrap()),
+                volume: hypeedge_domain::decimal::Size::new(
+                    Decimal::from_str_strict(volume).unwrap(),
+                ),
+                timestamp: ts,
+            })
+        };
+        let mut writer = ClickHouseWriter::new(
+            "http://localhost:8123",
+            "hypeedge",
+            "default",
+            "",
+            1000,
+            Duration::from_secs(5),
+            std::path::PathBuf::from("/tmp/ch_candle_test.jsonl"),
+        );
+        let ts = 1_700_000_000_000i64;
+        writer.enqueue(&c("100.5", "1.0", ts)); // forming frame
+        writer.enqueue(&c("100.5", "1.0", ts)); // identical redelivery → dedup
+        assert_eq!(writer.rows.len(), 1, "identical candle frame must dedup");
+        writer.enqueue(&c("101.0", "2.0", ts)); // updated forming frame
+        writer.enqueue(&c("101.0", "2.0", ts)); // closed frame redelivered → dedup
+        assert_eq!(
+            writer.rows.len(),
+            2,
+            "close/volume change must write; redelivery must dedup"
+        );
+        // The final frame (true close) is present — the closed candle wins.
+        let (close, volume) = match &writer.rows[1] {
+            PendingRow::Candle(r) => (r.close, r.volume),
+            _ => panic!("expected candle row"),
+        };
+        assert_eq!(close, 101.0);
+        assert_eq!(volume, 2.0);
+    }
+
+    #[test]
+    fn l2_book_levels_are_per_side_and_key_includes_side() {
+        // H-CH4 regression: `level` used to be a global enumerate index across
+        // bids+asks. It is now numbered per side (bids 0..n / asks 0..m) and
+        // the dedup key is (timestamp, symbol, side, level), so a bid and an
+        // ask at the same index never collide.
+        let book = |ts: i64| L2BookSnapshot {
+            symbol: "BTC".into(),
+            bids: vec![
+                L2Level {
+                    price: Price::new(Decimal::from_str_strict("100").unwrap()),
+                    size: Size::new(Decimal::from_str_strict("2").unwrap()),
+                },
+                L2Level {
+                    price: Price::new(Decimal::from_str_strict("99").unwrap()),
+                    size: Size::new(Decimal::from_str_strict("4").unwrap()),
+                },
+            ],
+            asks: vec![L2Level {
+                price: Price::new(Decimal::from_str_strict("101").unwrap()),
+                size: Size::new(Decimal::from_str_strict("3").unwrap()),
+            }],
+            timestamp: ts,
+            local_ts: Utc::now(),
+            version: 0,
+            connection_generation: 0,
+        };
+        let mut writer = ClickHouseWriter::new(
+            "http://localhost:8123",
+            "hypeedge",
+            "default",
+            "",
+            1000,
+            Duration::from_secs(5),
+            std::path::PathBuf::from("/tmp/ch_l2_test.jsonl"),
+        );
+        writer.enqueue(&DomainEvent::L2BookUpdate(book(1)));
+        assert_eq!(writer.rows.len(), 3, "2 bids + 1 ask enqueued");
+        let levels: Vec<(u8, u16)> = writer
+            .rows
+            .iter()
+            .map(|r| match r {
+                PendingRow::L2Book(r) => (r.side, r.level),
+                _ => panic!("expected l2 row"),
+            })
+            .collect();
+        assert_eq!(
+            levels,
+            vec![(1, 0), (1, 1), (2, 0)],
+            "per-side level numbering"
+        );
+        // Redelivered book at the same timestamp dedups entirely.
+        writer.enqueue(&DomainEvent::L2BookUpdate(book(1)));
+        assert_eq!(writer.rows.len(), 3, "identical book redelivery dedups");
     }
 
     #[test]

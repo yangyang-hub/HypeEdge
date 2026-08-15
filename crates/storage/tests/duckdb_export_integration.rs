@@ -45,6 +45,40 @@ async fn export_all_writes_duckdb_file() {
         Ok(totals) => {
             assert!(totals.contains_key("candles"), "totals: {totals:?}");
             assert!(PathBuf::from(&output).exists(), "duckdb file created");
+            // C6: the pre-fix `ts: f64` decode wrote garbage (empirically
+            // 8.81e-312) — the old test only checked file existence and let it
+            // through. Now every exported ts must be plausible Unix millis.
+            let total_rows: usize = totals.values().sum();
+            if total_rows > 0 {
+                let conn = duckdb::Connection::open(&output).unwrap();
+                for table in ["candles", "funding", "trades", "l2_book", "mid_prices"] {
+                    let bad: i64 = conn
+                        .query_row(
+                            &format!(
+                                "SELECT count(*) FROM {table} WHERE CAST(ts AS BIGINT) <= 1000000000000"
+                            ),
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    assert_eq!(
+                        bad, 0,
+                        "{table} contains implausible ts values (C6 regression)"
+                    );
+                    // And at least one ts is in the query window.
+                    let min_ts: i64 = conn
+                        .query_row(
+                            &format!("SELECT min(CAST(ts AS BIGINT)) FROM {table}"),
+                            [],
+                            |r| r.get(0),
+                        )
+                        .unwrap_or(0);
+                    assert!(
+                        min_ts >= 1_700_000_000_000,
+                        "{table} min ts {min_ts} not in the expected window"
+                    );
+                }
+            }
         }
         Err(e) => {
             // Table may not exist (writer never ran) — that's an infra skip, not

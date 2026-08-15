@@ -13,7 +13,9 @@ use uuid::Uuid;
 #[derive(Debug, Clone, FromRow)]
 pub struct OrderRow {
     pub order_id: Uuid,
-    pub command_id: Uuid,
+    /// Nullable: exchange-discovered orders (`find_or_create_order`) have no
+    /// command, and `persist_reconciled_order` inserts NULL. H-PG1.
+    pub command_id: Option<Uuid>,
     pub cloid: String,
     pub symbol: String,
     pub side: String,
@@ -85,7 +87,8 @@ pub struct RiskReservationRow {
     pub id: i64,
     pub reservation_id: Uuid,
     pub command_id: Uuid,
-    pub command_item_id: Option<Uuid>,
+    /// BIGINT column in `risk_reservations` (M-PG1) — not a UUID.
+    pub command_item_id: Option<i64>,
     pub risk_owner_type: Option<String>,
     pub risk_owner_key: Option<String>,
     pub order_id: Uuid,
@@ -166,7 +169,11 @@ pub struct AccountStateRow {
     pub total_margin_used: BigDecimal,
     pub total_unrealized_pnl: BigDecimal,
     pub peak_equity: BigDecimal,
-    pub action_credits_remaining: i64,
+    /// Nullable in the schema and never written by the poller snapshot sink
+    /// (C2): `PolledAccountSnapshot` carries no `userRateLimit` field, so the
+    /// UPSERT leaves it NULL. Decode as `Option` so the DB risk scope
+    /// (`SELECT * FROM account_state`) never fails on NULL.
+    pub action_credits_remaining: Option<i64>,
     pub exchange_updated_at: DateTime<Utc>,
     pub reconciled_at: Option<DateTime<Utc>>,
     pub revision: i64,

@@ -335,16 +335,22 @@ async fn filled_order_does_not_regress_on_late_cancelled_update() {
 }
 
 #[tokio::test]
-async fn ingest_funding_records_payment() {
+async fn ingest_funding_records_payment_flat_shape() {
+    // H-CH1 regression: the real REST `userFunding` payload is flat
+    // (`{time, coin, usdc, ...}` with no `delta` and no `type`); the old
+    // `delta.type == "funding"` validation rejected it. The flat shape must
+    // ingest identically.
     let Some(pool) = try_pool().await else { return };
     let _guard = acquire_test_lock(&pool).await;
     clean_tables(&pool).await;
     let projector = PostgresExchangeFactProjector::new(pool.clone(), ACCOUNT);
 
     let update = json!({
-        "hash": "0xf00d",
         "time": 1_700_000_002_000i64,
-        "delta": {"type": "funding", "coin": "BTC", "usdc": "-1.2345", "fundingRate": "0.00001", "szi": "1.25"}
+        "coin": "BTC",
+        "usdc": "-1.2345",
+        "fundingRate": "0.00001",
+        "szi": "1.25"
     });
     let result = projector.ingest_funding(&update).await.unwrap();
     assert!(result.processed);
@@ -358,6 +364,61 @@ async fn ingest_funding_records_payment() {
     assert_eq!(amount.to_string(), "-1.2345");
     let cursor = projector.cursor("funding").await.unwrap();
     assert_eq!(cursor, 1_700_000_002_000);
+}
+
+#[tokio::test]
+async fn funding_ws_and_rest_shapes_dedup_on_time_coin_usdc() {
+    // H-CH1 regression: the same funding settlement arriving once as a WS
+    // delta frame and once as a flat REST history item must collapse to one
+    // `funding_payments` row. The external id is `(time, coin, usdc)` —
+    // excluding the exchange hash, which WS frames do not carry.
+    let Some(pool) = try_pool().await else { return };
+    let _guard = acquire_test_lock(&pool).await;
+    clean_tables(&pool).await;
+    let projector = PostgresExchangeFactProjector::new(pool.clone(), ACCOUNT);
+
+    let ws_delta = json!({
+        "time": 1_700_000_004_000i64,
+        "hash": "0xws1",
+        "delta": {"coin": "BTC", "usdc": "-2.5", "fundingRate": "0.00002", "szi": "1.0"}
+    });
+    let rest_flat = json!({
+        "time": 1_700_000_004_000i64,
+        "hash": "0xrest1",
+        "coin": "BTC",
+        "usdc": "-2.5",
+        "fundingRate": "0.00002",
+        "szi": "1.0"
+    });
+    let first = projector.ingest_funding(&ws_delta).await.unwrap();
+    assert!(first.processed);
+    let second = projector.ingest_funding(&rest_flat).await.unwrap();
+    assert!(
+        !second.processed,
+        "same (time, coin, usdc) must dedup: {:?}",
+        second
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM funding_payments")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1, "one funding payment across WS + REST paths");
+
+    // A genuinely different settlement still ingests.
+    let next = json!({
+        "time": 1_700_000_005_000i64,
+        "coin": "BTC",
+        "usdc": "-2.6",
+        "fundingRate": "0.00002",
+        "szi": "1.0"
+    });
+    let third = projector.ingest_funding(&next).await.unwrap();
+    assert!(third.processed);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM funding_payments")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
 }
 
 #[tokio::test]

@@ -239,6 +239,11 @@ impl StrategyStateStore for PostgresStrategyStateStore {
         reason: Option<&str>,
         expected_revision: Option<u64>,
     ) -> Result<StrategyRuntimeState, String> {
+        // M-PG: mirror `set_desired` — the expected revision is enforced by the
+        // statement itself (`$6` in the DO UPDATE WHERE), not by a separate
+        // read-then-check, so a concurrent transition cannot slip in between.
+        // A missing row still satisfies an absent expectation (create path);
+        // with an expected revision the pre-check keeps the friendly error.
         if let Some(expected) = expected_revision {
             let current: Option<(i64,)> = sqlx::query_as(
                 "SELECT revision FROM strategy_runtime_state WHERE strategy_id = $1",
@@ -254,7 +259,7 @@ impl StrategyStateStore for PostgresStrategyStateStore {
                 ));
             }
         }
-        sqlx::query(
+        let result = sqlx::query(
             r#"
             INSERT INTO strategy_runtime_state (
                 strategy_id, actual_state, effective_config_version_id, heartbeat_at,
@@ -267,6 +272,7 @@ impl StrategyStateStore for PostgresStrategyStateStore {
                 reason = $4,
                 revision = strategy_runtime_state.revision + 1,
                 updated_at = now()
+            WHERE $6::bigint IS NULL OR strategy_runtime_state.revision = $6
             "#,
         )
         .bind(strategy_id)
@@ -274,10 +280,18 @@ impl StrategyStateStore for PostgresStrategyStateStore {
         .bind(effective_config_revision.map(|v| v as i64))
         .bind(reason)
         .bind(set_effective_config)
+        .bind(expected_revision.map(|v| v as i64))
         .execute(&self.pool)
         .await
         .map_err(map_sqlx)
         .map_err(|e| e.to_string())?;
+        // The DO UPDATE WHERE guard failing (revision moved since the check)
+        // yields zero affected rows — surface it like `set_desired` does.
+        if expected_revision.is_some() && result.rows_affected() == 0 {
+            return Err(format!(
+                "strategy {strategy_id} runtime revision conflict (rows_affected=0)"
+            ));
+        }
         self.get_runtime(strategy_id)
             .await?
             .ok_or_else(|| format!("missing runtime {strategy_id}"))

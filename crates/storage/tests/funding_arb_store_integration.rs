@@ -177,3 +177,62 @@ async fn funding_arb_cycle_create_get_transition() {
     // No longer active.
     assert!(store.get_active("fa_test").await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn faulted_cycle_is_not_active() {
+    // M-CH6: `faulted` is terminal — `get_active` must not return it, or a
+    // crash-recovery path would keep driving a cycle the runtime gave up on.
+    let Some(pool) = try_pool().await else { return };
+    let _guard = acquire_test_lock(&pool).await;
+    sqlx::query("DELETE FROM funding_arb_cycle_events")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM funding_arb_cycles")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM strategy_instances")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let store = PostgresFundingArbCycleStore::new(pool.clone());
+    sqlx::query(
+        "INSERT INTO strategy_instances (strategy_id, strategy_type, symbol) VALUES ($1, 'funding_arb', 'AUTO')",
+    )
+    .bind("fa_fault_test")
+    .execute(&pool)
+    .await
+    .unwrap();
+    let (config_version_id,): (i64,) = sqlx::query_as(
+        "INSERT INTO strategy_config_versions (strategy_id, version, config_hash, created_by) VALUES ($1, 1, $2, 'test') RETURNING id",
+    )
+    .bind("fa_fault_test")
+    .bind("b".repeat(64))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let mut c = cycle("fa_fault_test", FundingArbCycleState::EnteringSpot);
+    c.config_revision = config_version_id as u64;
+    let created = store.create(&c).await.unwrap();
+
+    // Still active while mid-transition.
+    assert!(store.get_active("fa_fault_test").await.unwrap().is_some());
+
+    let faulted = store
+        .transition(
+            &created,
+            FundingArbCycleState::Faulted,
+            "cycle_faulted",
+            Some(serde_json::json!({"error_code": "e"})),
+            serde_json::json!({}),
+        )
+        .await
+        .unwrap();
+    assert_eq!(faulted.state, FundingArbCycleState::Faulted);
+    assert!(
+        store.get_active("fa_fault_test").await.unwrap().is_none(),
+        "faulted cycle must not be reported as active (M-CH6)"
+    );
+}

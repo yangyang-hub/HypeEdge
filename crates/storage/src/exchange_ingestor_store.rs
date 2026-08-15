@@ -20,8 +20,8 @@ use hypeedge_domain::decimal::Decimal;
 use hypeedge_domain::error::HypeEdgeError;
 use hypeedge_trading::account::exchange_ingestor::{
     CommittedFillProjection, ExchangeFactProjector, IngestResult, SOURCE, TERMINAL_STATUSES,
-    canonical_payload, fill_external_id, fill_position_after, funding_external_id,
-    normalize_status, projected_entry_price, synthetic_cloid,
+    canonical_payload, fill_external_id, fill_position_after, normalize_status,
+    projected_entry_price, synthetic_cloid,
 };
 use serde_json::Value;
 use sqlx::{PgPool, Postgres, Transaction};
@@ -920,33 +920,30 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
     async fn ingest_funding(&self, update: &Value) -> Result<IngestResult, HypeEdgeError> {
         let external_id = funding_external_id(update);
         let (payload_hash, payload) = canonical_payload(update);
-        let delta = update
+        // H-CH1: accept both the WS delta shape (`{time, hash, delta: {coin,
+        // usdc, ...}}`) and the flat REST shape (`{time, coin, usdc, ...}`) —
+        // the old `delta.type == "funding"` check rejected the flat shape.
+        let src = update
             .get("delta")
             .filter(|d| d.is_object())
-            .cloned()
-            .unwrap_or(Value::Null);
-        if delta.get("type").and_then(|t| t.as_str()) != Some("funding") {
-            return Err(HypeEdgeError::Reconciliation {
-                message: "invalid_user_funding_update".into(),
-            });
-        }
-        let symbol = str_of(delta.get("coin"));
+            .unwrap_or(update);
+        let symbol = str_of(src.get("coin"));
         if symbol.is_empty() {
             return Err(HypeEdgeError::Reconciliation {
                 message: "user_funding_missing_coin".into(),
             });
         }
-        let amount = delta
+        let amount = src
             .get("usdc")
             .and_then(|v| v.as_str())
             .and_then(|s| Decimal::from_str_lenient(s).ok())
             .unwrap_or(Decimal::ZERO);
-        let funding_rate = delta
+        let funding_rate = src
             .get("fundingRate")
             .and_then(|v| v.as_str())
             .and_then(|s| Decimal::from_str_lenient(s).ok())
             .unwrap_or(Decimal::ZERO);
-        let position_size = delta
+        let position_size = src
             .get("szi")
             .and_then(|v| v.as_str())
             .and_then(|s| Decimal::from_str_lenient(s).ok())
@@ -1050,4 +1047,19 @@ impl ExchangeFactProjector for PostgresExchangeFactProjector {
         .map_err(map_sqlx)?;
         Ok(row.map(|(v,)| v).unwrap_or(0))
     }
+}
+
+/// Stable funding identity shared by the REST and WS ingest paths:
+/// `(time, coin, usdc)` (H-CH1). The exchange `hash` is deliberately excluded
+/// — WS user-funding frames carry no hash, so a hash-based id would split one
+/// settlement across two inbox keys and double-count it when REST recovery
+/// and the WS stream overlap.
+fn funding_external_id(update: &Value) -> String {
+    let src = update
+        .get("delta")
+        .filter(|d| d.is_object())
+        .unwrap_or(update);
+    let coin = str_of(src.get("coin"));
+    let usdc = str_of(src.get("usdc"));
+    format!("funding:{}:{}:{}", str_of(update.get("time")), coin, usdc)
 }

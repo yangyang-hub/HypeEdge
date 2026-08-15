@@ -193,9 +193,12 @@ impl FundingArbCycleStore for PostgresFundingArbCycleStore {
     }
 
     async fn get_active(&self, strategy_id: &str) -> Result<Option<FundingArbCycle>, String> {
+        // M-CH6: `faulted` cycles are terminal and must not be treated as
+        // active (a crash-recovery path would otherwise keep driving a cycle
+        // the runtime already gave up on).
         let row: Option<CycleRow> = sqlx::query_as::<_, CycleRow>(
             &format!(
-                "SELECT {columns} FROM funding_arb_cycles WHERE strategy_id = $1 AND state <> 'closed' ORDER BY created_at DESC LIMIT 1",
+                "SELECT {columns} FROM funding_arb_cycles WHERE strategy_id = $1 AND state NOT IN ('closed','faulted') ORDER BY created_at DESC LIMIT 1",
                 columns = CYCLE_COLUMNS
             ),
         )

@@ -88,9 +88,14 @@ pub fn duckdb_file_exists(path: &Path) -> bool {
 
 /// Row types for each exported table. `?fields` expands the columns in
 /// declaration order, matching the DuckDB column list.
+///
+/// `ts` is `i64` Unix **milliseconds** (C6): ClickHouse stores `ts` as
+/// `DateTime64(3)`, which travels on the wire as an `Int64` of milliseconds.
+/// The old `f64` read the raw millis bits as a float and produced garbage
+/// values (empirically `8.81e-312`).
 #[derive(Debug, Row, Serialize, Deserialize, Clone)]
 struct CandleChRow {
-    ts: f64,
+    ts: i64,
     coin: String,
     interval: String,
     open: f64,
@@ -102,7 +107,7 @@ struct CandleChRow {
 
 #[derive(Debug, Row, Serialize, Deserialize, Clone)]
 struct FundingChRow {
-    ts: f64,
+    ts: i64,
     coin: String,
     funding_rate: f64,
     premium: f64,
@@ -112,7 +117,7 @@ struct FundingChRow {
 
 #[derive(Debug, Row, Serialize, Deserialize, Clone)]
 struct TradeChRow {
-    ts: f64,
+    ts: i64,
     coin: String,
     px: f64,
     sz: f64,
@@ -122,7 +127,7 @@ struct TradeChRow {
 
 #[derive(Debug, Row, Serialize, Deserialize, Clone)]
 struct L2BookChRow {
-    ts: f64,
+    ts: i64,
     coin: String,
     side: u8,
     level: u16,
@@ -132,10 +137,14 @@ struct L2BookChRow {
 
 #[derive(Debug, Row, Serialize, Deserialize, Clone)]
 struct MidPriceChRow {
-    ts: f64,
+    ts: i64,
     coin: String,
     px: f64,
 }
+
+/// Earliest plausible Unix-millis timestamp (~2001-09-09): any exported row
+/// below this is garbage (C6 — the pre-fix exports carried `8.81e-312`).
+const TS_MIN_MILLIS: i64 = 1_000_000_000_000;
 
 /// Export one market-data table for a coin + time range from ClickHouse into
 /// the DuckDB file. Returns the number of rows written.
@@ -150,9 +159,7 @@ pub async fn export_table(
     start_ms: i64,
     end_ms: i64,
 ) -> Result<usize, String> {
-    let start_sec = start_ms as f64 / 1000.0;
-    let end_sec = end_ms as f64 / 1000.0;
-    let rows: Vec<Vec<Option<String>>> = query_rows(ch, table, coin, start_sec, end_sec).await?;
+    let rows: Vec<Vec<Option<String>>> = query_rows(ch, table, coin, start_ms, end_ms).await?;
     if rows.is_empty() {
         return Ok(0);
     }
@@ -185,22 +192,29 @@ pub async fn export_all(
 }
 
 /// Query one table and collect every row as a Vec<Option<String>>.
+///
+/// `start_ms`/`end_ms` are Unix milliseconds; the `ts` column is
+/// `DateTime64(3)` so the range predicate converts it to Int64 millis with
+/// `toUnixTimestamp64Milli` (an Int64 literal compared against DateTime64 is
+/// otherwise interpreted as seconds, which would silently return nothing).
 async fn query_rows(
     ch: &Client,
     table: &str,
     coin: &str,
-    start_sec: f64,
-    end_sec: f64,
+    start_ms: i64,
+    end_ms: i64,
 ) -> Result<Vec<Vec<Option<String>>>, String> {
-    let sql = format!("SELECT ?fields FROM {table} WHERE coin = ? AND ts BETWEEN ? AND ?");
+    let sql = format!(
+        "SELECT ?fields FROM {table} WHERE coin = ? AND toUnixTimestamp64Milli(ts) BETWEEN ? AND ?"
+    );
     let mut rows: Vec<Vec<Option<String>>> = Vec::new();
     match table {
         "candles" => {
             let mut cursor = ch
                 .query(&sql)
                 .bind(coin)
-                .bind(start_sec)
-                .bind(end_sec)
+                .bind(start_ms)
+                .bind(end_ms)
                 .fetch::<CandleChRow>()
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
             while let Some(r) = cursor
@@ -208,6 +222,7 @@ async fn query_rows(
                 .await
                 .map_err(|e| format!("clickhouse row: {e}"))?
             {
+                assert_ts_sane(table, r.ts)?;
                 rows.push(vec![
                     Some(r.ts.to_string()),
                     Some(r.coin),
@@ -224,8 +239,8 @@ async fn query_rows(
             let mut cursor = ch
                 .query(&sql)
                 .bind(coin)
-                .bind(start_sec)
-                .bind(end_sec)
+                .bind(start_ms)
+                .bind(end_ms)
                 .fetch::<FundingChRow>()
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
             while let Some(r) = cursor
@@ -233,6 +248,7 @@ async fn query_rows(
                 .await
                 .map_err(|e| format!("clickhouse row: {e}"))?
             {
+                assert_ts_sane(table, r.ts)?;
                 rows.push(vec![
                     Some(r.ts.to_string()),
                     Some(r.coin),
@@ -247,8 +263,8 @@ async fn query_rows(
             let mut cursor = ch
                 .query(&sql)
                 .bind(coin)
-                .bind(start_sec)
-                .bind(end_sec)
+                .bind(start_ms)
+                .bind(end_ms)
                 .fetch::<TradeChRow>()
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
             while let Some(r) = cursor
@@ -256,6 +272,7 @@ async fn query_rows(
                 .await
                 .map_err(|e| format!("clickhouse row: {e}"))?
             {
+                assert_ts_sane(table, r.ts)?;
                 rows.push(vec![
                     Some(r.ts.to_string()),
                     Some(r.coin),
@@ -270,8 +287,8 @@ async fn query_rows(
             let mut cursor = ch
                 .query(&sql)
                 .bind(coin)
-                .bind(start_sec)
-                .bind(end_sec)
+                .bind(start_ms)
+                .bind(end_ms)
                 .fetch::<L2BookChRow>()
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
             while let Some(r) = cursor
@@ -279,6 +296,7 @@ async fn query_rows(
                 .await
                 .map_err(|e| format!("clickhouse row: {e}"))?
             {
+                assert_ts_sane(table, r.ts)?;
                 rows.push(vec![
                     Some(r.ts.to_string()),
                     Some(r.coin),
@@ -293,8 +311,8 @@ async fn query_rows(
             let mut cursor = ch
                 .query(&sql)
                 .bind(coin)
-                .bind(start_sec)
-                .bind(end_sec)
+                .bind(start_ms)
+                .bind(end_ms)
                 .fetch::<MidPriceChRow>()
                 .map_err(|e| format!("clickhouse query {table}: {e}"))?;
             while let Some(r) = cursor
@@ -302,6 +320,7 @@ async fn query_rows(
                 .await
                 .map_err(|e| format!("clickhouse row: {e}"))?
             {
+                assert_ts_sane(table, r.ts)?;
                 rows.push(vec![
                     Some(r.ts.to_string()),
                     Some(r.coin),
@@ -312,6 +331,18 @@ async fn query_rows(
         other => return Err(format!("unsupported export table: {other}")),
     }
     Ok(rows)
+}
+
+/// C6: refuse to export rows whose `ts` is not plausible Unix millis. The
+/// pre-fix `f64` decode produced values like `8.81e-312`; exporting them hid
+/// the bug in the DuckDB files (the old test only checked file existence).
+fn assert_ts_sane(table: &str, ts: i64) -> Result<(), String> {
+    if ts > TS_MIN_MILLIS {
+        return Ok(());
+    }
+    Err(format!(
+        "duckdb export: {table} row has implausible ts={ts} (expected Unix millis > {TS_MIN_MILLIS}); refusing to export garbage"
+    ))
 }
 
 /// The column names for each exported table (matches the CH table schemas).

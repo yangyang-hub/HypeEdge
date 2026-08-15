@@ -297,8 +297,9 @@ async fn write_typed_config(
                     config_version_id, spot_coin, entry_funding_rate, exit_funding_rate,
                     max_notional_usd, hedge_ratio, rebalance_threshold_bps, leverage,
                     max_slippage_bps, max_basis_bps, min_expected_edge_bps,
-                    expected_hold_hours, round_trip_fee_bps, max_unhedged_seconds
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+                    expected_hold_hours, round_trip_fee_bps, max_unhedged_seconds,
+                    max_hold_hours
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
                 "#,
             )
             .bind(config_version_id)
@@ -320,6 +321,7 @@ async fn write_typed_config(
             .bind(int_field(values, "expected_hold_hours"))
             .bind(dec_field(values, "round_trip_fee_bps"))
             .bind(int_field(values, "max_unhedged_seconds"))
+            .bind(int_field(values, "max_hold_hours"))
             .execute(&mut **tx)
             .await
             .map_err(map_sqlx)?;

@@ -4,8 +4,11 @@
 //! Requires `HYPE_TEST_PG_URL` (default `postgres://postgres:testpass@localhost:55432/hypeedge_test`).
 //! Skips when Postgres is unreachable.
 
+use hypeedge_domain::enums::MarketMakerLifecycle;
 use hypeedge_storage::config_version_pg::PostgresConfigVersionStore;
 use hypeedge_storage::config_version_store::ConfigVersionStore;
+use hypeedge_storage::strategy_state_store::PostgresStrategyStateStore;
+use hypeedge_trading::strategy::StrategyStateStore;
 use serde_json::json;
 use sqlx::PgPool;
 
@@ -182,4 +185,79 @@ async fn unknown_instance_rejected() {
         err.to_string().contains("Unknown active strategy instance"),
         "err: {err}"
     );
+}
+
+#[tokio::test]
+async fn set_runtime_revision_guard_rejects_stale() {
+    // M-PG: `set_runtime` must enforce the expected revision inside the
+    // statement (mirroring `set_desired`), so a stale handle cannot clobber a
+    // newer transition. `effective_config_revision` stays None here because
+    // the column FK-references `strategy_config_versions`.
+    let Some(pool) = try_pool().await else { return };
+    let _guard = acquire_test_lock(&pool).await;
+    clean(&pool).await;
+    seed_instance(&pool, "tf_rt", "trend_follow").await;
+    let store = PostgresStrategyStateStore::new(pool.clone());
+
+    // Create path (no expected revision) → row at revision 1.
+    let first = store
+        .set_runtime(
+            "tf_rt",
+            Some(MarketMakerLifecycle::Warming),
+            None,
+            false,
+            None,
+            None,
+        )
+        .await
+        .expect("create runtime row");
+    assert_eq!(first.revision, 1);
+
+    // Correct expected revision → succeeds and bumps to 2.
+    let second = store
+        .set_runtime(
+            "tf_rt",
+            Some(MarketMakerLifecycle::Shadow),
+            None,
+            false,
+            None,
+            Some(1),
+        )
+        .await
+        .expect("expected revision matches");
+    assert_eq!(second.revision, 2);
+
+    // Stale expected revision → refused.
+    let stale = store
+        .set_runtime(
+            "tf_rt",
+            Some(MarketMakerLifecycle::Running),
+            None,
+            false,
+            None,
+            Some(1),
+        )
+        .await;
+    assert!(stale.is_err(), "stale expected revision must be refused");
+
+    // Missing row with an expected revision → refused (nothing to guard).
+    let missing = store
+        .set_runtime(
+            "tf_missing",
+            Some(MarketMakerLifecycle::Warming),
+            None,
+            false,
+            None,
+            Some(0),
+        )
+        .await;
+    assert!(
+        missing.is_err(),
+        "missing runtime row with expected revision refused"
+    );
+
+    // The state was not clobbered by the stale write.
+    let runtime = store.get_runtime("tf_rt").await.unwrap().expect("runtime");
+    assert_eq!(runtime.revision, 2);
+    assert_eq!(runtime.actual_state, MarketMakerLifecycle::Shadow);
 }

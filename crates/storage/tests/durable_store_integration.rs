@@ -9,11 +9,13 @@
 use chrono::Utc;
 use hypeedge_domain::decimal::Decimal;
 use hypeedge_domain::enums::{OrderStatus, OrderType, Side, TimeInForce};
-use hypeedge_domain::models::{Order, RiskCheckResult};
+use hypeedge_domain::models::{AccountState, Order, Position, RiskCheckResult};
 use hypeedge_domain::traits::DurableOrderStore;
+use hypeedge_storage::account_state_store::PostgresAccountSnapshotStore;
 use hypeedge_storage::adapters::PooledDurableOrderStore;
 use hypeedge_storage::durable_order_store::PostgresDurableOrderStore;
 use hypeedge_storage::outbox::PostgresOutboxStore;
+use hypeedge_trading::account::account_health::{AccountSnapshotSink, PolledAccountSnapshot};
 use sqlx::PgPool;
 use uuid::Uuid;
 
@@ -602,4 +604,293 @@ async fn pooled_adapter_implements_durable_order_store_trait() {
         .unwrap()
         .expect("order persisted");
     assert_eq!(loaded.cloid, cloid);
+}
+
+#[tokio::test]
+async fn poller_null_action_credits_then_placement_succeeds() {
+    // C2 regression: the poller's account snapshot carries no `userRateLimit`
+    // field, so `account_state.action_credits_remaining` is written NULL. The
+    // DB risk scope's `SELECT * FROM account_state` must decode NULL as
+    // `Option::None` instead of failing the whole placement path.
+    let _guard = SERIAL.lock().await;
+    let Some(pool) = try_pool().await else { return };
+    let _test_lock = acquire_test_lock(&pool).await;
+    clean_tables(&pool).await;
+
+    // Simulate the poller: persist a snapshot that never sets the column.
+    let sink = PostgresAccountSnapshotStore::new(pool.clone());
+    let snapshot = PolledAccountSnapshot {
+        account_state: AccountState {
+            equity: hypeedge_domain::Usd::new(Decimal::from_str_strict("10000").unwrap()),
+            available_balance: hypeedge_domain::Usd::new(
+                Decimal::from_str_strict("10000").unwrap(),
+            ),
+            total_margin_used: hypeedge_domain::Usd::new(Decimal::ZERO),
+            total_unrealized_pnl: hypeedge_domain::Usd::new(Decimal::ZERO),
+            peak_equity: hypeedge_domain::Usd::new(Decimal::from_str_strict("10000").unwrap()),
+            sub_account: None,
+        },
+        positions: vec![Position {
+            symbol: "BTC".into(),
+            size: hypeedge_domain::Size::ZERO,
+            entry_price: None,
+            mark_price: Some(hypeedge_domain::Price::new(
+                Decimal::from_str_strict("100").unwrap(),
+            )),
+            unrealized_pnl: None,
+            leverage: 5,
+            liquidation_price: None,
+            sub_account: None,
+            strategy_id: None,
+        }],
+        received_at: Utc::now(),
+        spot_balances: vec![],
+    };
+    sink.persist(&snapshot)
+        .await
+        .expect("poller snapshot persists");
+
+    let nulls: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM account_state WHERE action_credits_remaining IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        nulls, 1,
+        "poller snapshot must leave action_credits_remaining NULL"
+    );
+
+    let store = PostgresDurableOrderStore::default();
+    let cloid = valid_cloid(201);
+    let mut order = make_order(&cloid, Side::Buy, "0.1", Some("100"));
+    order.status = OrderStatus::Submitted;
+    let effective = store
+        .persist_placement(
+            &pool,
+            &mut order,
+            &passing_risk(),
+            Uuid::new_v4(),
+            true,
+            None,
+        )
+        .await
+        .expect("placement persists with NULL action_credits_remaining");
+    assert!(
+        effective.passed,
+        "placement must pass with NULL action credits: {effective:?}"
+    );
+}
+
+#[tokio::test]
+async fn null_command_id_order_supports_get_and_transition() {
+    // H-PG1 regression: exchange-discovered orders (`find_or_create_order` and
+    // `persist_reconciled_order`) are inserted with `command_id = NULL`. The
+    // `OrderRow` decode must accept that, so `get_order` and
+    // `persist_transition` work on such rows.
+    let _guard = SERIAL.lock().await;
+    let Some(pool) = try_pool().await else { return };
+    let _test_lock = acquire_test_lock(&pool).await;
+    clean_tables(&pool).await;
+    seed_account_and_position(&pool).await;
+
+    // Row exactly as `find_or_create_order` writes it: command_id omitted.
+    let cloid = valid_cloid(202);
+    sqlx::query(
+        "INSERT INTO orders (order_id, cloid, exchange_oid, symbol, side, order_type, time_in_force, size, price, status, sub_account, is_spot, filled_size, revision, created_at, updated_at) VALUES ($1,$2,$3,'BTC','buy','limit','Gtc',0.1,100,'acknowledged',NULL,false,0,0,now(),now())",
+    )
+    .bind(Uuid::new_v4())
+    .bind(&cloid)
+    .bind("12345")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let store = PostgresDurableOrderStore::default();
+    let loaded = store
+        .get_order(&pool, &cloid)
+        .await
+        .expect("get_order decodes a NULL-command_id row")
+        .expect("order present");
+    assert_eq!(loaded.cloid, cloid);
+
+    // A transport transition on that row must also decode fine.
+    let mut transitioned = loaded.clone();
+    transitioned.status = OrderStatus::Acknowledged;
+    store
+        .persist_transition(&pool, &transitioned, "acknowledged", None, None)
+        .await
+        .expect("persist_transition on a NULL-command_id order succeeds");
+}
+
+#[tokio::test]
+async fn persist_reconciled_order_insert_and_update_branches() {
+    // H-PG2 regression: the INSERT branch had 23 placeholders for 22 binds
+    // (and no bind for the stray $23), so every new-order reconcile failed
+    // with "expected 23 parameters, got 22". Both branches must round-trip.
+    let _guard = SERIAL.lock().await;
+    let Some(pool) = try_pool().await else { return };
+    let _test_lock = acquire_test_lock(&pool).await;
+    clean_tables(&pool).await;
+
+    let store = PostgresDurableOrderStore::default();
+
+    // New order (INSERT branch).
+    let cloid = valid_cloid(203);
+    let mut fresh = make_order(&cloid, Side::Sell, "0.2", Some("99"));
+    fresh.exchange_oid = Some("777001".into());
+    fresh.status = OrderStatus::Acknowledged;
+    fresh.submitted_at = Some(Utc::now() - chrono::Duration::seconds(5));
+    fresh.acknowledged_at = Some(Utc::now());
+    store
+        .persist_reconciled_order(&pool, &fresh)
+        .await
+        .expect("new reconcile inserts");
+    let loaded = store
+        .get_order(&pool, &cloid)
+        .await
+        .expect("get after insert")
+        .expect("order exists");
+    assert_eq!(loaded.exchange_oid.as_deref(), Some("777001"));
+    assert_eq!(loaded.status, OrderStatus::Acknowledged);
+
+    // Update branch: filled data must land without regression.
+    let mut updated = loaded.clone();
+    updated.status = OrderStatus::Filled;
+    updated.filled_size = hypeedge_domain::Size::new(Decimal::from_str_strict("0.2").unwrap());
+    updated.avg_fill_price = Some(hypeedge_domain::Price::new(
+        Decimal::from_str_strict("98.5").unwrap(),
+    ));
+    updated.filled_at = Some(Utc::now());
+    store
+        .persist_reconciled_order(&pool, &updated)
+        .await
+        .expect("reconcile update succeeds");
+    let reloaded = store
+        .get_order(&pool, &cloid)
+        .await
+        .unwrap()
+        .expect("order after update");
+    assert_eq!(reloaded.status, OrderStatus::Filled);
+    assert_eq!(
+        reloaded.filled_size.inner(),
+        Decimal::from_str_strict("0.2").unwrap()
+    );
+    assert!(reloaded.filled_at.is_some(), "filled_at persisted");
+}
+
+#[tokio::test]
+async fn max_position_gate_uses_resulting_size_with_existing_position() {
+    // H-PG3 regression: `worst_symbol_size` computed `existing - buys` instead
+    // of `existing + buys`, under-counting same-direction add-ons and letting
+    // over-limit adds past the gate when a non-zero position existed (the
+    // pre-existing tests only covered existing=0).
+    let _guard = SERIAL.lock().await;
+    let Some(pool) = try_pool().await else { return };
+    let _test_lock = acquire_test_lock(&pool).await;
+    clean_tables(&pool).await;
+
+    // equity=800 → max_symbol_notional = 20% × 800 = 160.
+    sqlx::query(
+        "INSERT INTO account_state (sub_account, equity, available_balance, total_margin_used, total_unrealized_pnl, peak_equity, action_credits_remaining, exchange_updated_at, revision, updated_at) VALUES (NULL, 800, 800, 0, 0, 800, 10000, now(), 1, now())",
+    )
+    .execute(&pool).await.unwrap();
+    // Existing long position: 1.0 BTC @ mark 100.
+    sqlx::query(
+        "INSERT INTO positions (position_id, sub_account, symbol, size, entry_price, mark_price, leverage, exchange_updated_at, revision, created_at, updated_at) VALUES ($1, NULL, 'BTC', 1.0, 100, 100, 5, now(), 1, now(), now())",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool).await.unwrap();
+
+    let store = PostgresDurableOrderStore::default();
+    // First add-on 0.3 buy: resulting 1.3 BTC = 130 notional ≤ 160 → passes.
+    let mut first = make_order(&valid_cloid(204), Side::Buy, "0.3", Some("100"));
+    first.status = OrderStatus::Submitted;
+    let r1 = store
+        .persist_placement(
+            &pool,
+            &mut first,
+            &passing_risk(),
+            Uuid::new_v4(),
+            true,
+            None,
+        )
+        .await
+        .expect("first add-on persists");
+    assert!(r1.passed, "first add-on (1.3 BTC) must pass: {r1:?}");
+
+    // Second add-on 0.5 buy: resulting 1.8 BTC = 180 notional > 160 → the gate
+    // must reject using the resulting size (the buggy `existing - buys` gave
+    // |1.0 - 0.8| = 0.2 and would have let it through).
+    let mut second = make_order(&valid_cloid(205), Side::Buy, "0.5", Some("100"));
+    second.status = OrderStatus::Submitted;
+    let r2 = store
+        .persist_placement(
+            &pool,
+            &mut second,
+            &passing_risk(),
+            Uuid::new_v4(),
+            true,
+            None,
+        )
+        .await
+        .expect("second add-on evaluates");
+    assert!(!r2.passed, "over-limit add-on must be rejected: {r2:?}");
+    assert_eq!(
+        r2.reason.as_deref(),
+        Some("position_limit_exceeded_with_reservations")
+    );
+}
+
+#[tokio::test]
+async fn persist_placement_is_idempotent_for_existing_cloid() {
+    // M-PG regression: retrying a placement for an already-persisted cloid
+    // (crash between commit and the in-memory store) must not duplicate the
+    // order row or its child rows.
+    let _guard = SERIAL.lock().await;
+    let Some(pool) = try_pool().await else { return };
+    let _test_lock = acquire_test_lock(&pool).await;
+    clean_tables(&pool).await;
+    seed_account_and_position(&pool).await;
+
+    let store = PostgresDurableOrderStore::default();
+    let cloid = valid_cloid(206);
+    let mut order = make_order(&cloid, Side::Buy, "0.1", Some("100"));
+    order.status = OrderStatus::Submitted;
+    let command_id = Uuid::new_v4();
+    store
+        .persist_placement(&pool, &mut order, &passing_risk(), command_id, true, None)
+        .await
+        .expect("first placement");
+
+    // Retry with the same cloid (a different command id, as a crash-retry
+    // would): must be a no-op that reports the persisted outcome.
+    let mut retry = order.clone();
+    let effective = store
+        .persist_placement(
+            &pool,
+            &mut retry,
+            &passing_risk(),
+            Uuid::new_v4(),
+            true,
+            None,
+        )
+        .await
+        .expect("retry evaluates");
+    assert!(effective.passed, "retry of accepted order reports passed");
+
+    let orders: i64 = sqlx::query_scalar("SELECT count(*) FROM orders WHERE cloid=$1")
+        .bind(&cloid)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(orders, 1, "no duplicate order row");
+    let commands: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM execution_commands WHERE order_id=(SELECT order_id FROM orders WHERE cloid=$1)",
+    )
+    .bind(&cloid)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(commands, 1, "no duplicate execution command");
 }
