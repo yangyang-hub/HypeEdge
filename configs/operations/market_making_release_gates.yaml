@@ -1,3 +1,5 @@
+# 人工门禁记录（human release-gate checklist）：本文件仅供人工核对/记录各阶段完成状态，
+# 不被任何代码或脚本消费（无脚本依赖）；`completion_claims` 需人工确认真实证据后更新。
 schema_version: 1
 authority:
   transactional_facts: postgres
