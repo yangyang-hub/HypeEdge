@@ -55,6 +55,22 @@ export function formatPct(value: DecimalValue, decimals: number = 2): string {
   return `${new Decimal(value).mul(100).toFixed(decimals)}%`
 }
 
+/**
+ * 后端 `pct_used` 已经是 0–100 的百分数值（crates/api/src/routes/risk.rs），
+ * 这里直接按百分比展示，不再 ×100（避免 33.33 → "3333%" 的双重放大）。
+ */
+export function formatPctUsed(pctUsed: DecimalValue, decimals: number = 2): string {
+  return `${formatPrice(pctUsed, decimals)}%`
+}
+
+/**
+ * 后端 `pct_used`（0–100）转为 0–1 分数，供 ProgressBar 等比例组件使用。
+ * 超过 100（超限）时饱和到 1。
+ */
+export function pctUsedFraction(pctUsed: DecimalValue): number {
+  return new Decimal(pctUsed).div(100).clamp(0, 1).toNumber()
+}
+
 export function formatTime(isoString: string | null): string {
   if (!isoString) return "—"
   const d = new Date(isoString)

@@ -154,8 +154,9 @@ export interface StrategyInstanceBase {
   effective_config_version_id: number | null
   revision: number
   archived_at: string | null
-  created_at: string
-  updated_at: string
+  /** 后端可能不返回（null → 前端显示 "—"）。 */
+  created_at: string | null
+  updated_at: string | null
   metadata?: Record<string, string>
 }
 

@@ -27,7 +27,9 @@ export function GlobalAlerts() {
           {status.safety_reason ? `（${status.safety_reason}）` : ""}
         </div>
       ) : null}
-      {error || !connected ? (
+      {/* L-FE8: connected 初始为 null（未知），首帧到达前不显示断线横幅，
+          避免首屏闪现「实时连接中断」；明确断开（false）才显示。 */}
+      {error || connected === false ? (
         <div className="flex min-h-8 items-center justify-center gap-2 bg-bg-panel px-4 py-1 text-xs text-warning" role="status">
           <RadioTower aria-hidden="true" className="h-3.5 w-3.5" />
           实时连接中断，当前数据可能已过期；界面保留最后一次成功数据

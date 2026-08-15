@@ -25,17 +25,20 @@ export function Topbar() {
   const { account } = useAccount()
   const [killOpen, setKillOpen] = useState(false)
   const [killing, setKilling] = useState(false)
+  // M-FE6: kill switch 触发失败必须可见，不能只在 console 里静默。
+  const [killError, setKillError] = useState<string | null>(null)
 
-  const tone = liveTone(connected, Boolean(status?.kill_switch_active))
+  const tone = liveTone(connected === false ? false : true, Boolean(status?.kill_switch_active))
 
   async function handleKill() {
     setKilling(true)
+    setKillError(null)
     try {
       await triggerKillSwitch("manual_trigger_topbar")
       await mutate()
       setKillOpen(false)
     } catch (error) {
-      console.error("Kill switch trigger failed:", error)
+      setKillError(error instanceof Error ? error.message : "Kill Switch 触发失败")
     } finally {
       setKilling(false)
     }
@@ -52,7 +55,7 @@ export function Topbar() {
 
         <LiveIndicator
           tone={tone}
-          title={connected ? "SSE 已连接" : "SSE 断开"}
+          title={connected === null ? "SSE 连接中…" : connected ? "SSE 已连接" : "SSE 断开"}
         />
 
         {status?.safety_mode ? (
@@ -89,6 +92,16 @@ export function Topbar() {
           </Button>
         </div>
       </header>
+
+      {killError ? (
+        <div
+          role="alert"
+          className="flex items-center justify-center gap-2 border-b border-loss/30 bg-loss/15 px-4 py-1.5 text-xs text-loss"
+        >
+          <ShieldAlert className="h-3.5 w-3.5" aria-hidden="true" />
+          Kill Switch 触发失败：{killError}
+        </div>
+      ) : null}
 
       <ConfirmPhraseDialog
         open={killOpen}

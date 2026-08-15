@@ -79,8 +79,11 @@ export function MarketMakingWorkspace({ strategyId, justCreated = false }: Marke
     }
     setCommandError(null)
     try {
+      // H-FE4: start 动作默认进入 Shadow（与策略列表页 startStrategy(strategy, "shadow")
+      // 对齐），防止不带 target_state 时后端默认 Running 绕过 Shadow 验证。
       await runStrategyAction(strategyId, action, state?.runtime_revision ?? 0, {
         confirmation: confirmation || undefined,
+        ...(action === "start" ? { target_state: "shadow" as const } : {}),
       })
       setPendingAction(null)
       setConfirmation("")
@@ -227,20 +230,22 @@ function ConnectionStrip({
   observedAt,
   stale,
 }: {
-  reliableConnected: boolean
+  reliableConnected: boolean | null
   realtimeState: string
   observedAt: string | null
   stale: boolean
 }) {
+  const sseTone =
+    reliableConnected === true ? "bg-profit/15 text-profit" : reliableConnected === false ? "bg-loss/15 text-loss" : "bg-warning/15 text-warning"
+  const sseLabel =
+    reliableConnected === true ? "可靠流已连接" : reliableConnected === false ? "已断开" : "连接中"
   return (
     <div className="flex flex-wrap items-center gap-2 text-xs">
-      <span className={cn("rounded-full px-2 py-1", reliableConnected ? "bg-profit/15 text-profit" : "bg-loss/15 text-loss")}>
-        SSE {reliableConnected ? "可靠流已连接" : "已断开"}
-      </span>
+      <span className={cn("rounded-full px-2 py-1", sseTone)}>SSE {sseLabel}</span>
       <span className={cn("rounded-full px-2 py-1", realtimeState === "connected" ? "bg-profit/15 text-profit" : "bg-warning/15 text-warning")}>
         WS {realtimeState === "disabled" ? "未配置（不影响控制）" : realtimeState}
       </span>
-      <SnapshotTime observedAt={observedAt} stale={stale || !reliableConnected} />
+      <SnapshotTime observedAt={observedAt} stale={stale || reliableConnected === false} />
     </div>
   )
 }

@@ -78,8 +78,27 @@ export function CreateStrategyDialog({
   const needsInstrumentMeta = strategyType === "market_maker"
   const { meta, error: metaError } = useInstrumentMeta(open && needsInstrumentMeta ? symbol : undefined)
 
+  // M-FE1: 账户轮询（每 5s）会改变 equity，不能因此重置表单。equity 只通过
+  // ref 提供给「打开时」的库存带建议，自身不是重置 effect 的依赖。
+  const equityRef = useRef(account?.equity)
+  const wasOpenRef = useRef(false)
+  // M-FE2: quote_size 建议只在首次加载/换币种时生效；用户编辑后不再被 meta
+  // 轮询（每 30s 新对象）覆盖。
+  const quoteSizeTouchedRef = useRef(false)
+  const quoteSizeSuggestedSymbolRef = useRef<string | null>(null)
+
   useEffect(() => {
-    if (!open) return
+    equityRef.current = account?.equity
+  }, [account?.equity])
+
+  useEffect(() => {
+    if (!open) {
+      wasOpenRef.current = false
+      return
+    }
+    // 只在 open 从 false→true 时重置一次；已打开时 equity 轮询不应清空输入。
+    if (wasOpenRef.current) return
+    wasOpenRef.current = true
     setStep(1)
     setStrategyType("market_maker")
     setStrategyId("")
@@ -90,18 +109,29 @@ export function CreateStrategyDialog({
     setSubmitting(false)
     idempotencyKeyRef.current = createIdempotencyKey()
     const next = cloneDefaultMmConfig()
-    if (account?.equity) {
-      Object.assign(next, inventoryBandsFromEquity(account.equity))
+    if (equityRef.current) {
+      Object.assign(next, inventoryBandsFromEquity(equityRef.current))
     }
     setMmConfig(next)
     setTfConfig(cloneDefaultTfConfig())
     setFaConfig(cloneDefaultFaConfig())
-  }, [open, account?.equity])
+    quoteSizeTouchedRef.current = false
+    quoteSizeSuggestedSymbolRef.current = null
+  }, [open])
 
   useEffect(() => {
     if (!open || !meta || strategyType !== "market_maker") return
+    if (quoteSizeTouchedRef.current) return
+    if (quoteSizeSuggestedSymbolRef.current === symbol) return
+    quoteSizeSuggestedSymbolRef.current = symbol
     setMmConfig((previous) => ({ ...previous, quote_size: suggestQuoteSize(meta) }))
   }, [meta, open, symbol, strategyType])
+
+  /** 用户编辑 quote_size 后标记 dirty，阻止轮询建议覆盖。 */
+  function handleMmConfigChange(next: MarketMakerConfig) {
+    if (next.quote_size !== mmConfig.quote_size) quoteSizeTouchedRef.current = true
+    setMmConfig(next)
+  }
 
   const conflictHint = useMemo(() => {
     const id = strategyId.trim()
@@ -285,7 +315,11 @@ export function CreateStrategyDialog({
                   id="create-symbol"
                   className="mt-1.5 flex h-9 w-full rounded-md border border-border bg-bg-primary px-3 font-mono text-sm"
                   value={symbol}
-                  onChange={(event) => setSymbol(event.target.value)}
+                  onChange={(event) => {
+                    // 换币种时允许对新品种重新做 quote_size 建议（M-FE2）。
+                    quoteSizeTouchedRef.current = false
+                    setSymbol(event.target.value)
+                  }}
                 >
                   {TRADE_SYMBOLS.map((item) => (
                     <option key={item} value={item}>
@@ -311,7 +345,7 @@ export function CreateStrategyDialog({
           <div className="space-y-3">
             <MarketMakerConfigFields
               value={mmConfig}
-              onChange={setMmConfig}
+              onChange={handleMmConfigChange}
               mode="create"
               showAdvanced={showAdvanced}
             />

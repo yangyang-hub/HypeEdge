@@ -10,7 +10,7 @@ import { usePositions } from "@/hooks/use-positions"
 import { useRiskStatus } from "@/hooks/use-risk"
 import { useInstrumentMeta } from "@/hooks/use-system-status"
 import type { Position } from "@/lib/types"
-import { decimalToNumber, formatDateTime, formatPct, formatPrice, formatSize, formatUsd } from "@/lib/utils"
+import { formatDateTime, formatPct, formatPrice, formatSize, formatUsd, pctUsedFraction } from "@/lib/utils"
 
 export default function DashboardPage() {
   const { account, error: accountError } = useAccount()
@@ -97,7 +97,8 @@ export default function DashboardPage() {
                     </span>
                   </div>
                   {risk.limits.map((limit) => {
-                    const used = decimalToNumber(limit.pct_used)
+                    // pct_used 是 0–100 百分数值，进度条需要 0–1 分数。
+                    const used = pctUsedFraction(limit.pct_used)
                     return (
                       <div key={limit.name} className="space-y-1">
                         <div className="flex items-center justify-between text-xs">

@@ -1,9 +1,11 @@
 import { cleanup, render, screen } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import type { DecimalString } from "@/lib/types"
 
 const useMarketMakingMock = vi.fn()
 const useRealtimeMock = vi.fn()
+const runStrategyActionMock = vi.hoisted(() => vi.fn())
 
 vi.mock("next/dynamic", () => ({ default: () => () => <div data-testid="pnl-chart" /> }))
 vi.mock("next/link", () => ({ default: ({ children, href }: { children: React.ReactNode; href: string }) => <a href={href}>{children}</a> }))
@@ -12,7 +14,7 @@ vi.mock("@/components/layout/app-shell", () => ({
 }))
 vi.mock("@/hooks/use-market-making", () => ({
   useMarketMaking: (...args: unknown[]) => useMarketMakingMock(...args),
-  runStrategyAction: vi.fn(),
+  runStrategyAction: runStrategyActionMock,
   createMarketMakerConfig: vi.fn(),
   activateMarketMakerConfig: vi.fn(),
   rollbackMarketMakerConfig: vi.fn(),
@@ -33,9 +35,13 @@ const freshness = {
 }
 
 describe("MarketMakingWorkspace", () => {
-  afterEach(cleanup)
+  afterEach(() => {
+    cleanup()
+    runStrategyActionMock.mockReset()
+  })
 
   beforeEach(() => {
+    runStrategyActionMock.mockResolvedValue(undefined)
     useRealtimeMock.mockReturnValue({ overlay: null, connectionState: "connected" })
     useMarketMakingMock.mockReturnValue({
       state: {
@@ -207,5 +213,23 @@ describe("MarketMakingWorkspace", () => {
     render(<MarketMakingWorkspace strategyId="mm-btc" />)
 
     expect(screen.getByText(/External reference 未启用/)).toBeInTheDocument()
+  })
+
+  it("H-FE4: start 动作默认携带 target_state=shadow", async () => {
+    const user = userEvent.setup()
+    render(<MarketMakingWorkspace strategyId="mm-btc" />)
+
+    await user.click(screen.getByRole("button", { name: "start" }))
+
+    expect(runStrategyActionMock).toHaveBeenCalledWith(
+      "mm-btc",
+      "start",
+      12,
+      expect.objectContaining({ target_state: "shadow" }),
+    )
+    // 其它动作不携带 target_state。
+    runStrategyActionMock.mockClear()
+    await user.click(screen.getByRole("button", { name: "stop" }))
+    expect(runStrategyActionMock).toHaveBeenCalledWith("mm-btc", "stop", 12, expect.not.objectContaining({ target_state: "shadow" }))
   })
 })

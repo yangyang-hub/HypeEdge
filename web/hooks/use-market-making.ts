@@ -3,6 +3,7 @@
 import { useCallback, useEffect } from "react"
 import useSWR from "swr"
 import { fetcher, poster } from "@/lib/api"
+import { STREAM_RESYNC_EVENT } from "@/lib/event-contract"
 import { SWR_REFRESH_INTERVAL, SWR_SLOW_INTERVAL } from "@/lib/constants"
 import { useSSE } from "@/hooks/use-sse"
 import type {
@@ -14,20 +15,52 @@ import type {
   MarketMakingPerformanceSnapshot,
   MarketMakingQuotesSnapshot,
   MarketMakingStateSnapshot,
+  SSEEvent,
   StrategyDesiredState,
 } from "@/lib/types"
 
-const RELIABLE_MARKET_MAKING_EVENTS = new Set([
-  "strategy.lifecycle.changed",
-  "strategy.config.activated",
-  "strategy.config.rolled_back",
-  "market_making.risk.changed",
-  "market_making.execution.unknown",
-  "market_making.budget.changed",
-  "market_making.reconciliation.completed",
-  "market_making.operator.audit",
-  "StreamResyncRequired",
+/**
+ * 触发 MM 工作台全量 resync 的事件（真实后端事件名，见
+ * crates/domain/src/events.rs `ALL_EVENT_TYPES`）。旧实现里的
+ * "strategy.lifecycle.changed" 等 dot-case 事件后端并不存在，已删除；
+ * `StreamResyncRequired` 是 SSE 重放缺口时前端专用事件。
+ */
+export const RELIABLE_MARKET_MAKING_EVENTS = new Set<string>([
+  // Market-making analytics（lossy；经 durable outbox 流式下发时携带 strategy_id）。
+  "MarketMakerFeatureSample",
+  "MarketMakerQuoteDecision",
+  "MarketMakerInventorySample",
+  "MarketMakerActionCreditSample",
+  "MarketMakerFillMarkout",
+  // Execution —— 成交/撤单直接改变库存与报价。
+  "OrderSubmitted",
+  "OrderAcknowledged",
+  "OrderFilled",
+  "OrderPartialFill",
+  "OrderCancelled",
+  "OrderRejected",
+  "OrderExpired",
+  // Account。
+  "PositionChanged",
+  "BalanceChanged",
+  "AccountStateUpdate",
+  // Risk / system。
+  "RiskCheckPassed",
+  "RiskCheckFailed",
+  "KillSwitchTriggered",
+  "ReconciliationComplete",
+  "ActionCreditsLow",
+  // 前端专用。
+  STREAM_RESYNC_EVENT,
 ])
+
+/** 判断某个 SSE 事件是否需要触发该策略的 resync（事件类型 + strategy_id 过滤）。 */
+export function shouldResyncMarketMaking(event: SSEEvent, strategyId: string): boolean {
+  if (!RELIABLE_MARKET_MAKING_EVENTS.has(event.event_type)) return false
+  const eventStrategyId = event.payload.strategy_id
+  if (typeof eventStrategyId === "string" && eventStrategyId !== strategyId) return false
+  return true
+}
 
 export function useMarketMaking(strategyId: string) {
   const base = `/api/v1/market-making/${encodeURIComponent(strategyId)}`
@@ -82,9 +115,7 @@ export function useMarketMaking(strategyId: string) {
   }, [mutateBudget, mutateConfigs, mutateEvents, mutateInventory, mutatePerformance, mutateQuotes, mutateState])
 
   useEffect(() => {
-    if (!lastEvent || !RELIABLE_MARKET_MAKING_EVENTS.has(lastEvent.event_type)) return
-    const eventStrategyId = lastEvent.payload.strategy_id
-    if (typeof eventStrategyId === "string" && eventStrategyId !== strategyId) return
+    if (!lastEvent || !shouldResyncMarketMaking(lastEvent, strategyId)) return
     void resync()
   }, [lastEvent, resync, strategyId])
 

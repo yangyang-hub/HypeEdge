@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button"
 import { ConfirmPhraseDialog } from "@/components/ui/confirm-phrase-dialog"
 import { EmptyState, Metric, Panel, ProgressBar } from "@/components/ui/data-display"
 import { useRiskStatus, triggerKillSwitch, resetKillSwitch } from "@/hooks/use-risk"
-import { decimalToNumber, formatPct, formatPrice } from "@/lib/utils"
+import { formatPct, formatPctUsed, formatPrice, pctUsedFraction } from "@/lib/utils"
 
 export default function RiskPage() {
   const { risk, refresh } = useRiskStatus()
@@ -101,7 +101,8 @@ export default function RiskPage() {
                 <EmptyState message="暂无限额数据" />
               ) : (
                 risk.limits.map((limit) => {
-                  const used = decimalToNumber(limit.pct_used)
+                  // pct_used 是 0–100 百分数值：进度条用分数，文案直接按百分比显示。
+                  const used = pctUsedFraction(limit.pct_used)
                   return (
                     <div key={limit.name} className="flex items-center gap-3">
                       <span className="w-28 shrink-0 text-sm text-text-secondary">{limit.name}</span>
@@ -116,7 +117,7 @@ export default function RiskPage() {
                           used > 0.8 ? "text-loss" : used > 0.6 ? "text-warning" : "text-profit"
                         }`}
                       >
-                        {formatPct(limit.pct_used, 0)}
+                        {formatPctUsed(limit.pct_used, 2)}
                       </span>
                     </div>
                   )

@@ -57,8 +57,10 @@ export function normalizeStrategy(raw: StrategyListItem): StrategyInstance {
     effective_config_version_id: raw.effective_config_version_id ?? null,
     revision: raw.revision ?? 0,
     archived_at: raw.archived_at ?? null,
-    created_at: raw.created_at ?? new Date(0).toISOString(),
-    updated_at: raw.updated_at ?? new Date(0).toISOString(),
+    // L-FE5: 后端可能不返回 created_at/updated_at；不再 fallback 到
+    // new Date(0)（显示 1970），保留 null 由 formatDateTime 渲染为 "—"。
+    created_at: raw.created_at ?? null,
+    updated_at: raw.updated_at ?? null,
     metadata: raw.metadata,
   }
 

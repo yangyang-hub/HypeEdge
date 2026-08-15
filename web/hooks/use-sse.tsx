@@ -2,68 +2,18 @@
 
 import { createContext, useContext, useEffect, useMemo, useState } from "react"
 import { useSWRConfig } from "swr"
+import { revalidationTargets } from "@/lib/event-contract"
 import type { SSEEvent } from "@/lib/types"
 
+/**
+ * SSE 连接状态。`null` = 尚未建立/尚不确定（首帧到达前），避免首屏误报断线。
+ */
 interface SSEState {
-  connected: boolean
+  connected: boolean | null
   lastEvent: SSEEvent | null
 }
 
-const SSEContext = createContext<SSEState>({ connected: false, lastEvent: null })
-
-const EVENT_KEYS: Record<string, string[]> = {
-  OrderSubmitted: ["/api/v1/orders"],
-  OrderAcknowledged: ["/api/v1/orders"],
-  OrderFilled: ["/api/v1/orders", "/api/v1/positions", "/api/v1/account"],
-  OrderPartialFill: ["/api/v1/orders", "/api/v1/positions", "/api/v1/account"],
-  OrderExpired: ["/api/v1/orders"],
-  OrderCancelled: ["/api/v1/orders"],
-  PositionChanged: ["/api/v1/positions", "/api/v1/account"],
-  BalanceChanged: ["/api/v1/account"],
-  AccountStateUpdate: ["/api/v1/account", "/api/v1/risk/status"],
-  KillSwitchTriggered: ["/api/v1/system/status", "/api/v1/risk/status"],
-  "order.submitted": ["/api/v1/orders"],
-  "order.acknowledged": ["/api/v1/orders"],
-  "order.filled": ["/api/v1/orders", "/api/v1/positions", "/api/v1/account"],
-  "order.cancelled": ["/api/v1/orders"],
-  "order.rejected": ["/api/v1/orders"],
-  "exchange.fill.ingested": ["/api/v1/orders", "/api/v1/positions", "/api/v1/account"],
-  "exchange.order.updated": ["/api/v1/orders"],
-  "system.safety.transitioned": ["/api/v1/system/status", "/api/v1/risk/status"],
-  "reconciliation.completed": [
-    "/api/v1/system/status",
-    "/api/v1/account",
-    "/api/v1/positions",
-    "/api/v1/orders",
-    "/api/v1/risk/status",
-  ],
-  // The Rust backend emits snake_case event names (the Phase-6 contract
-  // cleanup). Map them to the same revalidation endpoints.
-  order_submitted: ["/api/v1/orders"],
-  order_acknowledged: ["/api/v1/orders"],
-  order_filled: ["/api/v1/orders", "/api/v1/positions", "/api/v1/account"],
-  order_partial_fill: ["/api/v1/orders", "/api/v1/positions", "/api/v1/account"],
-  order_expired: ["/api/v1/orders"],
-  order_cancelled: ["/api/v1/orders"],
-  order_rejected: ["/api/v1/orders"],
-  position_changed: ["/api/v1/positions", "/api/v1/account"],
-  balance_changed: ["/api/v1/account"],
-  account_state_update: ["/api/v1/account", "/api/v1/risk/status"],
-  kill_switch_triggered: ["/api/v1/system/status", "/api/v1/risk/status"],
-  signal_generated: ["/api/v1/strategies"],
-  risk_check_passed: ["/api/v1/risk/status"],
-  risk_check_failed: ["/api/v1/risk/status"],
-  action_credits_low: ["/api/v1/risk/status"],
-  reconciliation_complete: [
-    "/api/v1/system/status",
-    "/api/v1/account",
-    "/api/v1/positions",
-    "/api/v1/orders",
-    "/api/v1/risk/status",
-  ],
-  ws_connected: [],
-  ws_disconnected: [],
-}
+const SSEContext = createContext<SSEState>({ connected: null, lastEvent: null })
 
 const RESYNC_KEYS = [
   "/api/v1/system/status",
@@ -76,12 +26,19 @@ const RESYNC_KEYS = [
 
 export function SSEProvider({ children }: { children: React.ReactNode }) {
   const { mutate } = useSWRConfig()
-  const [state, setState] = useState<SSEState>({ connected: false, lastEvent: null })
+  const [state, setState] = useState<SSEState>({ connected: null, lastEvent: null })
 
   useEffect(() => {
     const controller = new AbortController()
     let reconnectTimer: ReturnType<typeof setTimeout> | undefined
-    let lastEventId = sessionStorage.getItem("hypeedge:last-event-id") ?? ""
+    // N-FE4: sessionStorage can throw (private mode / disabled storage); the
+    // stream must keep working without last-event-id replay.
+    let lastEventId = ""
+    try {
+      lastEventId = sessionStorage.getItem("hypeedge:last-event-id") ?? ""
+    } catch {
+      lastEventId = ""
+    }
 
     async function connect() {
       try {
@@ -119,7 +76,11 @@ export function SSEProvider({ children }: { children: React.ReactNode }) {
                 nextSequence <= previousSequence
               ) continue
               lastEventId = id
-              sessionStorage.setItem("hypeedge:last-event-id", id)
+              try {
+                sessionStorage.setItem("hypeedge:last-event-id", id)
+              } catch {
+                // ignore storage failures (private mode / disabled storage)
+              }
             }
             if (event.event_type === "StreamResyncRequired") {
               for (const prefix of RESYNC_KEYS) {
@@ -127,7 +88,7 @@ export function SSEProvider({ children }: { children: React.ReactNode }) {
               }
             }
             setState({ connected: true, lastEvent: event })
-            for (const prefix of EVENT_KEYS[event.event_type] ?? []) {
+            for (const prefix of revalidationTargets(event.event_type)) {
               void mutate((key) => typeof key === "string" && key.startsWith(prefix))
             }
           }

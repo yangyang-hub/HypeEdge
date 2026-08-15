@@ -7,7 +7,6 @@ import { AlertConfirmDialog } from "@/components/ui/alert-confirm-dialog"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { EmptyState, Panel, SideTag, StaleBanner } from "@/components/ui/data-display"
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { useOrders, cancelOrder } from "@/hooks/use-orders"
 import { useInstrumentMeta } from "@/hooks/use-system-status"
@@ -35,8 +34,11 @@ function statusVariant(status: OrderStatus): "default" | "accent" | "profit" | "
 }
 
 export default function OrdersPage() {
-  const [tab, setTab] = useState<"active" | "terminal">("active")
-  const { orders, refresh, error, isLoading } = useOrders(tab)
+  // M-FE5: 后端 GET /api/v1/orders 目前忽略 `status` 参数（恒返回活跃订单，
+  // crates/api/src/routes/account.rs `orders`），历史 tab 会误展示活跃订单，
+  // 因此先降级为仅活跃订单视图。契约实现保留在 use-orders.ts（status 参数照传），
+  // 待后端子代理支持 status 过滤后再恢复双 tab。
+  const { orders, refresh, error, isLoading } = useOrders("active")
   const [actionError, setActionError] = useState<string | null>(null)
   const [cancelTarget, setCancelTarget] = useState<string | null>(null)
   const [cancelling, setCancelling] = useState(false)
@@ -58,64 +60,57 @@ export default function OrdersPage() {
   return (
     <AppShell>
       <main id="main-content" className="flex-1 space-y-4 overflow-y-auto p-3 md:p-5">
-        <PageHeader title="订单" subtitle="活跃订单与历史终态订单" />
+        <PageHeader title="订单" subtitle="活跃订单（历史终态订单待后端 status 过滤支持）" />
 
-        <Tabs value={tab} onValueChange={(value) => setTab(value as "active" | "terminal")}>
-          <TabsList>
-            <TabsTrigger value="active">活跃订单</TabsTrigger>
-            <TabsTrigger value="terminal">历史订单</TabsTrigger>
-          </TabsList>
+        <div className="mt-4 space-y-3">
+          {actionError ? (
+            <p role="alert" className="rounded-md border border-loss/30 bg-loss/10 px-3 py-2 text-sm text-loss">
+              {actionError}
+            </p>
+          ) : null}
+          {error ? <StaleBanner message="数据刷新失败，正在显示最后一次成功结果" /> : null}
 
-          <TabsContent value={tab} className="mt-4 space-y-3">
-            {actionError ? (
-              <p role="alert" className="rounded-md border border-loss/30 bg-loss/10 px-3 py-2 text-sm text-loss">
-                {actionError}
-              </p>
-            ) : null}
-            {error ? <StaleBanner message="数据刷新失败，正在显示最后一次成功结果" /> : null}
-
-            <Panel>
-              <Table>
-                <TableHeader>
+          <Panel>
+            <Table>
+              <TableHeader>
+                <TableRow className="hover:bg-transparent">
+                  <TableHead>时间</TableHead>
+                  <TableHead>币种</TableHead>
+                  <TableHead>方向</TableHead>
+                  <TableHead className="text-right">数量</TableHead>
+                  <TableHead className="text-right">价格</TableHead>
+                  <TableHead>状态</TableHead>
+                  <TableHead className="text-right">已成交</TableHead>
+                  <TableHead className="text-right">操作</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {isLoading && orders.length === 0 ? (
                   <TableRow className="hover:bg-transparent">
-                    <TableHead>时间</TableHead>
-                    <TableHead>币种</TableHead>
-                    <TableHead>方向</TableHead>
-                    <TableHead className="text-right">数量</TableHead>
-                    <TableHead className="text-right">价格</TableHead>
-                    <TableHead>状态</TableHead>
-                    <TableHead className="text-right">已成交</TableHead>
-                    <TableHead className="text-right">操作</TableHead>
+                    <TableCell colSpan={8} className="p-0">
+                      <EmptyState message="正在加载订单…" />
+                    </TableCell>
                   </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {isLoading && orders.length === 0 ? (
-                    <TableRow className="hover:bg-transparent">
-                      <TableCell colSpan={8} className="p-0">
-                        <EmptyState message="正在加载订单…" />
-                      </TableCell>
-                    </TableRow>
-                  ) : orders.length === 0 ? (
-                    <TableRow className="hover:bg-transparent">
-                      <TableCell colSpan={8} className="p-0">
-                        <EmptyState message={tab === "active" ? "无活跃订单" : "无历史订单"} />
-                      </TableCell>
-                    </TableRow>
-                  ) : (
-                    orders.map((order) => (
-                      <OrderRow
-                        key={order.cloid}
-                        order={order}
-                        showCancel={tab === "active"}
-                        onCancel={() => setCancelTarget(order.cloid)}
-                      />
-                    ))
-                  )}
-                </TableBody>
-              </Table>
-            </Panel>
-          </TabsContent>
-        </Tabs>
+                ) : orders.length === 0 ? (
+                  <TableRow className="hover:bg-transparent">
+                    <TableCell colSpan={8} className="p-0">
+                      <EmptyState message="无活跃订单" />
+                    </TableCell>
+                  </TableRow>
+                ) : (
+                  orders.map((order) => (
+                    <OrderRow
+                      key={order.cloid}
+                      order={order}
+                      showCancel
+                      onCancel={() => setCancelTarget(order.cloid)}
+                    />
+                  ))
+                )}
+              </TableBody>
+            </Table>
+          </Panel>
+        </div>
       </main>
 
       <AlertConfirmDialog
