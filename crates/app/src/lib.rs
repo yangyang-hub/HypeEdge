@@ -6,6 +6,7 @@ use std::sync::Arc;
 use hypeedge_api::AppState;
 use hypeedge_config::loader::load_settings;
 use hypeedge_config::settings::AppSettings;
+use hypeedge_domain::traits::ExecutionClient;
 use hypeedge_infra::event_bus::EventBus;
 use hypeedge_trading::market_data::BookManager;
 use hypeedge_trading::risk::KillSwitch;
@@ -92,6 +93,12 @@ impl HypeEdgeApp {
 
     /// Run the HTTP server until shutdown (C9: graceful shutdown on
     /// SIGINT/SIGTERM so in-flight requests drain instead of an abrupt kill).
+    ///
+    /// P5-3: once the shutdown signal fires, the trading runtime is wound down
+    /// in order — cancel-all flattening working orders, then a bounded drain
+    /// window — as part of the axum graceful-shutdown future, so the process
+    /// never exits while orders are still live on the exchange and never hangs
+    /// on a stuck exchange call (every step is timeout-bounded).
     pub async fn serve(&self) -> Result<(), String> {
         let api = &self.settings.api;
         let addr = format!("{}:{}", api.host, api.port);
@@ -100,11 +107,67 @@ impl HypeEdgeApp {
             .map_err(|e| format!("bind {addr}: {e}"))?;
         let router = self.router();
         tracing::info!(addr = %addr, "api_server_started");
-        axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal())
-            .await
-            .map_err(|e| format!("serve: {e}"))
+        let execution = self.runtime.execution.clone();
+        let drain = async move {
+            shutdown_signal().await;
+            shutdown_runtime(execution.as_deref().map(|e| e as &dyn ExecutionClient)).await;
+        };
+        // H-AP1: the server must expose the real peer address as
+        // `ConnectInfo<SocketAddr>` so the api middleware can rate-limit per
+        // client. Without it every request falls back to a single shared
+        // "unknown" key (safe but over-restrictive). `axum::serve` with a
+        // `TcpListener` + `into_make_service_with_connect_info::<SocketAddr>`
+        // is the documented axum 0.8 way; no `tower::ServiceBuilder` needed.
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(drain)
+        .await
+        .map_err(|e| format!("serve: {e}"))
     }
+}
+
+/// P5-3: cancel-all timeout before the process gives up on flattening working
+/// orders (a stuck exchange must not block shutdown).
+const SHUTDOWN_CANCEL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// P5-3: bounded drain window after cancel-all, so the durable worker /
+/// in-flight commands get a moment to settle before the process exits.
+const SHUTDOWN_DRAIN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Graceful-shutdown sequence (P5-3), run after the shutdown signal arrives
+/// and before the process exits:
+///
+/// 1. stop the strategy supervisor — no live supervisor registry is exposed by
+///    the current wiring (`MarketMakerRuntimeFactory` builds per-strategy
+///    runtimes on demand and has no stop hook), so this step is a no-op today;
+/// 2. kill-switch style cancel-all: flatten every working order through the
+///    engine's [`ExecutionClient::cancel_all_orders`];
+/// 3. bounded drain window.
+///
+/// Every step is wrapped in a timeout so a hung exchange cannot block exit.
+/// The axum graceful shutdown runs concurrently: this future is the
+/// `with_graceful_shutdown` future, so in-flight HTTP requests keep draining
+/// while the trading runtime winds down.
+async fn shutdown_runtime(execution: Option<&dyn ExecutionClient>) {
+    tracing::info!("shutdown_sequence_started");
+    if let Some(engine) = execution {
+        match tokio::time::timeout(SHUTDOWN_CANCEL_TIMEOUT, engine.cancel_all_orders(None)).await {
+            Ok(Ok(cancelled)) => {
+                tracing::info!(cancelled, "shutdown_cancel_all_complete");
+            }
+            Ok(Err(e)) => {
+                tracing::error!(error = %e, "shutdown_cancel_all_failed");
+            }
+            Err(_) => {
+                tracing::error!("shutdown_cancel_all_timed_out");
+            }
+        }
+    } else {
+        tracing::info!("shutdown_no_execution_engine_wired");
+    }
+    tokio::time::sleep(SHUTDOWN_DRAIN).await;
+    tracing::info!("shutdown_sequence_complete");
 }
 
 /// Wait for SIGINT (Ctrl-C) or SIGTERM, then signal graceful shutdown.
@@ -310,7 +373,9 @@ mod tests {
 
     #[tokio::test]
     async fn kill_switch_trigger_with_idempotency() {
-        let settings = dev_settings();
+        // The middleware denies unauthenticated mutations (no tokens ⇒ viewer
+        // role, A23/P5-1), and the kill-switch route is admin-only.
+        let settings = admin_settings();
         let app = HypeEdgeApp::new(settings);
         let router = app.router();
 
@@ -322,6 +387,7 @@ mod tests {
                     .uri("/api/v1/kill-switch")
                     .header("content-type", "application/json")
                     .header("idempotency-key", "test-key-1")
+                    .header("authorization", admin_header())
                     .body(Body::from(r#"{"action":"trigger"}"#))
                     .unwrap(),
             )
@@ -342,8 +408,9 @@ mod tests {
     #[tokio::test]
     async fn kill_switch_reset_actually_clears_latch() {
         // A22 regression: `POST /api/v1/kill-switch {action:"reset"}` must
-        // clear the latch (it was a no-op that reported success).
-        let settings = dev_settings();
+        // clear the latch (it was a no-op that reported success). The route
+        // is admin-only (A23), so the test authenticates as admin.
+        let settings = admin_settings();
         let app = HypeEdgeApp::new(settings);
         let router = app.router();
         let trigger = router
@@ -354,6 +421,7 @@ mod tests {
                     .uri("/api/v1/kill-switch")
                     .header("content-type", "application/json")
                     .header("idempotency-key", "ks-trigger")
+                    .header("authorization", admin_header())
                     .body(Body::from(r#"{"action":"trigger"}"#))
                     .unwrap(),
             )
@@ -370,6 +438,7 @@ mod tests {
                     .uri("/api/v1/kill-switch")
                     .header("content-type", "application/json")
                     .header("idempotency-key", "ks-reset")
+                    .header("authorization", admin_header())
                     .body(Body::from(r#"{"action":"reset"}"#))
                     .unwrap(),
             )
@@ -421,7 +490,35 @@ mod tests {
         );
     }
 
-    /// Helper: send a JSON request body through the router.
+    /// Dev settings with an operator token configured, so mutation tests pass
+    /// the middleware's role gate (no tokens ⇒ viewer role ⇒ 403, A23/P5-1).
+    fn operator_settings() -> AppSettings {
+        let mut settings = dev_settings();
+        settings.api.operator_token = "operator-token-12345678901234567890123456789012".into();
+        settings
+    }
+
+    /// The `Authorization` header for the operator token above.
+    fn operator_header() -> &'static str {
+        "Bearer operator-token-12345678901234567890123456789012"
+    }
+
+    /// Dev settings with an admin token configured — the kill-switch routes
+    /// are admin-only (A23), so they cannot be exercised with an operator
+    /// credential.
+    fn admin_settings() -> AppSettings {
+        let mut settings = dev_settings();
+        settings.api.admin_token = "admin-token-12345678901234567890123456789012".into();
+        settings
+    }
+
+    /// The `Authorization` header for the admin token above.
+    fn admin_header() -> &'static str {
+        "Bearer admin-token-12345678901234567890123456789012"
+    }
+
+    /// Helper: send a JSON request body through the router (authenticated as
+    /// operator, since the middleware rejects unauthenticated mutations).
     async fn send_json(
         router: &axum::Router,
         method: &str,
@@ -436,6 +533,7 @@ mod tests {
                     .uri(uri)
                     .header("content-type", "application/json")
                     .header("idempotency-key", "strat-key")
+                    .header("authorization", operator_header())
                     .body(Body::from(body.to_string()))
                     .unwrap(),
             )
@@ -450,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn strategy_lifecycle_create_list_start_stop() {
-        let settings = dev_settings();
+        let settings = operator_settings();
         let app = HypeEdgeApp::new(settings);
         let router = app.router();
 
@@ -535,7 +633,7 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_strategy_lifecycle_conflict() {
-        let settings = dev_settings();
+        let settings = operator_settings();
         let app = HypeEdgeApp::new(settings);
         let router = app.router();
 

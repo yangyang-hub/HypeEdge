@@ -165,12 +165,16 @@ pub async fn candles(
                 }))
                 .collect::<Vec<_>>()
         )),
-        Err(e) => ApiProblem::new(
-            502,
-            "CANDLE_BACKFILL_FAILED",
-            format!("candle backfill failed: {e}"),
-        )
-        .into_response(),
+        Err(e) => {
+            // M1: do not leak the backfill error into the response body.
+            tracing::warn!(error = %e, symbol = %symbol, interval, "candle_backfill_failed");
+            ApiProblem::new(
+                502,
+                "CANDLE_BACKFILL_FAILED",
+                "Candle backfill failed; retry later",
+            )
+            .into_response()
+        }
     }
 }
 

@@ -4,10 +4,12 @@
 //! Applies request-id, security headers, bearer auth, sliding-window rate
 //! limits, and idempotency-key enforcement in the same order as Python.
 
+use axum::extract::connect_info::ConnectInfo;
 use axum::extract::{Request, State};
 use axum::http::header;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
+use std::net::SocketAddr;
 use uuid::Uuid;
 
 use crate::auth::{ApiRole, is_mutation};
@@ -37,14 +39,24 @@ pub async fn security(State(state): State<AppState>, request: Request, next: Nex
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_string();
+    // H-AP1: the real peer address is authoritative for rate limiting. The
+    // `ConnectInfo` extension is present only when the server was started with
+    // `into_make_service_with_connect_info` (see `HypeEdgeApp::serve`); it is
+    // set by the transport and cannot be spoofed, so `x-forwarded-for` is
+    // NEVER trusted. Without it (unit tests / misconfigured server) every
+    // request falls back to a single shared key and a warning is logged.
     let client_ip = request
-        .headers()
-        .get("x-forwarded-for")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(',').next())
-        .unwrap_or("unknown")
-        .trim()
-        .to_string();
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string())
+        .or_else(|| {
+            tracing::warn!(
+                "client_ip_fallback: ConnectInfo missing (server must use \
+                 into_make_service_with_connect_info); rate limiting shared"
+            );
+            Some("unknown".to_string())
+        })
+        .unwrap();
 
     // Request id.
     let request_id = request
@@ -104,8 +116,10 @@ pub async fn security(State(state): State<AppState>, request: Request, next: Nex
             }
         }
     } else if protected {
-        // No tokens configured → local-admin.
-        actor_role = Some(ApiRole::Admin);
+        // H-AP3: no tokens configured → the least-privilege `viewer` role, so
+        // unauthenticated requests can read but every mutation is rejected by
+        // the handler-level `authorize` gates (A23). (Was `Admin`.)
+        actor_role = Some(ApiRole::Viewer);
     }
 
     // --- Mutation rate limit (per actor).
@@ -204,4 +218,124 @@ fn problem(status: u16, code: &str, detail: &str, retryable: bool, request_id: &
             .unwrap_or_else(|_| axum::http::HeaderValue::from_static("")),
     );
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use std::sync::Arc;
+    use tower::ServiceExt;
+
+    fn test_state(rate_limit: u32) -> AppState {
+        let mut settings = hypeedge_config::settings::AppSettings::default();
+        settings.api.request_rate_limit_per_minute = rate_limit;
+        settings.api.mutation_rate_limit_per_minute = rate_limit;
+        let settings = Arc::new(settings);
+        let bus = Arc::new(hypeedge_infra::event_bus::EventBus::new(64));
+        let ks = Arc::new(hypeedge_trading::risk::KillSwitch::new(bus.clone(), false));
+        AppState::new(
+            settings,
+            ks,
+            bus,
+            Arc::new(tokio::sync::Mutex::new(
+                hypeedge_trading::market_data::BookManager::new(20),
+            )),
+        )
+    }
+
+    fn request(uri: &str, method: &str, ip: std::net::IpAddr) -> Request<Body> {
+        request_with_body(uri, method, ip, "{}")
+    }
+
+    fn request_with_body(uri: &str, method: &str, ip: std::net::IpAddr, body: &str) -> Request<Body> {
+        let builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("idempotency-key", "test-key-0001")
+            .header("content-type", "application/json");
+        let mut req = builder.body(Body::from(body.to_string())).unwrap();
+        req.extensions_mut().insert(ConnectInfo(SocketAddr::new(ip, 54321)));
+        req
+    }
+
+    /// H-AP1: a spoofed `x-forwarded-for` must not let a client exceed its
+    /// rate limit — the real `ConnectInfo` peer address wins.
+    #[tokio::test]
+    async fn spoofed_xff_cannot_bypass_rate_limit() {
+        let router = crate::build_router(test_state(2));
+        let real_ip = "203.0.113.7".parse().unwrap();
+        // Two requests from the same real peer, each lying with a different XFF.
+        let mut r1 = request("/api/v1/strategies", "GET", real_ip);
+        r1.headers_mut()
+            .insert("x-forwarded-for", "1.2.3.4".parse().unwrap());
+        assert_eq!(router.clone().oneshot(r1).await.unwrap().status(), StatusCode::OK);
+        let mut r2 = request("/api/v1/strategies", "GET", real_ip);
+        r2.headers_mut()
+            .insert("x-forwarded-for", "5.6.7.8".parse().unwrap());
+        assert_eq!(router.clone().oneshot(r2).await.unwrap().status(), StatusCode::OK);
+        // Third request from the same peer — blocked despite yet another XFF.
+        let mut r3 = request("/api/v1/strategies", "GET", real_ip);
+        r3.headers_mut()
+            .insert("x-forwarded-for", "9.9.9.9".parse().unwrap());
+        let resp = router.oneshot(r3).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::TOO_MANY_REQUESTS);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("RATE_LIMIT_EXCEEDED"));
+    }
+
+    /// H-AP3: with no tokens configured, an unauthenticated mutation is denied
+    /// (empty token no longer maps to Admin).
+    #[tokio::test]
+    async fn empty_token_mutation_is_forbidden() {
+        let router = crate::build_router(test_state(100));
+        let req = request(
+            "/api/v1/strategies",
+            "POST",
+            "203.0.113.9".parse().unwrap(),
+        );
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let body = axum::body::to_bytes(resp.into_body(), 64 * 1024).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("FORBIDDEN"));
+    }
+
+    /// H-AP3: reads still work without a token (Viewer).
+    #[tokio::test]
+    async fn empty_token_reads_are_allowed() {
+        let router = crate::build_router(test_state(100));
+        let req = request("/api/v1/strategies", "GET", "203.0.113.9".parse().unwrap());
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// A configured operator token passes the mutation gate (regression guard
+    /// for the Viewer default).
+    #[tokio::test]
+    async fn operator_token_passes_mutation_gate() {
+        let mut settings = hypeedge_config::settings::AppSettings::default();
+        settings.api.operator_token = "op-token-1234567890123456".into();
+        settings.api.request_rate_limit_per_minute = 100;
+        let settings = Arc::new(settings);
+        let bus = Arc::new(hypeedge_infra::event_bus::EventBus::new(64));
+        let ks = Arc::new(hypeedge_trading::risk::KillSwitch::new(bus.clone(), false));
+        let state = AppState::new(
+            settings,
+            ks,
+            bus,
+            Arc::new(tokio::sync::Mutex::new(
+                hypeedge_trading::market_data::BookManager::new(20),
+            )),
+        );
+        let router = crate::build_router(state);
+        let mut req = request("/api/v1/strategies", "POST", "203.0.113.10".parse().unwrap());
+        req.headers_mut().insert(
+            header::AUTHORIZATION,
+            "Bearer op-token-1234567890123456".parse().unwrap(),
+        );
+        // Handler runs (validation error 422 for an empty body), not 403/401.
+        let resp = router.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    }
 }

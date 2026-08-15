@@ -148,8 +148,16 @@ pub async fn close_position(
             "cloid": order.cloid,
             "status": order.status.as_str(),
         })),
-        Err(e) => ApiProblem::new(502, "ORDER_SUBMIT_FAILED", format!("close failed: {e}"))
-            .into_response(),
+        Err(e) => {
+            // M1: do not leak the engine error into the response body.
+            tracing::warn!(error = %e, symbol = %symbol, "close_position_failed");
+            ApiProblem::new(
+                502,
+                "ORDER_SUBMIT_FAILED",
+                "Failed to close the position; retry later",
+            )
+            .into_response()
+        }
     }
 }
 
@@ -162,8 +170,12 @@ pub async fn orders(State(state): State<AppState>) -> Response {
         Ok(orders) => ok(serde_json::json!(
             orders.into_iter().map(order_payload).collect::<Vec<_>>()
         )),
-        Err(e) => ApiProblem::new(502, "ORDER_QUERY_FAILED", format!("orders failed: {e}"))
-            .into_response(),
+        Err(e) => {
+            // M1: do not leak the engine error into the response body.
+            tracing::warn!(error = %e, "orders_query_failed");
+            ApiProblem::new(502, "ORDER_QUERY_FAILED", "Failed to query orders; retry later")
+                .into_response()
+        }
     }
 }
 
@@ -197,8 +209,16 @@ pub async fn submit_order(
             "status": order.status.as_str(),
             "symbol": order.symbol,
         })),
-        Err(e) => ApiProblem::new(502, "ORDER_SUBMIT_FAILED", format!("submit failed: {e}"))
-            .into_response(),
+        Err(e) => {
+            // M1: do not leak the engine error into the response body.
+            tracing::warn!(error = %e, "submit_order_failed");
+            ApiProblem::new(
+                502,
+                "ORDER_SUBMIT_FAILED",
+                "Failed to submit the order; retry later",
+            )
+            .into_response()
+        }
     }
 }
 
@@ -222,8 +242,16 @@ pub async fn cancel_order(
     };
     match execution.cancel_order(&cloid).await {
         Ok(accepted) => ok(serde_json::json!({ "accepted": accepted, "cloid": cloid })),
-        Err(e) => ApiProblem::new(502, "ORDER_CANCEL_FAILED", format!("cancel failed: {e}"))
-            .into_response(),
+        Err(e) => {
+            // M1: do not leak the engine error into the response body.
+            tracing::warn!(error = %e, cloid = %cloid, "cancel_order_failed");
+            ApiProblem::new(
+                502,
+                "ORDER_CANCEL_FAILED",
+                "Failed to cancel the order; retry later",
+            )
+            .into_response()
+        }
     }
 }
 

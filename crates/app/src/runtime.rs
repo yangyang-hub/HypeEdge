@@ -59,6 +59,142 @@ pub struct RuntimeWiring {
     pub mm_runtime: Option<Arc<hypeedge_trading::market_maker::MarketMakerRuntimeFactory>>,
 }
 
+/// Startup + kill-switch lifecycle for the assembled runtime (P0-1).
+///
+/// The [`SafetyController`] starts in `Starting` — which rejects every
+/// placement — and nothing in the previous wiring ever moved it to `Normal`,
+/// so a fully "healthy-looking" system silently refused to trade. This type
+/// owns the two transitions that fix that:
+///
+/// - [`SafetyLifecycle::mark_startup_complete`] moves the controller to
+///   `Normal` once the account poller has produced its first authoritative
+///   clearinghouse snapshot (history recovery runs inline inside
+///   `build_runtime` before the poller is spawned, so it is complete by then).
+/// - [`SafetyLifecycle::refresh`] re-derives the API-facing
+///   `trading_enabled` / `safety_mode` mirrors from real state — the kill
+///   switch latch and the controller mode — instead of the hardcoded
+///   `true` / `"running"` the previous wiring wrote unconditionally, and
+///   parks the controller in `Halted` while the kill switch is latched so
+///   placements stay rejected even if the engine were misconfigured. A reset
+///   restores `Normal`.
+///
+/// The mirror derivation is intentionally fail-closed: `trading_enabled` is
+/// `true` only when the controller is in `Normal` and the kill switch is
+/// inactive.
+pub struct SafetyLifecycle {
+    safety: Arc<tokio::sync::Mutex<SafetyController>>,
+    kill_switch: Arc<KillSwitch>,
+    trading_enabled: Arc<tokio::sync::RwLock<bool>>,
+    safety_mode: Arc<tokio::sync::RwLock<String>>,
+}
+
+/// How long to wait for the first account snapshot before giving up on the
+/// startup transition (fail-closed: stay `Starting`).
+const STARTUP_READY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+/// Poll cadence while waiting for the first account snapshot.
+const STARTUP_READY_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+/// Mirror refresh cadence after startup.
+const STATUS_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+impl SafetyLifecycle {
+    pub fn new(
+        safety: Arc<tokio::sync::Mutex<SafetyController>>,
+        kill_switch: Arc<KillSwitch>,
+        trading_enabled: Arc<tokio::sync::RwLock<bool>>,
+        safety_mode: Arc<tokio::sync::RwLock<String>>,
+    ) -> Self {
+        Self {
+            safety,
+            kill_switch,
+            trading_enabled,
+            safety_mode,
+        }
+    }
+
+    /// Wait until the account tracker carries an authoritative clearinghouse
+    /// snapshot — the poller's first success. Because history recovery runs
+    /// inline inside `build_runtime` before the poller is spawned, a tracker
+    /// update implies recovery has completed as well.
+    pub async fn wait_for_account_ready(
+        &self,
+        tracker: &AccountTracker,
+        timeout: std::time::Duration,
+    ) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if tracker.get_account_state().is_some() {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(
+                    "timed out waiting for the first account snapshot; staying in SafetyMode::Starting"
+                        .into(),
+                );
+            }
+            tokio::time::sleep(STARTUP_READY_POLL).await;
+        }
+    }
+
+    /// Move the safety controller to `Normal` (startup completion: first
+    /// account poll + history recovery) and refresh the API mirrors.
+    pub async fn mark_startup_complete(&self) {
+        {
+            let mut safety = self.safety.lock().await;
+            if safety.mode() != SafetyMode::Normal {
+                safety.transition(SafetyMode::Normal, None);
+            }
+        }
+        self.refresh().await;
+    }
+
+    /// Re-derive the API mirrors from real state (kill switch + controller
+    /// mode). While the kill switch is latched the controller is parked in
+    /// `Halted`; a reset restores `Normal` so placements resume.
+    pub async fn refresh(&self) {
+        let killed = self.kill_switch.is_active().await;
+        {
+            let mut safety = self.safety.lock().await;
+            let mode = safety.mode();
+            if killed {
+                if mode != SafetyMode::Halted {
+                    let reason = self.kill_switch.reason().await;
+                    safety.transition(SafetyMode::Halted, reason.as_deref());
+                }
+            } else if mode == SafetyMode::Halted {
+                // A reset cleared the latch; the system was healthy before the
+                // kill, so restore Normal instead of leaving it parked.
+                safety.transition(SafetyMode::Normal, None);
+            }
+        }
+        let mode = self.safety.lock().await.mode();
+        *self.safety_mode.write().await = mode.as_str().to_string();
+        *self.trading_enabled.write().await = !killed && mode == SafetyMode::Normal;
+    }
+
+    /// The spawned lifecycle task: wait for the first account snapshot, move
+    /// the controller to `Normal`, then keep the mirrors derived from real
+    /// state for the life of the process. On readiness timeout it stays in
+    /// `Starting` (fail-closed) and keeps the mirrors accurate.
+    pub async fn run(self: Arc<Self>, tracker: Arc<AccountTracker>) {
+        match self
+            .wait_for_account_ready(&tracker, STARTUP_READY_TIMEOUT)
+            .await
+        {
+            Ok(()) => {
+                tracing::info!("safety_startup_complete_transition_normal");
+                self.mark_startup_complete().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "safety_startup_not_ready_staying_starting");
+            }
+        }
+        loop {
+            self.refresh().await;
+            tokio::time::sleep(STATUS_SYNC_INTERVAL).await;
+        }
+    }
+}
+
 /// Build the full runtime in dependency order. When the V2 trading chain is not
 /// enabled, returns an API-only wiring (matching the previous skeleton).
 pub async fn build_runtime(
@@ -187,7 +323,23 @@ pub async fn build_runtime(
             reconnect_delay_max: settings.market_data.ws_reconnect_delay_max,
         }));
         let bus = event_bus.clone();
-        tokio::spawn(async move { feed.run(bus).await });
+        // `WebSocketFeed::run` is not `Send`: its reconnect loop drives the
+        // shared feed behind a `std::sync::Mutex` and holds the guard across
+        // `.await` points (ws_feed's shared-mutex design), so it cannot be
+        // spawned on the multi-threaded runtime. Drive it on a dedicated
+        // thread with its own current-thread runtime instead — a single WS
+        // connection is inherently single-threaded, and the feed only
+        // publishes to the (thread-safe) EventBus.
+        std::thread::Builder::new()
+            .name("ws-feed".into())
+            .spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("ws-feed runtime");
+                rt.block_on(feed.run(bus));
+            })
+            .expect("spawn ws-feed thread");
     }
 
     // Instrument metadata background refresh.
@@ -229,13 +381,18 @@ pub async fn build_runtime(
                     let projector =
                         Arc::new(PostgresExchangeFactProjector::new(pool.clone(), &account));
                     let info: Arc<dyn InfoClient> = rest.clone();
+                    // P1-4: attach the event bus so authoritatively committed
+                    // fills are published as OrderFilled/OrderPartialFill
+                    // (strategies that only consume bus events unblock even
+                    // when the engine's own receipt path missed the fill).
                     let mut ingestor = ExchangeEventIngestor::new(
                         &account,
                         projector.clone(),
                         info,
                         Some(account_tracker.clone()),
                         settings.market_making.account_poll_interval_seconds,
-                    );
+                    )
+                    .with_event_bus(event_bus.clone());
                     if let Err(e) = ingestor.recover_history().await {
                         tracing::warn!(error = %e, "ingestor_history_recovery_failed");
                     }
@@ -466,7 +623,20 @@ pub async fn build_runtime(
                 tracker: tracker_ref,
                 cycles,
                 meta,
-                trading_ready: Box::new(|| Box::pin(async { true })),
+                // P2-3: the funding-arb entry gates used to be `|| true` — a
+                // real readiness signal derived from the kill switch, the
+                // trading-enabled mirror, and the account tracker:
+                // trading_ready = kill switch inactive AND trading enabled
+                // (i.e. the safety lifecycle has reached Normal).
+                trading_ready: Box::new({
+                    let ks = kill_switch.clone();
+                    let te = trading_enabled.clone();
+                    move || {
+                        let ks = ks.clone();
+                        let te = te.clone();
+                        Box::pin(async move { !ks.is_active().await && *te.read().await })
+                    }
+                }),
                 kill_switch_active: Box::new({
                     let ks = kill_switch.clone();
                     move || {
@@ -474,8 +644,38 @@ pub async fn build_runtime(
                         Box::pin(async move { ks.is_active().await })
                     }
                 }),
-                account_allows_risk_increase: Box::new(|| Box::pin(async { true })),
-                reconcile: Box::new(|| Box::pin(async { true })),
+                // account_allows_risk_increase = the account view is fresh
+                // (tracker last update within ~2 poll intervals; fail-closed
+                // while the tracker has never produced a snapshot).
+                account_allows_risk_increase: Box::new({
+                    let tracker = account_tracker.clone();
+                    let max_age_secs =
+                        (settings.market_making.account_poll_interval_seconds * 2.0).max(5.0);
+                    move || {
+                        let tracker = tracker.clone();
+                        Box::pin(async move {
+                            match tracker.last_update_ts() {
+                                Some(ts) => {
+                                    let age_secs = (chrono::Utc::now() - ts).num_milliseconds()
+                                        as f64
+                                        / 1000.0;
+                                    age_secs <= max_age_secs
+                                }
+                                None => false,
+                            }
+                        })
+                    }
+                }),
+                // reconcile = the account poller has run at least once (no
+                // production reconciler is wired yet; the clearinghouse
+                // snapshot is the best available authoritative marker).
+                reconcile: Box::new({
+                    let tracker = account_tracker.clone();
+                    move || {
+                        let tracker = tracker.clone();
+                        Box::pin(async move { tracker.get_account_state().is_some() })
+                    }
+                }),
                 deployment: hypeedge_trading::funding_arb::runtime::FundingArbDeployment {
                     max_notional_usd: fa.max_notional_usd.0,
                     poll_interval_seconds: fa.poll_interval_seconds,
@@ -510,6 +710,27 @@ pub async fn build_runtime(
         None
     };
 
+    // P0-1: drive the safety controller out of `Starting` once the account
+    // poller has produced its first authoritative snapshot (history recovery
+    // ran inline above, so it is complete by then), and keep the API-facing
+    // trading_enabled / safety_mode mirrors derived from real state (kill
+    // switch + safety mode) instead of the hardcoded "running"/true the
+    // previous wiring wrote. Until this fires, every placement is rejected —
+    // which is the intended fail-closed boot behavior.
+    {
+        let lifecycle = Arc::new(SafetyLifecycle::new(
+            safety,
+            kill_switch.clone(),
+            trading_enabled.clone(),
+            safety_mode.clone(),
+        ));
+        let lifecycle_task = lifecycle.clone();
+        let tracker = account_tracker.clone();
+        tokio::spawn(async move {
+            lifecycle_task.run(tracker).await;
+        });
+    }
+
     Ok(RuntimeWiring {
         settings: Arc::new(settings.clone()),
         event_bus: event_bus.clone(),
@@ -522,14 +743,8 @@ pub async fn build_runtime(
         config_versions,
         sse_outbox,
         sse_pool,
-        trading_enabled: {
-            *trading_enabled.write().await = true;
-            trading_enabled
-        },
-        safety_mode: {
-            *safety_mode.write().await = "running".into();
-            safety_mode
-        },
+        trading_enabled,
+        safety_mode,
         action_budget: Some(action_budget),
         funding_arb_deps,
         mm_runtime,

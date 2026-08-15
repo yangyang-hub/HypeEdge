@@ -71,6 +71,38 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/strategies/{strategy_id}/config-versions/{version}/activate",
             post(routes::strategies::activate_config_version),
+        )
+        .route(
+            "/strategies/{strategy_id}/config-versions/{version}/rollback",
+            post(routes::strategies::rollback_config_version),
+        )
+        .route(
+            "/strategies/{strategy_id}/archive",
+            post(routes::strategies::archive_strategy),
+        )
+        .route(
+            "/market-making/{strategy_id}/state",
+            get(routes::market_making::mm_state),
+        )
+        .route(
+            "/market-making/{strategy_id}/quotes",
+            get(routes::market_making::mm_quotes),
+        )
+        .route(
+            "/market-making/{strategy_id}/inventory",
+            get(routes::market_making::mm_inventory),
+        )
+        .route(
+            "/market-making/{strategy_id}/performance",
+            get(routes::market_making::mm_performance),
+        )
+        .route(
+            "/market-making/{strategy_id}/action-budget",
+            get(routes::market_making::mm_action_budget),
+        )
+        .route(
+            "/market-making/{strategy_id}/events",
+            get(routes::market_making::mm_events),
         );
 
     Router::new()

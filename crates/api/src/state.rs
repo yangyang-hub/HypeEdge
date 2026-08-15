@@ -22,7 +22,10 @@ use hypeedge_trading::strategy::{
 use crate::auth::RoleTokens;
 use crate::sse_broker::SseBroker;
 
-type MmSnapshotProvider = Arc<
+/// Latest snapshot lookup for a strategy's market-maker runtime. `None` means
+/// the strategy has no live runtime. Public so the WS module and tests can
+/// construct fake providers.
+pub type MmSnapshotProvider = Arc<
     dyn Fn(
             &str,
         ) -> futures::future::BoxFuture<
@@ -433,10 +436,25 @@ fn register_noop_plugins(registry: &mut StrategyRegistry) {
     }
 }
 
+/// How long a limiter key is retained after its last hit. Entries past this
+/// age are garbage-collected so attacker-supplied keys (or IP churn) cannot
+/// grow the map unboundedly.
+const LIMITER_KEY_TTL: std::time::Duration = std::time::Duration::from_secs(120);
+/// Sweep the whole key map once it grows past this many entries.
+const LIMITER_SWEEP_THRESHOLD: usize = 1024;
+
 /// Sliding-window rate limiter keyed by a string (IP or actor).
 #[derive(Clone)]
 pub struct SlidingWindowLimiter {
-    windows: Arc<tokio::sync::Mutex<std::collections::HashMap<String, VecDeque<Instant>>>>,
+    windows: Arc<tokio::sync::Mutex<HashMap<String, LimiterWindow>>>,
+}
+
+#[derive(Debug, Clone)]
+struct LimiterWindow {
+    /// Hit timestamps inside the 60s sliding window.
+    times: VecDeque<Instant>,
+    /// The most recent hit; drives garbage collection of the whole entry.
+    last_seen: Instant,
 }
 
 impl Default for SlidingWindowLimiter {
@@ -452,23 +470,53 @@ impl SlidingWindowLimiter {
         }
     }
 
+    /// Number of tracked keys (test/observability helper).
+    pub async fn len(&self) -> usize {
+        self.windows.lock().await.len()
+    }
+
+    /// Whether any key is tracked.
+    pub async fn is_empty(&self) -> bool {
+        self.windows.lock().await.is_empty()
+    }
+
     /// Whether a request under `key` is allowed within `limit` per 60s.
     pub async fn allow(&self, key: &str, limit: u64) -> bool {
+        let now = Instant::now();
         let mut windows = self.windows.lock().await;
-        let window = windows.entry(key.to_string()).or_default();
-        let cutoff = Instant::now() - std::time::Duration::from_secs(60);
-        while let Some(front) = window.front() {
+        self.prune_expired(&mut windows, now);
+        let entry = windows
+            .entry(key.to_string())
+            .or_insert_with(|| LimiterWindow {
+                times: VecDeque::new(),
+                last_seen: now,
+            });
+        entry.last_seen = now;
+        let cutoff = now - std::time::Duration::from_secs(60);
+        while let Some(front) = entry.times.front() {
             if *front < cutoff {
-                window.pop_front();
+                entry.times.pop_front();
             } else {
                 break;
             }
         }
-        if window.len() as u64 >= limit {
+        if entry.times.len() as u64 >= limit {
             return false;
         }
-        window.push_back(Instant::now());
+        entry.times.push_back(now);
         true
+    }
+
+    /// Evict entries idle for longer than [`LIMITER_KEY_TTL`]. The full sweep
+    /// runs when the map is large; otherwise individual hits refresh
+    /// `last_seen`, so stale single keys are cheap to leave until the next
+    /// sweep. This bounds memory even when the keys are attacker-controlled.
+    fn prune_expired(&self, windows: &mut HashMap<String, LimiterWindow>, now: Instant) {
+        if windows.len() < LIMITER_SWEEP_THRESHOLD {
+            return;
+        }
+        let ttl = LIMITER_KEY_TTL;
+        windows.retain(|_, entry| now.duration_since(entry.last_seen) < ttl);
     }
 }
 
@@ -485,5 +533,35 @@ mod tests {
         assert!(!limiter.allow("ip:1", 3).await);
         // Different key is unaffected.
         assert!(limiter.allow("ip:2", 3).await);
+    }
+
+    #[tokio::test]
+    async fn stale_keys_are_garbage_collected() {
+        let limiter = SlidingWindowLimiter::new();
+        // Grow past the sweep threshold with fresh keys.
+        for i in 0..LIMITER_SWEEP_THRESHOLD + 16 {
+            assert!(limiter.allow(&format!("k{i}"), 100).await);
+        }
+        // Age one entry artificially past the TTL.
+        {
+            let mut windows = limiter.windows.lock().await;
+            let aged = windows.get_mut("k0").unwrap();
+            aged.last_seen = Instant::now() - LIMITER_KEY_TTL - std::time::Duration::from_secs(1);
+        }
+        let before = limiter.windows.lock().await.len();
+        assert!(limiter.allow("fresh-key", 100).await);
+        let after = limiter.windows.lock().await.len();
+        assert!(
+            !limiter.windows.lock().await.contains_key("k0"),
+            "aged key must be evicted"
+        );
+        assert!(
+            limiter.windows.lock().await.contains_key("fresh-key"),
+            "fresh key must survive the sweep"
+        );
+        // The map stays bounded by the TTL sweep (pruned k0 is replaced by the
+        // fresh key, so the total stays at the pre-sweep size).
+        assert!(after <= LIMITER_SWEEP_THRESHOLD + 16, "after={after}");
+        assert!(after < before + 2, "map must not grow unboundedly");
     }
 }
