@@ -57,7 +57,9 @@ clickhouse:
   spool_path: data/clickhouse_spool.sqlite3
 
 postgres:
-  url: postgresql+asyncpg://hypeedge:hypeedge@localhost:5432/hypeedge
+  # Plain postgresql:// scheme (sqlx; the Python-era postgresql+asyncpg://
+  # dialect prefix is not a sqlx scheme).
+  url: postgresql://hypeedge:hypeedge@localhost:5432/hypeedge
   pool_size: 5
   command_poll_interval_ms: 100
   command_lease_seconds: 15

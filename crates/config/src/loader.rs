@@ -208,6 +208,13 @@ fn validate_mainnet_environment(settings: &AppSettings) -> Result<(), ConfigErro
             "mainnet HYPE_POSTGRES__URL must require TLS with ssl=require, verify-ca, or verify-full".into(),
         ));
     }
+
+    // H-CF1: real money requires the kill switch armed. A mainnet deployment
+    // with `kill_switch_enabled=false` cannot panic-stop trading, so it is
+    // refused at load time.
+    if !settings.risk.kill_switch_enabled {
+        return Err(ConfigError::MainnetKillSwitchDisabled);
+    }
     Ok(())
 }
 
@@ -246,7 +253,14 @@ fn load_dotenv_map() -> HashMap<String, String> {
 /// `__` delimiter (e.g. `HYPE_EXCHANGE__API_URL` -> `exchange.api_url`);
 /// top-level fields use `HYPE_FIELD`. `HYPE_ENV` is an alias only and is
 /// ignored here.
+///
+/// Only variables whose path resolves to a real settings field are injected
+/// (M-CF1): unrelated `HYPE_*` variables in the operator's environment (loader
+/// controls such as `HYPE_CONFIGS_DIR`, CI secrets, tooling vars) must not be
+/// smuggled into the YAML root, where `deny_unknown_fields` would otherwise
+/// fail the load (or worse, silently shadow a typo'd setting).
 fn apply_env_overlay(root: &mut Value, env: &HashMap<String, String>) {
+    let known = known_overlay_paths();
     for (key, value) in env {
         let Some(rest) = key.strip_prefix("HYPE_") else {
             continue;
@@ -255,7 +269,52 @@ fn apply_env_overlay(root: &mut Value, env: &HashMap<String, String>) {
             continue;
         }
         let path: Vec<&str> = rest.split("__").collect();
+        let canonical = path
+            .iter()
+            .map(|s| s.to_lowercase())
+            .collect::<Vec<_>>()
+            .join("__");
+        if !known.contains(&canonical) {
+            continue; // not a settings field: never inject into the YAML root
+        }
         set_path(root, &path, &parse_env_scalar(value));
+    }
+}
+
+/// The set of canonical `section__field` paths that exist on [`AppSettings`],
+/// derived once from its serialized defaults. `apply_env_overlay` uses this
+/// as the allow-list for `HYPE_*` injection.
+fn known_overlay_paths() -> &'static std::collections::HashSet<String> {
+    use std::sync::OnceLock;
+    static KNOWN: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+    KNOWN.get_or_init(|| {
+        let defaults = serde_yaml::to_value(AppSettings::default())
+            .expect("AppSettings defaults must serialize");
+        let mut paths = std::collections::HashSet::new();
+        let mut prefix = Vec::new();
+        collect_leaf_paths(&defaults, &mut prefix, &mut paths);
+        paths
+    })
+}
+
+/// Walk a YAML mapping, recording every leaf path as a `__`-joined lowercase
+/// string (e.g. `risk__max_leverage`).
+fn collect_leaf_paths(
+    value: &Value,
+    prefix: &mut Vec<String>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    if let Value::Mapping(map) = value {
+        for (k, v) in map {
+            let key = k.as_str().unwrap_or_default().to_lowercase();
+            prefix.push(key);
+            if matches!(v, Value::Mapping(_)) {
+                collect_leaf_paths(v, prefix, out);
+            } else {
+                out.insert(prefix.join("__"));
+            }
+            prefix.pop();
+        }
     }
 }
 
@@ -331,6 +390,10 @@ fn json_to_yaml(json: &serde_json::Value) -> Value {
 mod tests {
     use super::*;
 
+    /// Serialize env mutation across tests in this binary (env vars are
+    /// global; `mainnet_requires_kill_switch_enabled` mutates them).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn defaults_apply_without_env_or_yaml() {
         // Point configs dir at an empty temp dir so no YAML interferes.
@@ -348,6 +411,15 @@ mod tests {
         assert!(s.exchange.api_url.contains("testnet"));
         assert!(!s.exchange.is_configured());
         assert!(!s.features.v2_trading_enabled());
+        // The default Postgres URL must use the plain `postgresql://` scheme
+        // (sqlx); the Python-era `postgresql+asyncpg://` dialect prefix is
+        // not a sqlx scheme and must not reappear in the default.
+        assert!(
+            s.postgres.url.starts_with("postgresql://"),
+            "default postgres url must use the sqlx scheme: {}",
+            s.postgres.url
+        );
+        assert!(!s.postgres.url.contains("asyncpg"));
     }
 
     #[test]
@@ -389,6 +461,77 @@ mod tests {
     }
 
     #[test]
+    fn env_overlay_ignores_unrelated_hype_vars() {
+        // M-CF1: only env vars that resolve to real settings fields are
+        // injected; loader controls and typo'd settings are ignored so they
+        // cannot be smuggled into the YAML root.
+        let mut root = Value::Mapping(Default::default());
+        let mut env = HashMap::new();
+        env.insert("HYPE_MARKET_DATA__COINS".into(), "[\"BTC\"]".into());
+        env.insert("HYPE_RISK__MAX_LEVARAGE".into(), "5".into()); // typo
+        env.insert("HYPE_CONFIGS_DIR".into(), "/tmp/nope".into()); // loader control
+        env.insert("HYPE_UNRELATED_SECRET".into(), "s3cr3t".into());
+        apply_env_overlay(&mut root, &env);
+        let s: AppSettings = serde_yaml::from_value(root).unwrap();
+        assert_eq!(s.market_data.coins, vec!["BTC"]);
+        assert_eq!(s.risk.max_leverage, 5); // default, typo not applied
+        let map = serde_yaml::to_value(&s).unwrap();
+        let debug = format!("{map:?}");
+        assert!(
+            !debug.contains("MAX_LEVARAGE") && !debug.contains("max_levarage"),
+            "typo'd key must not appear: {debug}"
+        );
+    }
+
+    #[test]
+    fn mainnet_requires_kill_switch_enabled() {
+        // H-CF1: mainnet with risk.kill_switch_enabled=false must be refused,
+        // even when every mainnet secret is present.
+        let _guard = ENV_LOCK.lock().unwrap();
+        let cfg_dir = std::env::temp_dir().join("hypeedge_config_kill_switch");
+        let _ = std::fs::create_dir_all(&cfg_dir);
+        unsafe {
+            std::env::set_var("HYPE_CONFIGS_DIR", &cfg_dir);
+            std::env::set_var(
+                "HYPE_EXCHANGE__ACCOUNT_ADDRESS",
+                "0x1234567890abcdef1234567890abcdef12345678",
+            );
+            std::env::set_var(
+                "HYPE_EXCHANGE__AGENT_PRIVATE_KEY",
+                "0x0000000000000000000000000000000000000000000000000000000000000001",
+            );
+            std::env::set_var(
+                "HYPE_POSTGRES__URL",
+                "postgresql://hypeedge:strongpassword123@db.example.com:5432/hypeedge?sslmode=require",
+            );
+            std::env::set_var(
+                "HYPE_API__ADMIN_TOKEN",
+                "a-very-long-admin-token-that-is-at-least-32-characters-long",
+            );
+            std::env::set_var("HYPE_RISK__KILL_SWITCH_ENABLED", "false");
+        }
+        let err = load_settings(Some("mainnet")).expect_err("kill switch disabled must fail");
+        assert!(
+            matches!(err, ConfigError::MainnetKillSwitchDisabled),
+            "expected MainnetKillSwitchDisabled, got: {err}"
+        );
+        // With the kill switch armed, mainnet loads (valid mainnet defaults).
+        unsafe {
+            std::env::set_var("HYPE_RISK__KILL_SWITCH_ENABLED", "true");
+        }
+        let settings = load_settings(Some("mainnet")).expect("kill switch enabled loads");
+        assert!(settings.risk.kill_switch_enabled);
+        unsafe {
+            std::env::remove_var("HYPE_RISK__KILL_SWITCH_ENABLED");
+            std::env::remove_var("HYPE_API__ADMIN_TOKEN");
+            std::env::remove_var("HYPE_POSTGRES__URL");
+            std::env::remove_var("HYPE_EXCHANGE__AGENT_PRIVATE_KEY");
+            std::env::remove_var("HYPE_EXCHANGE__ACCOUNT_ADDRESS");
+            std::env::remove_var("HYPE_CONFIGS_DIR");
+        }
+    }
+
+    #[test]
     fn funding_arb_restricted_to_live_envs() {
         let mut s = AppSettings::default();
         s.features.durable_ledger_v2 = true;
@@ -397,8 +540,22 @@ mod tests {
         s.features.reconciliation_v2 = true;
         s.features.strategy_runner_v2 = true;
         s.features.funding_arb_execution_enabled = true;
-        assert!(s.validate().is_err()); // dev
+        assert!(s.validate().is_err()); // dev: observation/control plane only
+        // M-FA6: mainnet is hard-disabled for funding-arb live execution even
+        // when every other mainnet gate would pass.
+        s.environment = "mainnet".into();
+        let err = s.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("testnet"),
+            "mainnet must be refused with a testnet-only message: {err}"
+        );
         s.environment = "testnet".into();
+        assert!(s.validate().is_ok());
+        // With the flag off, every environment validates.
+        s.features.funding_arb_execution_enabled = false;
+        s.environment = "dev".into();
+        assert!(s.validate().is_ok());
+        s.environment = "mainnet".into();
         assert!(s.validate().is_ok());
     }
 }

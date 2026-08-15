@@ -59,7 +59,9 @@ clickhouse:
   spool_path: data/clickhouse_spool_testnet.sqlite3
 
 postgres:
-  url: postgresql+asyncpg://hypeedge:hypeedge@localhost:5432/hypeedge_testnet
+  # Plain postgresql:// scheme (sqlx; the Python-era postgresql+asyncpg://
+  # dialect prefix is not a sqlx scheme).
+  url: postgresql://hypeedge:hypeedge@localhost:5432/hypeedge_testnet
   pool_size: 5
   command_poll_interval_ms: 100
   command_lease_seconds: 15
@@ -154,7 +156,12 @@ backtest:
   monte_carlo_simulations: 1000
 
 api:
-  # LAN dashboard / market WS for intranet lab (no auth when tokens empty; mainnet forbids this)
+  # RISK: binding 0.0.0.0 with empty tokens exposes the full admin control
+  # plane (kill switch, strategy lifecycle, trading) to the LAN with no
+  # credential. This is an operator-controlled lab deployment, but keep it off
+  # public networks — or set HYPE_API__*_TOKEN (each >= 32 chars) and bind
+  # loopback. Host is intentionally left as-is (the API/auth sub-agent owns
+  # the bind-side hardening).
   host: 0.0.0.0
   port: 37001
   request_rate_limit_per_minute: 6000

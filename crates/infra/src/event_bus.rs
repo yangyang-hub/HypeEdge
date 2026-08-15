@@ -6,10 +6,19 @@
 //! publishers apply backpressure, sync publishers fail loudly). The
 //! classification comes from [`DomainEvent::is_lossy`] and is byte-identical
 //! to Python's `LOSSY_EVENT_TYPES`.
+//!
+//! ## Zombie-subscriber hygiene
+//!
+//! The bus stores only [`Weak`] references to subscriber mailboxes. A consumer
+//! that drops its mailbox handle is pruned lazily on the next matching
+//! publish, so a dead subscriber can never pin a full mailbox forever (which
+//! would otherwise block reliable publishers indefinitely). Mutex poisoning
+//! (a panicked consumer/callback) is tolerated: locks are recovered with
+//! `into_inner()` and the bus keeps operating.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use hypeedge_domain::events::{DomainEvent, Event, EventType};
 use tokio::sync::Notify;
@@ -61,12 +70,24 @@ impl<T> BoundedMailbox<T> {
         }
     }
 
+    /// Lock the mailbox state, tolerating a poisoned mutex: a panicked
+    /// consumer must not take the whole bus down (M-IN3).
+    fn lock_state(&self) -> MutexGuard<'_, MailboxState<T>> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Whether the mailbox was closed (or the owning consumer dropped its
+    /// handle entirely, in which case the bus prunes it lazily).
+    pub fn is_closed(&self) -> bool {
+        self.lock_state().closed
+    }
+
     /// Reliable put: await space if the queue is full. Returns `false` if the
     /// mailbox was closed.
     pub async fn put(&self, item: T) -> bool {
         loop {
             {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.lock_state();
                 if st.closed {
                     return false;
                 }
@@ -86,7 +107,7 @@ impl<T> BoundedMailbox<T> {
     /// incoming lossy item is dropped instead. Returns how many items were
     /// dropped (0 or 1). Returns `None` if closed.
     pub fn put_lossy(&self, item: T) -> Option<u64> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock_state();
         if st.closed {
             return None;
         }
@@ -116,7 +137,7 @@ impl<T> BoundedMailbox<T> {
     pub async fn recv(&self) -> Option<T> {
         loop {
             {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.lock_state();
                 if let Some(item) = st.items.pop_front() {
                     drop(st);
                     self.space_available.notify_one();
@@ -132,7 +153,7 @@ impl<T> BoundedMailbox<T> {
 
     /// Non-blocking peek of the oldest item, if any.
     pub fn try_recv(&self) -> Option<T> {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock_state();
         let item = st.items.pop_front();
         if item.is_some() {
             drop(st);
@@ -142,12 +163,12 @@ impl<T> BoundedMailbox<T> {
     }
 
     pub fn len(&self) -> usize {
-        self.state.lock().unwrap().items.len()
+        self.lock_state().items.len()
     }
 
     /// The queue capacity (used by the sync publish path's backpressure check).
     pub fn capacity(&self) -> usize {
-        self.state.lock().unwrap().capacity
+        self.lock_state().capacity
     }
 
     pub fn is_empty(&self) -> bool {
@@ -156,23 +177,26 @@ impl<T> BoundedMailbox<T> {
 
     /// Number of items dropped by the lossy path.
     pub fn dropped(&self) -> u64 {
-        self.state.lock().unwrap().dropped
+        self.lock_state().dropped
     }
 
     /// Close the mailbox: `put`/`put_lossy` return closed, `recv` drains then
     /// returns `None`.
     pub fn close(&self) {
-        self.state.lock().unwrap().closed = true;
+        self.lock_state().closed = true;
         self.space_available.notify_waiters();
         self.item_ready.notify_waiters();
     }
 }
 
 type Mailbox = Arc<BoundedMailbox<Arc<Event>>>;
+/// The bus retains subscribers weakly so a dropped consumer handle is pruned
+/// lazily instead of pinning a full mailbox forever (M-IN3).
+type WeakMailbox = Weak<BoundedMailbox<Arc<Event>>>;
 
 struct BusState {
-    by_type: HashMap<EventType, Vec<Mailbox>>,
-    wildcard: Vec<Mailbox>,
+    by_type: HashMap<EventType, Vec<WeakMailbox>>,
+    wildcard: Vec<WeakMailbox>,
     queue_maxsize: usize,
 }
 
@@ -200,16 +224,20 @@ impl EventBus {
         }
     }
 
+    /// Lock the bus state, tolerating a poisoned mutex: a panicked subscriber
+    /// or callback must not take the whole bus down (M-IN3).
+    fn lock_bus_state(&self) -> MutexGuard<'_, BusState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// Subscribe to events of a specific type. Returns a mailbox to read from.
     pub fn subscribe(&self, event_type: EventType) -> Mailbox {
         let mb = self.new_mailbox();
-        self.state
-            .lock()
-            .unwrap()
+        self.lock_bus_state()
             .by_type
             .entry(event_type)
             .or_default()
-            .push(mb.clone());
+            .push(Arc::downgrade(&mb));
         mb
     }
 
@@ -217,9 +245,9 @@ impl EventBus {
     /// publish order across them.
     pub fn subscribe_many(&self, event_types: &[EventType]) -> Mailbox {
         let mb = self.new_mailbox();
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock_bus_state();
         for et in event_types {
-            st.by_type.entry(*et).or_default().push(mb.clone());
+            st.by_type.entry(*et).or_default().push(Arc::downgrade(&mb));
         }
         mb
     }
@@ -228,48 +256,44 @@ impl EventBus {
     /// strategy runner's latest-value `maxsize=1` lossy mailboxes).
     pub fn subscribe_maxsize(&self, event_type: EventType, maxsize: usize) -> Mailbox {
         let mb = Arc::new(BoundedMailbox::with_classifier(maxsize, event_is_lossy));
-        self.state
-            .lock()
-            .unwrap()
+        self.lock_bus_state()
             .by_type
             .entry(event_type)
             .or_default()
-            .push(mb.clone());
+            .push(Arc::downgrade(&mb));
         mb
     }
 
     /// Subscribe to all events (for audit/logging/metrics).
     pub fn subscribe_all(&self) -> Mailbox {
         let mb = self.new_mailbox();
-        self.state.lock().unwrap().wildcard.push(mb.clone());
+        self.lock_bus_state().wildcard.push(Arc::downgrade(&mb));
         mb
     }
 
     /// Remove a mailbox from a specific event type's subscription list.
     pub fn unsubscribe(&self, event_type: EventType, mailbox: &Mailbox) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock_bus_state();
         if let Some(queues) = st.by_type.get_mut(&event_type) {
-            queues.retain(|q| !Arc::ptr_eq(q, mailbox));
+            queues.retain(|q| !same_mailbox(q, mailbox));
         }
     }
 
     /// Remove a mailbox from a set of event type subscriptions.
     pub fn unsubscribe_many(&self, event_types: &[EventType], mailbox: &Mailbox) {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock_bus_state();
         for et in event_types {
             if let Some(queues) = st.by_type.get_mut(et) {
-                queues.retain(|q| !Arc::ptr_eq(q, mailbox));
+                queues.retain(|q| !same_mailbox(q, mailbox));
             }
         }
     }
 
     /// Remove a mailbox from the wildcard subscription list.
     pub fn unsubscribe_wildcard(&self, mailbox: &Mailbox) {
-        self.state
-            .lock()
-            .unwrap()
+        self.lock_bus_state()
             .wildcard
-            .retain(|q| !Arc::ptr_eq(q, mailbox));
+            .retain(|q| !same_mailbox(q, mailbox));
     }
 
     /// Publish an event to all matching subscribers. Reliable event types
@@ -323,19 +347,29 @@ impl EventBus {
         self.publish_count.load(Ordering::Relaxed)
     }
 
-    /// Number of subscribers across all event types plus wildcard.
+    /// Number of live subscribers across all event types plus wildcard.
+    /// Subscribers that dropped their mailbox handle are not counted.
     pub fn subscriber_count(&self) -> usize {
-        let st = self.state.lock().unwrap();
-        st.by_type.values().map(|v| v.len()).sum::<usize>() + st.wildcard.len()
+        let st = self.lock_bus_state();
+        st.by_type
+            .values()
+            .map(|v| v.iter().filter(|q| is_live(q)).count())
+            .sum::<usize>()
+            + st.wildcard.iter().filter(|q| is_live(q)).count()
     }
 
-    /// Number of distinct subscribed event types.
+    /// Number of distinct subscribed event types with at least one live
+    /// subscriber.
     pub fn event_type_count(&self) -> usize {
-        self.state.lock().unwrap().by_type.len()
+        self.lock_bus_state()
+            .by_type
+            .iter()
+            .filter(|(_, v)| v.iter().any(is_live))
+            .count()
     }
 
     fn capacity(&self) -> usize {
-        self.state.lock().unwrap().queue_maxsize
+        self.lock_bus_state().queue_maxsize
     }
 
     fn new_mailbox(&self) -> Mailbox {
@@ -343,12 +377,45 @@ impl EventBus {
         Arc::new(BoundedMailbox::with_classifier(cap, event_is_lossy))
     }
 
+    /// Collect strong references to the live mailboxes matching an event type,
+    /// pruning dead (dropped-handle) subscribers from the maps in the same
+    /// critical section. A dropped subscriber can never pin a full mailbox and
+    /// block a reliable publisher (M-IN3).
     fn matching_mailboxes(&self, event_type: EventType) -> Vec<Mailbox> {
-        let st = self.state.lock().unwrap();
-        let mut out = st.by_type.get(&event_type).cloned().unwrap_or_default();
-        out.extend(st.wildcard.iter().cloned());
+        let mut st = self.lock_bus_state();
+        let mut out = Vec::new();
+        if let Some(queues) = st.by_type.get_mut(&event_type) {
+            queues.retain(|q| {
+                match q.upgrade() {
+                    Some(mb) => {
+                        out.push(mb);
+                        true
+                    }
+                    None => false, // zombie subscriber: prune
+                }
+            });
+        }
+        st.wildcard.retain(|q| {
+            match q.upgrade() {
+                Some(mb) => {
+                    out.push(mb);
+                    true
+                }
+                None => false, // zombie subscriber: prune
+            }
+        });
         out
     }
+}
+
+/// Whether a weak mailbox reference still points at a live mailbox.
+fn is_live(q: &WeakMailbox) -> bool {
+    q.strong_count() > 0
+}
+
+/// Whether a weak reference and a strong mailbox refer to the same mailbox.
+fn same_mailbox(q: &WeakMailbox, mb: &Mailbox) -> bool {
+    q.ptr_eq(&Arc::downgrade(mb))
 }
 
 /// A reliable event could not be delivered without dropping data (mirrors
@@ -365,7 +432,7 @@ impl<T> BoundedMailbox<T> {
     /// Push without blocking, returning `false` if the mailbox is closed or
     /// full. Used by the sync publish path after its capacity check.
     pub(crate) fn try_recv_forced(&self, item: T) -> bool {
-        let mut st = self.state.lock().unwrap();
+        let mut st = self.lock_state();
         if st.closed || st.items.len() >= st.capacity {
             return false;
         }
@@ -501,5 +568,81 @@ mod tests {
         bus.unsubscribe(EventType::OrderSubmitted, &sub);
         bus.publish(order_event()).await;
         assert_eq!(sub.len(), 0);
+    }
+
+    // --- M-IN3: zombie subscribers and poisoned locks ---
+
+    #[tokio::test]
+    async fn dropped_subscriber_is_pruned_and_publish_does_not_block() {
+        let bus = Arc::new(EventBus::new(2));
+        {
+            let sub = bus.subscribe(EventType::OrderSubmitted);
+            assert_eq!(bus.subscriber_count(), 1);
+            bus.publish(order_event()).await;
+            assert_eq!(sub.len(), 1);
+        } // consumer drops its handle — only the bus's Weak ref remains
+
+        // A dropped consumer must not pin a mailbox forever: publish skips it
+        // (no infinite await) and the registration is pruned.
+        bus.publish(order_event()).await;
+        assert_eq!(bus.subscriber_count(), 0);
+        assert_eq!(bus.event_type_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn closed_mailbox_publish_returns_immediately() {
+        let bus = EventBus::new(1);
+        let sub = bus.subscribe(EventType::OrderSubmitted);
+        sub.close();
+        // put on a closed mailbox returns false on the first check; publish
+        // must not block.
+        bus.publish(order_event()).await;
+        assert_eq!(sub.len(), 0);
+        assert_eq!(bus.publish_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn wildcard_zombie_pruned_alongside_typed() {
+        let bus = EventBus::new(4);
+        {
+            let _typed = bus.subscribe(EventType::OrderSubmitted);
+            let _wild = bus.subscribe_all();
+            assert_eq!(bus.subscriber_count(), 2);
+        }
+        bus.publish(order_event()).await;
+        assert_eq!(bus.subscriber_count(), 0);
+    }
+
+    #[test]
+    fn poisoned_bus_state_keeps_working() {
+        let bus = Arc::new(EventBus::new(4));
+        // Poison the internal mutex: panic while holding its guard.
+        let bus2 = bus.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = bus2.state.lock().unwrap();
+            panic!("intentional panic to poison the bus state");
+        });
+        assert!(handle.join().is_err(), "the panic must poison the mutex");
+        // The bus keeps operating on the poisoned state.
+        let sub = bus.subscribe(EventType::OrderSubmitted);
+        bus.publish_sync(order_event()).unwrap();
+        assert_eq!(sub.len(), 1);
+        assert_eq!(bus.subscriber_count(), 1);
+    }
+
+    #[test]
+    fn poisoned_mailbox_state_keeps_working() {
+        let bus = EventBus::new(4);
+        let sub = bus.subscribe(EventType::OrderSubmitted);
+        // Poison the mailbox state mutex.
+        let sub2 = sub.clone();
+        let handle = std::thread::spawn(move || {
+            let _guard = sub2.state.lock().unwrap();
+            panic!("intentional panic to poison the mailbox");
+        });
+        assert!(handle.join().is_err());
+        bus.publish_sync(order_event()).unwrap();
+        assert_eq!(sub.len(), 1);
+        assert_eq!(sub.dropped(), 0);
     }
 }

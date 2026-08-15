@@ -1,6 +1,10 @@
 # Trend Following Strategy Parameters
 # Design doc §7.1, §15.2
-# Hot-reloadable: changes are picked up without process restart.
+# Reference template only — NOT hot-reloaded at runtime. Live strategy
+# parameters are immutable Postgres config versions
+# (strategy_config_versions + trend_follow_config_versions) activated via the
+# API (create / config-version activate with If-Match); no file watcher drives
+# managed instances (docs/design.md §15.2, docs/strategy_control_plane.md).
 
 symbol: BTC
 

@@ -68,6 +68,14 @@ impl Decimal {
     /// Smallest positive representable value = `10^-18`.
     pub const EPSILON: Decimal = Decimal { raw: 1 };
 
+    /// Upper bound on `|exponent|` accepted by the lenient parser. Any
+    /// exponent beyond this cannot produce an in-range `NUMERIC(38,18)` value
+    /// (positive exponents yield > 38 significant digits and are rejected by
+    /// [`Decimal::from_parts`]; negative exponents beyond 18 fractional digits
+    /// truncate to zero). The bound also keeps `apply_exponent`'s shift loop
+    /// linear in the input length instead of exponential in the exponent.
+    pub const MAX_LENIENT_EXPONENT: u32 = 40;
+
     /// Create from a raw scaled value (`value / 10^18`).
     pub const fn from_raw(raw: i128) -> Decimal {
         Decimal { raw }
@@ -134,8 +142,12 @@ impl Decimal {
     }
 
     /// Lenient parse: accepts exponent notation (e.g. `1e-07`, `1.5E+3`) and
-    /// arbitrary leading zeros. Used for internal float-string coercion and
-    /// pre-normalized values. Still enforces `NUMERIC(38,18)` bounds.
+    /// arbitrary leading zeros. Also accepts a leading `+` and `.5`-style
+    /// shapes that the strict parser rejects — this is deliberate: lenient is
+    /// the internal coercion entry (float `str()` output, pre-normalized
+    /// values), strict is the API gate. Still enforces `NUMERIC(38,18)` bounds
+    /// and caps `|exponent|` at [`MAX_LENIENT_EXPONENT`] so a hostile string
+    /// like `1e2147483647` cannot drive an unbounded shift loop.
     pub fn from_str_lenient(s: &str) -> Result<Decimal, DecimalError> {
         let s = s.trim();
         let (neg, mantissa, exp) = parse_lenient_decimal(s)?;
@@ -243,8 +255,15 @@ impl Decimal {
         }
     }
     pub const fn abs(&self) -> Decimal {
+        // `i128::MIN` has no positive counterpart: `wrapping_abs` would return
+        // a negative value (breaking the `abs() >= 0` contract) and a panicking
+        // `abs` would crash at the boundary. Saturate to `MAX` instead so the
+        // magnitude never wraps and the result is always non-negative.
         Decimal {
-            raw: self.raw.wrapping_abs(),
+            raw: match self.raw.checked_abs() {
+                Some(v) => v,
+                None => i128::MAX,
+            },
         }
     }
     pub const fn max(self, other: Decimal) -> Decimal {
@@ -266,32 +285,30 @@ impl Decimal {
     }
 
     /// Floor to the nearest integer (toward negative infinity).
+    ///
+    /// Computed in `I256` and saturated: at `i128::MIN` the true floor is one
+    /// unit of `SCALE` below the representable range, so the result clamps to
+    /// `MIN` rather than panicking or wrapping.
     pub fn floor(&self) -> Decimal {
-        let int = self.raw / SCALE_I128;
+        let int = I256::from(self.raw / SCALE_I128);
         let frac = self.raw % SCALE_I128;
-        if frac < 0 {
-            Decimal {
-                raw: (int - 1) * SCALE_I128,
-            }
-        } else {
-            Decimal {
-                raw: int * SCALE_I128,
-            }
+        let base = if frac < 0 { int - I256::ONE } else { int };
+        Decimal {
+            raw: signed_to_i128(base * I256::from(SCALE_I128)),
         }
     }
 
     /// Ceil to the nearest integer (toward positive infinity).
+    ///
+    /// Computed in `I256` and saturated: at `i128::MAX` the true ceiling is one
+    /// unit of `SCALE` above the representable range, so the result clamps to
+    /// `MAX` rather than panicking or wrapping.
     pub fn ceil(&self) -> Decimal {
-        let int = self.raw / SCALE_I128;
+        let int = I256::from(self.raw / SCALE_I128);
         let frac = self.raw % SCALE_I128;
-        if frac > 0 {
-            Decimal {
-                raw: (int + 1) * SCALE_I128,
-            }
-        } else {
-            Decimal {
-                raw: int * SCALE_I128,
-            }
+        let base = if frac > 0 { int + I256::ONE } else { int };
+        Decimal {
+            raw: signed_to_i128(base * I256::from(SCALE_I128)),
         }
     }
 
@@ -336,12 +353,19 @@ impl Decimal {
     pub fn div(self, rhs: Decimal) -> Decimal {
         assert!(!rhs.is_zero(), "Decimal division by zero");
         let neg = (self.raw < 0) ^ (rhs.raw < 0);
-        let num = I256::from(self.raw.unsigned_abs() as i128) * I256::from(SCALE_I128);
-        let den = I256::from(rhs.raw.unsigned_abs() as i128);
+        // `unsigned_abs()` yields a `u128`; converting through `I256::from`
+        // preserves the full magnitude. (Casting `unsigned_abs() as i128`
+        // would wrap `2^127` — the magnitude of `i128::MIN` — back to a
+        // negative value and silently flip the quotient's sign.)
+        let num = I256::from(self.raw.unsigned_abs()) * I256::from(SCALE_I128);
+        let den = I256::from(rhs.raw.unsigned_abs());
         let q = (num + den / I256::from(2)) / den;
-        let q = signed_to_i128(q);
+        // Apply the sign in `I256` *before* the saturated narrowing: for
+        // `MIN / 1` the magnitude `2^127` alone exceeds `i128::MAX`, but the
+        // true (negative) quotient `-2^127` is exactly representable.
+        let q = if neg { -q } else { q };
         Decimal {
-            raw: if neg { q.wrapping_neg() } else { q },
+            raw: signed_to_i128(q),
         }
     }
 
@@ -369,7 +393,11 @@ impl Decimal {
         let half = div / 2;
         let mut raw = self.raw;
         let sign = if raw < 0 { -1i128 } else { 1i128 };
-        raw = (raw.abs() + half) / div * div * sign;
+        // `i128::abs()` panics on `MIN`; saturate the magnitude first so the
+        // half-up add below cannot wrap either (`MIN`/`MAX` magnitudes round
+        // to themselves, which is the best representable answer).
+        let mag = raw.checked_abs().unwrap_or(i128::MAX).saturating_add(half);
+        raw = mag / div * div * sign;
         Decimal { raw }
     }
 
@@ -536,6 +564,13 @@ fn parse_lenient_decimal(s: &str) -> Result<(bool, &str, i32), DecimalError> {
         Some(i) => {
             let exp_str = &s[i + 1..];
             let exp: i32 = exp_str.parse().map_err(|_| DecimalError::InvalidFormat)?;
+            // Reject absurd exponents up front: `apply_exponent` shifts digit
+            // by digit, so a string like `1e2147483647` would otherwise loop
+            // ~2^31 times (CPU DoS). No exponent beyond ±40 can produce an
+            // in-range value anyway (see [`Decimal::MAX_LENIENT_EXPONENT`]).
+            if exp.unsigned_abs() > Decimal::MAX_LENIENT_EXPONENT {
+                return Err(DecimalError::OutOfRange);
+            }
             (&s[..i], exp)
         }
         None => (s, 0),
@@ -656,6 +691,15 @@ impl Ord for Decimal {
 
 // --- serde ---
 
+/// Serialize through [`fmt::Display`], i.e. Python's `decimal_string()`
+/// normalization: values with > 28 significant digits are rounded to 28
+/// (ROUND_HALF_EVEN) before rendering, while [`Deserialize`] accepts the full
+/// `NUMERIC(38,18)` range. This asymmetry is **intentional and locked in**:
+/// the API/storage wire contract is the 28-significant-digit `decimal_string`
+/// form, and `to_exact_string` is the lossless storage boundary. A serde
+/// round-trip of a 29–38 significant-digit value therefore normalizes (loses
+/// the digits beyond 28); callers that need exactness must use
+/// [`Decimal::to_exact_string`] explicitly.
 impl Serialize for Decimal {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         serializer.serialize_str(&self.to_string())
@@ -1152,6 +1196,181 @@ mod tests {
         );
     }
 
+    // --- H-DM1: div at i128::MIN must not flip the sign ---
+
+    #[test]
+    fn div_min_by_one_is_min() {
+        // Regression: `unsigned_abs() as i128` wrapped 2^127 to a negative
+        // value and flipped the sign of the quotient.
+        let q = Decimal::MIN.div(Decimal::from_i128(1));
+        assert_eq!(q.raw(), i128::MIN);
+        assert_eq!(q, Decimal::MIN);
+    }
+
+    #[test]
+    fn div_min_by_two_truncates_toward_zero() {
+        // MIN / 2 == -2^126 == i128::MIN / 2 (exact, no rounding involved).
+        let q = Decimal::MIN.div(Decimal::from_i128(2));
+        assert_eq!(q.raw(), i128::MIN / 2);
+        assert!(q.is_negative());
+    }
+
+    #[test]
+    fn div_min_by_neg_two_sign_correct() {
+        // MIN / -2 must be positive (sign = (-) x (-)).
+        let q = Decimal::MIN.div(Decimal::from_i128(-2));
+        assert_eq!(q.raw(), -(i128::MIN / 2));
+        assert!(q.is_positive());
+    }
+
+    #[test]
+    fn div_by_one_is_identity_at_bounds() {
+        assert_eq!(Decimal::MAX.div(Decimal::ONE).raw(), i128::MAX);
+        assert_eq!(Decimal::MIN.div(Decimal::ONE).raw(), i128::MIN);
+        assert_eq!(Decimal::from_raw(12345).div(Decimal::ONE).raw(), 12345);
+    }
+
+    // --- H-DM2: abs() must never return a negative value ---
+
+    #[test]
+    fn abs_min_saturates_to_max() {
+        let a = Decimal::MIN.abs();
+        assert!(a.raw() >= 0, "abs(MIN) must be non-negative");
+        assert_eq!(a, Decimal::MAX, "abs(MIN) saturates to MAX");
+        assert_eq!(Decimal::MAX.abs(), Decimal::MAX);
+        assert_eq!(Decimal::ZERO.abs(), Decimal::ZERO);
+        assert_eq!(Decimal::from_i128(-42).abs().to_string(), "42");
+    }
+
+    #[test]
+    fn round_to_places_min_no_garbage() {
+        // Must not panic (i128::abs on MIN): rounding MIN at 2 places keeps
+        // the sign and a magnitude that is a multiple of the rounding step.
+        let r = Decimal::MIN.round_to_places(2);
+        assert!(r.raw() <= 0);
+        assert_eq!(r.raw() % 10_000_000_000_000_000, 0); // multiple of 10^16
+        // And the same magnitude rounding on the positive side.
+        let p = Decimal::MAX.round_to_places(2);
+        assert!(p.raw() > 0);
+        assert_eq!(p.raw() % 10_000_000_000_000_000, 0);
+    }
+
+    // --- H-DM3: floor/ceil must not overflow at the extremes ---
+
+    #[test]
+    fn floor_ceil_extremes_saturate() {
+        let fl = Decimal::MIN.floor();
+        let ce = Decimal::MAX.ceil();
+        // No panic, no wrap: the results are ordered against the extremes and
+        // are integral (a wrapped result would not be).
+        assert!(fl <= Decimal::MIN);
+        assert!(Decimal::MAX <= ce);
+        assert_eq!(fl, Decimal::MIN); // saturated floor
+        assert_eq!(ce, Decimal::MAX); // saturated ceil
+        // Mid-range still behaves exactly.
+        assert_eq!(
+            Decimal::from_str_strict("-100.5")
+                .unwrap()
+                .floor()
+                .to_string(),
+            "-101"
+        );
+        assert_eq!(
+            Decimal::from_str_strict("100.5")
+                .unwrap()
+                .ceil()
+                .to_string(),
+            "101"
+        );
+    }
+
+    // --- M-DM4: lenient exponent cap (DoS guard) ---
+
+    #[test]
+    fn lenient_rejects_absurd_exponents() {
+        // Huge exponents must fail fast instead of looping ~2^31 times.
+        for bad in [
+            "1e2147483647",
+            "-1e2147483647",
+            "1e-2147483648",
+            "1e50",
+            "1e-50",
+        ] {
+            assert!(
+                Decimal::from_str_lenient(bad).is_err(),
+                "should reject {bad:?}"
+            );
+        }
+        // Exponents within the cap still behave; the significant-digit gate
+        // rejects what cannot fit NUMERIC(38,18).
+        assert!(Decimal::from_str_lenient("1e40").is_err()); // 41 digits
+        assert_eq!(Decimal::from_str_lenient("1e-40").unwrap().to_string(), "0");
+        assert_eq!(
+            Decimal::from_str_lenient("1e20").unwrap().to_string(),
+            "100000000000000000000"
+        );
+    }
+
+    #[test]
+    fn lenient_truncates_excess_fractional_digits() {
+        // Documented lenient behavior: > 18 fractional digits truncate (the
+        // strict parser is the API gate and rejects them).
+        assert_eq!(
+            Decimal::from_str_lenient("1.0000000000000000001").unwrap(),
+            Decimal::from_i128(1)
+        );
+        assert_eq!(
+            Decimal::from_str_lenient("0.1234567890123456789").unwrap(),
+            Decimal::from_str_strict("0.123456789012345678").unwrap()
+        );
+    }
+
+    #[test]
+    fn lenient_accepts_plus_and_dot_shapes() {
+        // M-DM5: the lenient entry deliberately accepts shapes the strict
+        // parser rejects (+1, .5); documented contract, not a bug.
+        assert_eq!(
+            Decimal::from_str_lenient("+1").unwrap(),
+            Decimal::from_i128(1)
+        );
+        assert_eq!(
+            Decimal::from_str_lenient(".5").unwrap(),
+            Decimal::from_str_strict("0.5").unwrap()
+        );
+    }
+
+    // --- M-DM3: serde round-trip contract for 29..=38 significant digits ---
+
+    #[test]
+    fn serde_roundtrip_normalizes_28_sig_digits() {
+        // The wire contract is the 28-significant-digit `decimal_string`
+        // form: Serialize normalizes, Deserialize accepts 38. A round-trip of
+        // a 38-sig-digit value therefore is not identity; the lossless
+        // storage boundary is `to_exact_string`.
+        let v = Decimal::from_str_strict("99999999999999999999.999999999999999999").unwrap();
+        let s = serde_json::to_string(&v).unwrap();
+        assert_eq!(s, "\"100000000000000000000\"");
+        let back: Decimal = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.to_string(), "100000000000000000000");
+        assert_ne!(back, v, "28-sig normalize is lossy by contract");
+        assert_eq!(
+            v.to_exact_string(),
+            "99999999999999999999.999999999999999999"
+        );
+        // 29 significant digits (within the 20-int + 18-frac envelope):
+        // serde round-trip normalizes to 28, exact-string round-trips.
+        let v29 = Decimal::from_str_strict("12345678901234567890.123456789").unwrap();
+        assert_ne!(
+            serde_json::from_str::<Decimal>(&serde_json::to_string(&v29).unwrap()).unwrap(),
+            v29
+        );
+        assert_eq!(
+            Decimal::from_str_strict(&v29.to_exact_string()).unwrap(),
+            v29,
+            "to_exact_string is the lossless round-trip boundary"
+        );
+    }
+
     proptest! {
         #[test]
         fn mul_by_one_is_identity(v in any::<i64>()) {
@@ -1164,6 +1383,72 @@ mod tests {
             let da = Decimal::from_i128(a as i128);
             let db = Decimal::from_i128(b as i128);
             assert_eq!(da + db, db + da);
+        }
+
+        // --- H-DM1..3: boundary-safety properties over the full i128 range ---
+
+        #[test]
+        fn div_sign_matches_operands(a in any::<i128>(), b in any::<i128>()) {
+            let da = Decimal::from_raw(a);
+            let db = Decimal::from_raw(b);
+            prop_assume!(!db.is_zero());
+            let q = da.div(db);
+            if a == 0 {
+                prop_assert!(q.is_zero());
+            } else {
+                // Saturation only clamps magnitude; it never flips the sign.
+                // (A quotient may underflow to zero when |a/b| < 1e-18.)
+                let expected = (a.signum() * b.signum()) as i8;
+                prop_assert!(
+                    q.is_zero() || q.signum() == expected,
+                    "div sign mismatch for raw a={a} b={b}: q.raw={}",
+                    q.raw()
+                );
+            }
+        }
+
+        #[test]
+        fn abs_is_never_negative(a in any::<i128>()) {
+            let d = Decimal::from_raw(a);
+            prop_assert!(d.abs().raw() >= 0, "abs({a}) must be non-negative");
+        }
+
+        #[test]
+        fn floor_ceil_ordered_and_integral(a in any::<i128>()) {
+            let d = Decimal::from_raw(a);
+            let fl = d.floor();
+            let ce = d.ceil();
+            prop_assert!(fl <= d && d <= ce, "floor <= d <= ceil for raw {a}");
+            // Integral in raw units (multiple of SCALE), except when the true
+            // result saturates at the extremes.
+            prop_assert!(
+                fl.raw() % SCALE_I128 == 0 || fl == Decimal::MIN,
+                "floor({a}) must be integral or saturated"
+            );
+            prop_assert!(
+                ce.raw() % SCALE_I128 == 0 || ce == Decimal::MAX,
+                "ceil({a}) must be integral or saturated"
+            );
+            prop_assert!(
+                ce.raw().saturating_sub(fl.raw()) <= SCALE_I128,
+                "ceil - floor must be at most one unit for raw {a}"
+            );
+        }
+
+        #[test]
+        fn div_roundtrip_recovers_dividend(a in any::<i64>(), b in any::<i64>()) {
+            let da = Decimal::from_i128(a as i128);
+            let db = Decimal::from_i128(b as i128);
+            prop_assume!(!db.is_zero());
+            // q = a/b at scale 18; q * b must land within half a unit of a.
+            let q = da.div(db);
+            let back = q * db;
+            let err = (back - da).abs();
+            prop_assert!(
+                err <= db.abs(),
+                "div/mul roundtrip error too large for {a}/{b}: {err} (db={})",
+                db
+            );
         }
     }
 }

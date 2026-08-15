@@ -9,11 +9,12 @@ use std::collections::HashMap;
 use std::fmt;
 
 use hypeedge_domain::Decimal;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// A base-10 number that appears in config. Accepts a YAML number (int/float)
 /// or a decimal string, mirroring how pydantic's `Decimal` coerces.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize)]
 pub struct ConfigDecimal(pub Decimal);
 
 impl<'de> Deserialize<'de> for ConfigDecimal {
@@ -50,9 +51,50 @@ impl Default for ConfigDecimal {
     }
 }
 
+/// Render a secret for `Debug` output: `<unset>` when empty, otherwise a
+/// `<redacted:abcd>` marker carrying only the first 4 chars (mirrors the
+/// `ExchangeSettings` pattern). Structured logging of settings must never
+/// leak signing keys, DB passwords, or API tokens into the log stream.
+fn redact_secret(secret: &str) -> String {
+    if secret.is_empty() {
+        "<unset>".to_string()
+    } else {
+        format!("<redacted:{}>", secret.chars().take(4).collect::<String>())
+    }
+}
+
+/// Mask the password component of a `postgresql://user:pass@host:port/db`
+/// URL so `Debug` output of [`PostgresSettings`] never leaks the DB credential.
+fn redact_url_password(url: &str) -> String {
+    let Ok(parsed) = Url::parse(url) else {
+        return "<invalid url>".to_string();
+    };
+    let has_password = parsed.password().is_some();
+    let mut out = format!("{}://", parsed.scheme());
+    if !parsed.username().is_empty() || has_password {
+        out.push_str(parsed.username());
+        out.push(':');
+        out.push_str(if has_password { "***" } else { "" });
+        out.push('@');
+    }
+    if let Some(host) = parsed.host_str() {
+        out.push_str(host);
+        if let Some(port) = parsed.port() {
+            out.push(':');
+            out.push_str(&port.to_string());
+        }
+    }
+    out.push_str(parsed.path());
+    if let Some(query) = parsed.query() {
+        out.push('?');
+        out.push_str(query);
+    }
+    out
+}
+
 /// Hyperliquid exchange connection settings.
-#[derive(Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ExchangeSettings {
     pub api_url: String,
     pub ws_url: String,
@@ -68,17 +110,7 @@ impl fmt::Debug for ExchangeSettings {
             .field("api_url", &self.api_url)
             .field("ws_url", &self.ws_url)
             .field("account_address", &self.account_address)
-            .field(
-                "agent_private_key",
-                &if self.agent_private_key.is_empty() {
-                    "<unset>".to_string()
-                } else {
-                    format!(
-                        "<redacted:{}>",
-                        self.agent_private_key.chars().take(4).collect::<String>()
-                    )
-                },
-            )
+            .field("agent_private_key", &redact_secret(&self.agent_private_key))
             .finish()
     }
 }
@@ -102,8 +134,8 @@ impl ExchangeSettings {
 }
 
 /// Market data collection settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MarketDataSettings {
     pub coins: Vec<String>,
     pub spot_coins: Vec<String>,
@@ -139,8 +171,8 @@ impl Default for MarketDataSettings {
 }
 
 /// Deployment-wide safety limits for optional external reference prices.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ExternalReferenceSettings {
     pub external_reference_enabled: bool,
     pub spot_ws_url: String,
@@ -184,8 +216,8 @@ impl Default for ExternalReferenceSettings {
 }
 
 /// ClickHouse connection settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ClickHouseSettings {
     pub host: String,
     pub port: u16,
@@ -195,6 +227,22 @@ pub struct ClickHouseSettings {
     pub batch_size: u32,
     pub flush_interval: f64,
     pub spool_path: String,
+}
+
+/// `Debug` redacts the password (M-CF2).
+impl fmt::Debug for ClickHouseSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ClickHouseSettings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &redact_secret(&self.password))
+            .field("database", &self.database)
+            .field("batch_size", &self.batch_size)
+            .field("flush_interval", &self.flush_interval)
+            .field("spool_path", &self.spool_path)
+            .finish()
+    }
 }
 
 impl Default for ClickHouseSettings {
@@ -213,8 +261,8 @@ impl Default for ClickHouseSettings {
 }
 
 /// Postgres connection settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct PostgresSettings {
     pub url: String,
     pub pool_size: u32,
@@ -224,10 +272,31 @@ pub struct PostgresSettings {
     pub risk_reservation_ttl_seconds: u32,
 }
 
+/// `Debug` redacts the password embedded in the connection URL (M-CF2).
+impl fmt::Debug for PostgresSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PostgresSettings")
+            .field("url", &redact_url_password(&self.url))
+            .field("pool_size", &self.pool_size)
+            .field("command_poll_interval_ms", &self.command_poll_interval_ms)
+            .field("command_lease_seconds", &self.command_lease_seconds)
+            .field("unknown_recheck_seconds", &self.unknown_recheck_seconds)
+            .field(
+                "risk_reservation_ttl_seconds",
+                &self.risk_reservation_ttl_seconds,
+            )
+            .finish()
+    }
+}
+
 impl Default for PostgresSettings {
     fn default() -> Self {
         Self {
-            url: "postgresql+asyncpg://hypeedge:hypeedge@localhost:5432/hypeedge".into(),
+            // Plain `postgresql://` scheme: the `postgresql+asyncpg://`
+            // dialect prefix is a Python/SQLAlchemy-ism and is not a scheme
+            // sqlx understands (it currently parses anyway only because
+            // `PgConnectOptions::from_str` does not validate the scheme).
+            url: "postgresql://hypeedge:hypeedge@localhost:5432/hypeedge".into(),
             pool_size: 5,
             command_poll_interval_ms: 100,
             command_lease_seconds: 15,
@@ -238,8 +307,8 @@ impl Default for PostgresSettings {
 }
 
 /// Risk management settings (design doc §8).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct RiskSettings {
     pub max_position_pct: f64,
     pub max_strategy_loss_pct: f64,
@@ -270,8 +339,8 @@ impl Default for RiskSettings {
 }
 
 /// Address-action, cancel-headroom, and IP-weight safety budgets.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ActionBudgetSettings {
     pub remote_snapshot_max_age_seconds: f64,
     pub remote_poll_interval_normal_seconds: f64,
@@ -327,8 +396,8 @@ impl Default for ActionBudgetSettings {
 }
 
 /// Global market-making safety ceilings and control-plane defaults.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MarketMakingSettings {
     pub max_active_strategies: u32,
     pub max_quote_levels_per_side: u32,
@@ -364,8 +433,8 @@ impl Default for MarketMakingSettings {
 }
 
 /// Deployment-wide funding-arbitrage execution ceilings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FundingArbSettings {
     pub max_notional_usd: ConfigDecimal,
     pub poll_interval_seconds: f64,
@@ -401,8 +470,8 @@ impl Default for FundingArbSettings {
 }
 
 /// Monitoring settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct MonitorSettings {
     pub prometheus_port: u16,
 }
@@ -416,8 +485,8 @@ impl Default for MonitorSettings {
 }
 
 /// Backfill state and data integrity settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BackfillSettings {
     pub state_dir: String,
     pub backfill_window_days: u32,
@@ -439,8 +508,8 @@ impl Default for BackfillSettings {
 }
 
 /// Backtest framework settings (design doc §6).
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct BacktestSettings {
     pub initial_capital: f64,
     pub default_maker_rebate_pct: f64,
@@ -470,8 +539,8 @@ impl Default for BacktestSettings {
 }
 
 /// HTTP API settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct ApiSettings {
     pub host: String,
     pub port: u16,
@@ -488,6 +557,43 @@ pub struct ApiSettings {
     pub market_ws_max_connections_per_ip: u32,
     pub market_ws_queue_size: u32,
     pub market_ws_messages_per_second: u32,
+}
+
+/// `Debug` redacts the four API role tokens (M-CF2).
+impl fmt::Debug for ApiSettings {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ApiSettings")
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("cors_origins", &self.cors_origins)
+            .field("auth_token", &redact_secret(&self.auth_token))
+            .field("viewer_token", &redact_secret(&self.viewer_token))
+            .field("operator_token", &redact_secret(&self.operator_token))
+            .field("admin_token", &redact_secret(&self.admin_token))
+            .field(
+                "request_rate_limit_per_minute",
+                &self.request_rate_limit_per_minute,
+            )
+            .field(
+                "mutation_rate_limit_per_minute",
+                &self.mutation_rate_limit_per_minute,
+            )
+            .field(
+                "auth_failure_limit_per_minute",
+                &self.auth_failure_limit_per_minute,
+            )
+            .field("market_ws_max_connections", &self.market_ws_max_connections)
+            .field(
+                "market_ws_max_connections_per_ip",
+                &self.market_ws_max_connections_per_ip,
+            )
+            .field("market_ws_queue_size", &self.market_ws_queue_size)
+            .field(
+                "market_ws_messages_per_second",
+                &self.market_ws_messages_per_second,
+            )
+            .finish()
+    }
 }
 
 impl Default for ApiSettings {
@@ -515,8 +621,8 @@ impl Default for ApiSettings {
 }
 
 /// V2 cut-over flags. Trading stays disabled unless the full V2 chain is on.
-#[derive(Debug, Clone, PartialEq, Default, Deserialize)]
-#[serde(default)]
+#[derive(Debug, Clone, PartialEq, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct FeatureFlagsSettings {
     pub legacy_execution: bool,
     pub durable_ledger_v2: bool,
@@ -542,8 +648,13 @@ impl FeatureFlagsSettings {
 }
 
 /// Top-level application settings. Composes all sub-settings.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(default)]
+///
+/// `Debug` is derived: every secret-bearing sub-settings struct implements a
+/// redacting `Debug` (`ExchangeSettings`, `ClickHouseSettings`,
+/// `PostgresSettings`, `ApiSettings`), so formatting the whole tree never
+/// leaks keys/passwords/tokens (M-CF2).
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
 pub struct AppSettings {
     pub environment: String,
     pub log_level: String,
@@ -628,6 +739,35 @@ impl AppSettings {
                 ));
             }
         }
+
+        // Risk settings ranges (H-CF1): these are safety-critical ceilings, so
+        // nonsense values fail closed at startup instead of silently
+        // disabling protection.
+        let r = &self.risk;
+        if r.max_leverage == 0 || r.max_leverage > 20 {
+            return Err(ConfigError::validation("max_leverage must be in (0, 20]"));
+        }
+        for (name, v) in [
+            ("max_position_pct", r.max_position_pct),
+            ("max_strategy_loss_pct", r.max_strategy_loss_pct),
+            ("max_drawdown_pct", r.max_drawdown_pct),
+        ] {
+            if !(v > 0.0 && v <= 1.0) {
+                return Err(ConfigError::validation(format!("{name} must be in (0, 1]")));
+            }
+        }
+        if r.risk_check_timeout_ms < 100 {
+            return Err(ConfigError::validation(
+                "risk_check_timeout_ms must be at least 100ms",
+            ));
+        }
+        if !r.market_price_stale_seconds.is_finite() || r.market_price_stale_seconds <= 0.0 {
+            return Err(ConfigError::validation(
+                "market_price_stale_seconds must be positive and finite",
+            ));
+        }
+        // `action_credits_low_watermark` is a `u64`, so `>= 0` is guaranteed
+        // by the type; no runtime check needed.
 
         // Action budget thresholds.
         let ab = &self.action_budget;
@@ -778,12 +918,14 @@ impl AppSettings {
             ));
         }
 
-        // Live-strategy environment restriction.
-        if f.funding_arb_execution_enabled
-            && !matches!(self.environment.as_str(), "testnet" | "mainnet")
-        {
+        // Live-strategy environment restriction (M-FA6): funding-arb live
+        // execution is **testnet-only**. Mainnet is hard-disabled by design
+        // (`docs/funding_arb_design.md` §1: "mainnet 继续硬禁用"; §5.3: "本版本
+        // 没有 mainnet 解锁路径"), and `dev` runs the observation/control
+        // plane only.
+        if f.funding_arb_execution_enabled && self.environment.as_str() != "testnet" {
             return Err(ConfigError::validation(
-                "funding-arbitrage live execution is restricted to HYPE_ENV=testnet or mainnet",
+                "funding_arb_execution_enabled is restricted to HYPE_ENV=testnet (mainnet is hard-disabled)",
             ));
         }
 
@@ -807,6 +949,8 @@ pub enum ConfigError {
     UnsupportedEnvironment(String),
     #[error("mainnet requires secret environment variables: {0}")]
     MainnetSecretsMissing(String),
+    #[error("mainnet requires the kill switch to be enabled (risk.kill_switch_enabled=true)")]
+    MainnetKillSwitchDisabled,
     #[error("invalid mainnet Postgres URL: {0}")]
     MainnetPostgresInvalid(String),
     #[error("invalid mainnet API token: {0}")]
@@ -869,6 +1013,158 @@ mod tests {
         assert!(
             s.validate().is_ok(),
             "loopback host is allowed on mainnet without tokens"
+        );
+    }
+
+    // --- H-CF1: RiskSettings range validation ---
+
+    #[test]
+    fn risk_settings_range_validation() {
+        let mut s = AppSettings::default();
+        assert!(s.validate().is_ok(), "defaults are valid");
+
+        // max_leverage in (0, 20].
+        s.risk.max_leverage = 0;
+        assert!(s.validate().is_err());
+        s.risk.max_leverage = 21;
+        assert!(s.validate().is_err());
+        s.risk.max_leverage = 20;
+        assert!(s.validate().is_ok());
+        s.risk.max_leverage = 1;
+        assert!(s.validate().is_ok());
+        s.risk.max_leverage = 5;
+
+        // pct fields in (0, 1].
+        s.risk.max_position_pct = 0.0;
+        assert!(s.validate().is_err());
+        s.risk.max_position_pct = 1.1;
+        assert!(s.validate().is_err());
+        s.risk.max_position_pct = 1.0;
+        assert!(s.validate().is_ok());
+        s.risk.max_position_pct = 0.20;
+        s.risk.max_strategy_loss_pct = -0.01;
+        assert!(s.validate().is_err());
+        s.risk.max_strategy_loss_pct = 0.05;
+        s.risk.max_drawdown_pct = 0.0;
+        assert!(s.validate().is_err());
+        s.risk.max_drawdown_pct = 0.10;
+
+        // risk_check_timeout_ms >= 100.
+        s.risk.risk_check_timeout_ms = 99;
+        assert!(s.validate().is_err());
+        s.risk.risk_check_timeout_ms = 100;
+        assert!(s.validate().is_ok());
+        s.risk.risk_check_timeout_ms = 500;
+
+        // market_price_stale_seconds > 0.
+        s.risk.market_price_stale_seconds = 0.0;
+        assert!(s.validate().is_err());
+        s.risk.market_price_stale_seconds = -1.0;
+        assert!(s.validate().is_err());
+        s.risk.market_price_stale_seconds = 5.0;
+
+        assert!(s.validate().is_ok(), "all boundary-valid values pass");
+    }
+
+    // --- M-CF2: Debug redaction ---
+
+    #[test]
+    fn postgres_url_debug_redacts_password() {
+        let s = PostgresSettings {
+            url: "postgresql://hypeedge:supersecretpw@db.internal:5432/hypeedge".into(),
+            ..PostgresSettings::default()
+        };
+        let dbg = format!("{s:?}");
+        assert!(
+            !dbg.contains("supersecretpw"),
+            "Debug must not leak the DB password: {dbg}"
+        );
+        assert!(
+            dbg.contains(":***@db.internal"),
+            "redacted URL should keep user + host shape: {dbg}"
+        );
+    }
+
+    #[test]
+    fn clickhouse_debug_redacts_password() {
+        let s = ClickHouseSettings {
+            password: "ch-secret-123".into(),
+            ..ClickHouseSettings::default()
+        };
+        let dbg = format!("{s:?}");
+        assert!(
+            !dbg.contains("ch-secret-123"),
+            "Debug must not leak the ClickHouse password: {dbg}"
+        );
+        assert!(dbg.contains("<redacted:ch-s>"), "marker expected: {dbg}");
+    }
+
+    #[test]
+    fn api_debug_redacts_tokens() {
+        let s = ApiSettings {
+            auth_token: "0123456789abcdef0123456789abcdef".into(),
+            viewer_token: "fedcba9876543210fedcba9876543210".into(),
+            operator_token: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into(),
+            admin_token: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+            ..ApiSettings::default()
+        };
+        let dbg = format!("{s:?}");
+        for secret in [
+            "0123456789abcdef0123456789abcdef",
+            "fedcba9876543210fedcba9876543210",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ] {
+            assert!(
+                !dbg.contains(secret),
+                "Debug must not leak {secret:?}: {dbg}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_settings_debug_redacts_all_secrets() {
+        let mut s = AppSettings::default();
+        s.exchange.agent_private_key = "0xdeadbeefcafe1234".into();
+        s.exchange.account_address = "0x1111111111111111111111111111111111111111".into();
+        s.postgres.url = "postgresql://hypeedge:supersecretpw@db.internal:5432/hypeedge".into();
+        s.clickhouse.password = "ch-secret-123".into();
+        s.api.auth_token = "0123456789abcdef0123456789abcdef".into();
+        s.api.viewer_token = "fedcba9876543210fedcba9876543210".into();
+        s.api.operator_token = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
+        s.api.admin_token = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into();
+        let dbg = format!("{s:?}");
+        for secret in [
+            "0xdeadbeefcafe1234",
+            "supersecretpw",
+            "ch-secret-123",
+            "0123456789abcdef0123456789abcdef",
+            "fedcba9876543210fedcba9876543210",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ] {
+            assert!(
+                !dbg.contains(secret),
+                "AppSettings Debug must not leak {secret:?}: {dbg}"
+            );
+        }
+        // Redaction markers are present so the output is still actionable.
+        assert!(dbg.contains("<redacted:0xde>"), "exchange marker: {dbg}");
+        assert!(
+            dbg.contains("hypeedge:***@db.internal"),
+            "postgres URL password masked: {dbg}"
+        );
+    }
+
+    // --- M-CF1: unknown settings fields must be rejected on deserialization ---
+
+    #[test]
+    fn unknown_risk_field_is_rejected() {
+        let yaml = "risk:\n  max_levarage: 5\n"; // typo of max_leverage
+        let err = serde_yaml::from_str::<AppSettings>(yaml).unwrap_err();
+        assert!(
+            err.to_string().contains("max_levarage"),
+            "typo'd field must be reported: {err}"
         );
     }
 }
