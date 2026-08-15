@@ -54,14 +54,14 @@ Hyperliquid funding **每小时结算**（非币安 8h）。
 
 ## 4. 控制面契约
 
-- **策略类型**：`funding_arb`，注册于 `StrategyRegistry`（`src/hypeedge/strategy/funding_arb/runtime.py::build_funding_arb_plugin`）。
+- **策略类型**：`funding_arb`，注册于 `StrategyRegistry`（`crates/trading/src/funding_arb/runtime.rs::build_funding_arb_plugin`）。
 - **Capabilities**：`creatable=True`；`desired_states={stopped, running, paused}`；**无 shadow、无 drain**；`workspace="funding-arb"`（前端工作台 `/strategy/[id]/funding-arb`）。
 - **创建**：`POST /api/v1/strategies`，`strategy_type="funding_arb"`；请求不接受 `symbol`、`spot_coin` 或
   `sub_account`，服务端将实例市场作用域固定为 `AUTO`，并从已校验的 `HYPE_EXCHANGE__ACCOUNT_ADDRESS` 注入
   账户范围；`initial_config` 只包含上表策略/风险参数。
 - **配置版本**：`funding_arb_config_versions` 子表 + 通用 `strategy_config_versions`；`POST .../config-versions` 追加版本、`.../activate` 热替换（`apply_config` 解码为 `FundingArbParams`）。
 - **生命周期**：`start/stop/pause/resume` 经 Supervisor + CapabilityGate；对 `drain` 或目标 `shadow` 返回 409/422。
-- **DB 约束**：`strategy_instances.strategy_type` CHECK 由 Alembic 迁移显式加入 `funding_arb`，不得只修改 ORM metadata。
+- **DB 约束**：`strategy_instances.strategy_type` CHECK 由 sqlx migrate（`crates/storage/migrations/*.sql`）显式加入 `funding_arb`，不得只修改应用层代码。
   收紧的资金费阈值/现货标识 CHECK 以 `NOT VALID` 加入：不改写带内容哈希的不可变历史版本，但会约束所有新写入；
   激活配置前由 Strategy Type Plugin 再校验一次，因此旧非法版本不能成为新的 desired config。
 
@@ -69,8 +69,9 @@ Hyperliquid funding **每小时结算**（非币安 8h）。
 
 ### 5.1 环境与账户门禁
 
-- 只有 `HYPE_ENV=testnet` 或 `mainnet`、完整 V2 交易链、`funding_arb_execution_enabled=true`、启动对账成功、
-  Kill Switch 未触发、账户健康与动作额度新鲜时可启动真实 runtime。
+- 只有 `HYPE_ENV=testnet`、完整 V2 交易链、`funding_arb_execution_enabled=true`、启动对账成功、
+  Kill Switch 未触发、账户健康与动作额度新鲜时可启动真实 runtime（`crates/config/src/settings.rs` 校验器
+  对 mainnet 的 `funding_arb_execution_enabled=true` 直接报错——mainnet 硬禁用，与 §1/§5.3 一致）。
 - `dev` 只运行观察/控制面；`mainnet` 额外要求 loader 的 mainnet 门禁全部通过（Agent Wallet、强 Postgres、
   API admin token ≥32 字符、TLS），缺任一则配置加载失败。
 - Agent wallet 只负责交易签名，不执行资金转账。现货 USDC 必须由操作员事先在 Hyperliquid UI/受控流程中划入；

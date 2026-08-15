@@ -5,10 +5,12 @@
 
 ## 0. 前置：代码层已解锁（本次已完成）
 
-- `config/settings.py` validator：`funding_arb_execution_enabled` 允许 `testnet` / `mainnet`（dev 仍禁止）。
-- `app.py`：`spot_execution_enabled` 与 funding_arb 依赖构造不再写死 `is_testnet`。
+- `crates/config/src/settings.rs` validator：`funding_arb_execution_enabled` 允许 `testnet` / `mainnet`（dev 仍禁止）。
+- `crates/app/src/runtime.rs`：funding_arb 依赖（LiveFundingArbScanner / InstrumentMeta / cycle store）由
+  `funding_arb_execution_enabled` 控制装配，不再写死 `is_testnet`。
 - `configs/mainnet.yaml`：完整 V2 交易链 + `funding_arb_execution_enabled: true` 已开启。
-- 配套单测通过（`tests/unit/test_config.py`）。
+- mainnet 交易硬禁用闩（runtime.rs:119-127）：`HYPE_ENV=mainnet` 启动必须显式设置 `HYPE_MAINNET_TRADING_ENABLED=1`（见 §1）。
+- 配套单测通过（`crates/config/tests/config_parity.rs`）。
 
 ## 1. 环境变量（.env 或 secret manager）
 
@@ -16,16 +18,20 @@
 # 网络 —— 决定加载 configs/mainnet.yaml 与官方 mainnet API/WS
 HYPE_ENV=mainnet
 
+# ⚠️ 唯一解除 mainnet 交易硬禁用的开关（crates/app/src/runtime.rs:119-127）：
+# 未设置时 mainnet 启动直接报错拒绝。确认下方全部准备就绪后再置 1。
+HYPE_MAINNET_TRADING_ENABLED=1
+
 # Agent/API Wallet（主钱包私钥永不进交易进程）
 HYPE_EXCHANGE__ACCOUNT_ADDRESS=<mainnet 账户地址>
 HYPE_EXCHANGE__AGENT_PRIVATE_KEY=<agent 私钥>
 
 # mainnet 独立数据库（必须与 testnet 分开、TLS、强随机密码）
 # loader 会拒绝 hypeedge/postgres/password/changeme 等弱密码，且必须 ssl=require/verify-ca/verify-full
-HYPE_POSTGRES__URL=postgresql+asyncpg://<user>:<强密码>@<host>:5432/<mainnet_db>?ssl=require
+HYPE_POSTGRES__URL=postgresql://<user>:<强密码>@<host>:5432/<mainnet_db>?ssl=require
 
 # API token（mainnet 必须有 admin，全部 ≥32 随机字符）
-# python -c 'import secrets; print(secrets.token_urlsafe(48))'
+# openssl rand -base64 32   # 或任意 ≥32 字符随机串
 HYPE_API__VIEWER_TOKEN=<...>
 HYPE_API__OPERATOR_TOKEN=<...>
 HYPE_API__ADMIN_TOKEN=<...>

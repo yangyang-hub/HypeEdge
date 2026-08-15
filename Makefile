@@ -31,9 +31,14 @@ run:
 	cargo run -p hypeedge_app
 
 # Emergency kill switch
+# POST /api/v1/kill-switch is a v1 mutation: admin-only and requires an
+# Idempotency-Key header (see crates/api/src/middleware.rs). If API tokens are
+# configured (mainnet always requires one), also pass
+#   -H "Authorization: Bearer $$HYPE_API__ADMIN_TOKEN"
 kill-switch:
-	@curl -s -X POST http://localhost:37001/api/kill-switch \
+	@curl -s -X POST http://localhost:37001/api/v1/kill-switch \
 		-H "Content-Type: application/json" \
+		-H "Idempotency-Key: 00000000-0000-4000-8000-000000000001" \
 		-d '{"action":"trigger","reason":"manual_makefile_trigger"}' \
 		|| echo "Error: Is the HypeEdge API server running on port 37001?"
 

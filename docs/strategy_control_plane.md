@@ -20,10 +20,10 @@ DB `strategy_instances.strategy_type` CHECK 已预留 `trend_follow` / `legacy`�
 
 实现锚点（现状）：
 
-- Registry：`src/hypeedge/strategy/registry.py`
-- Supervisor：`src/hypeedge/strategy/supervisor.py`
-- Create 硬编码 gate：`src/hypeedge/storage/market_making.py`（拒绝非 `market_maker`）
-- API schema：`src/hypeedge/api/schemas.py` 中 `StrategyCreateRequest.strategy_type: Literal["market_maker"]`
+- Registry：`crates/trading/src/strategy/registry.rs`
+- Supervisor：`crates/trading/src/strategy/supervisor.rs`
+- Create 校验：`crates/api/src/routes/strategies.rs`（按 `strategy_type` 分发归一化，未知类型 422）
+- API schema：`crates/api/src/routes/strategies.rs` 的 `strategy_type` 判别联合校验（前端 `web/lib/types.ts` 同步）
 - 前端 create：`web/components/strategy/create-market-maker-dialog.tsx`
 
 ## 2. 设计结论
@@ -128,7 +128,7 @@ CapabilityGate 规则：
 
 与 `market_maker_config_versions` 同模式：`config_version_id` PK/FK → `strategy_config_versions.id`。
 
-列与 `TrendParams`（`src/hypeedge/strategy/params.py`）对齐：
+列与 `TrendParams`（`crates/trading/src/strategy/params.rs`）对齐：
 
 | 列 | 约束要点 |
 |----|----------|
@@ -250,7 +250,7 @@ P1/P2 完成后：
 
 - Plugin 接口与 MM/trend 注册骨架（trend factory 可暂返回 not-runnable stub，或仅 persist）
 - API / TS 判别联合 create
-- Alembic：`trend_follow_config_versions`
+- sqlx migrate：`trend_follow_config_versions`（`crates/storage/migrations/*.sql`）
 - 通用 Create Dialog + Trend ConfigFields
 - Create 后实例 `stopped` 出现在列表
 

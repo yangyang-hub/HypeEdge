@@ -25,7 +25,7 @@
 |---|---|---|
 | 服务拆分 | **先模块化单体**，模块边界保留为未来拆分蓝图 | 6 个微服务对个人是过度设计；风控放下单路径上做网络调用会给每单加延迟 |
 | 风控位置 | **内联在下单路径**（同步校验，零网络开销） | 风控必须在每个订单发出前同步通过 |
-| 语言 | **第一二阶段 Python；第三阶段把执行热路径重写 Rust** | 低频不需要 Rust 的延迟；研究阶段 Python 迭代快 5–10× |
+| 语言 | **全栈 Rust**（tokio + axum + sqlx，2026-08 整体重写完成） | 初版方案是 Python 先行、第三阶段热路径再迁 Rust；实际在 2026-08 一次性重写完成，研究/回测同样走 Rust（§10、§20） |
 | 账户隔离 | **每策略一个子账户（sub-account）+ isolated margin** | 避免策略间保证金互相穿仓、nonce 冲突、PnL 无法归因 |
 | 签名钱包 | **API/agent wallet（只交易不可提现）** | 主钱包私钥永不进交易进程 |
 | 限频模型 | 把**「按地址动作额度」**当成做市/网格/HFT 的一等约束 | 真正卡死交易机器人的不是 IP 权重，而是「成交量换动作额度」（见 §3.2） |
@@ -390,26 +390,29 @@ Postgres 关键表：
 
 ## 10. 技术栈
 
-| 层 | 第一/二阶段 | 第三阶段 |
-|---|---|---|
-| 语言 | **Python**（研究/回测/低频执行） | 执行热路径重写 **Rust** |
-| 行情 | WebSocket + REST | 同 |
-| 时序存储 | ClickHouse（或起步用 DuckDB） | ClickHouse |
-| 事务存储 | Postgres | 同 |
-| 缓存/总线 | Redis（按需） | Redis |
-| 监控 | Prometheus + Grafana | 同 |
-| 告警 | Telegram / 钉钉 | 同 |
-| HTTP API | **FastAPI**（Phase 2B+，为前端仪表盘提供 REST） | 同 |
-| 前端 | —（Phase 3 引入 Next.js 仪表盘） | Next.js + shadcn/ui |
+| 层 | 选型 |
+|---|---|
+| 语言 | **Rust**（edition 2024，workspace 多 crate） |
+| 异步 | **tokio**（rt-multi-thread），业务逻辑不引入线程 |
+| 行情 | WebSocket + REST（Hyperliquid） |
+| 时序存储 | **ClickHouse**（`clickhouse` crate）；离线研究用 **DuckDB** |
+| 事务存储 | **Postgres**（sqlx 0.8 原始 SQL + 迁移 `crates/storage/migrations/*.sql`） |
+| 配置 | 分层加载（env > .env > YAML > 默认），`crates/config` |
+| 日志 | **tracing + tracing-subscriber** |
+| 监控 | Prometheus + Grafana |
+| 告警 | Telegram / 钉钉 |
+| HTTP API | **axum 0.8** + tower/tower-http（CORS、request-id、trace），`crates/api` |
+| 前端 | Next.js + shadcn/ui |
 
-### HTTP API 层规划（Phase 2B+）
+### HTTP API 层（axum，已实现）
 
-第二阶段执行引擎完成后，引入 **FastAPI** 作为 HTTP API 层，为前端仪表盘提供数据接口。API 端点定义见 `rules/frontend.md` 的 API 契约小节（12 个端点）。引入时机：ExecutionClient 和 AccountTracker 实现完成后、前端开发开始前。
+HTTP API 由 `crates/api` 的 axum 路由提供（V1 REST + SSE + 行情 WebSocket），为前端仪表盘提供数据接口。API 端点契约见 `rules/frontend.md` 的 API 契约小节与 §17.6。
 
-- **实时推送策略**：账户/持仓/订单数据使用 SSE（Server-Sent Events）推送变更，行情数据前端直连 Hyperliquid WS（跳过后端中转以降低延迟）。低频数据（策略状态、风控面板）使用 SWR 轮询（5s 间隔）。
-- **API 响应格式**：统一 `{ "ok": true, "data": ... }` 或 `{ "ok": false, "error": "..." }`。
-- **认证**：纯内网 `dev`/`testnet` 默认可无鉴权（token 与 Dashboard 凭证留空）；需要时再启用分级 Bearer。
-  `mainnet` 强制 admin token。不引入复杂 OAuth。详见 `docs/deployment.md`。
+- **实时推送策略**：账户/持仓/订单等低频数据使用可靠 SSE（`outbox_events` 事实源，§17.6）；高频行情经后端
+  `/ws/v1/market` 中转（浏览器不直连 Hyperliquid）。低频数据（策略状态、风控面板）使用 SWR 轮询（5s 间隔）。
+- **API 响应格式**：成功统一 `{ "ok": true, "data": ... }`；错误使用 `application/problem+json`（稳定错误码，§17.6）。
+- **认证**：纯内网 `dev`/`testnet` 可无鉴权（token 与 Dashboard 凭证留空）；配置任一 token 后强制 Bearer。
+  `mainnet` 强制 admin token（≥32 字符）。详见 `docs/deployment.md`。
 
 ---
 
@@ -548,7 +551,7 @@ Postgres 关键表：
 - **格式**：结构化 JSON 日志（便于日志分析工具解析），包含时间戳、级别、模块、消息、关联字段（如 `cloid`、`strategy_id`）。
 - **级别**：`DEBUG`（开发）、`INFO`（生产默认）、`WARNING`（风控触发）、`ERROR`（下单失败、连接断开）、`CRITICAL`（kill switch 触发）。
 - **归档**：按天轮转，保留 30 天本地，超期自动清理；关键事件（kill switch、大额亏损）同时写入独立审计日志文件。
-- **使用 Python `structlog`** 或类似库实现。
+- **实现**：Rust `tracing` + `tracing-subscriber`（`crates/app/src/main.rs` 初始化，`EnvFilter` 由 `RUST_LOG`/`HYPE_LOG_LEVEL` 控制）。当前为纯文本 `fmt` 输出，JSON 结构化输出计划中。
 
 ### 16.4 优雅停机
 
@@ -588,7 +591,7 @@ Postgres 关键表：
 - EventBus 只分发事务提交后的领域事件，不作为订单、成交、风控或系统状态的唯一存储。
 - 策略、HTTP API 和运维命令统一通过 `TradingCommandService`，禁止直接访问 Exchange SDK 或
   `ExecutionEngine` 私有状态。
-- 保持 asyncio 单进程模块化单体；高频行情使用进程内快照，关键交易命令使用持久化队列。
+- 保持 **tokio** 单进程模块化单体；高频行情使用进程内快照，关键交易命令使用持久化队列。
 
 ### 17.2 交易链路
 
@@ -660,7 +663,7 @@ NORMAL/CANCEL_ONLY/HALTED -> STOPPING
 游标按账户和流持久化，并用一个时间戳重叠窗口恢复，依赖 inbox 去重，不能仅依赖进程内 checkpoint。
 
 价格、数量、费用、PnL 和 funding 使用 `NUMERIC(38,18)`；所有时间使用 `TIMESTAMPTZ`；schema 只通过
-Alembic 管理，应用启动禁止 `create_all`。
+sqlx migrate（`crates/storage/migrations/*.sql`）管理，应用启动禁止 `create_all`。
 
 ### 17.6 API 与前端实时通道
 
@@ -766,8 +769,8 @@ Alembic 管理，应用启动禁止 `create_all`。
   不得写 Postgres。
 - 新增 `strategy_instances`、活跃账户/币种排他 allocation、版本化强类型做市配置、runtime/session、quote plan/item、
   quote slot、execution command item/action、逐风险所有者 reservation 和地址级 action budget 表；普通 KEEP/NO_QUOTE
-  只写 ClickHouse。schema 仅通过 Alembic
-  expand/backfill/fenced-cutover/contract 演进，迁移期保持唯一写者，所有精确数值使用 `NUMERIC(38,18)`。
+  只写 ClickHouse。schema 仅通过 sqlx migrate（`crates/storage/migrations/*.sql`）演进，迁移期保持唯一写者，
+  所有精确数值使用 `NUMERIC(38,18)`。
 - Postgres ledger/fill/funding/paid-action 是 Accounting PnL 和风控权威；markout 是执行质量诊断，不能重复计入净 PnL，
   ClickHouse PnL 仅是可重建分析投影，不能驱动 Kill Switch。
 - API 重构为多策略实例、版本化配置和 start/pause/resume/drain/stop；mutation 继续强制 RBAC、CSRF、
@@ -783,8 +786,8 @@ Alembic 管理，应用启动禁止 `create_all`。
 - 扩大资金必须同时满足至少 30 个完整 UTC 交易日、预注册独立 inventory episode 和 regime coverage；按交易日/episode
   block bootstrap 的 Accounting net edge 95% 置信区间下界大于 0、边际 `USDC/action >= 1.25`、动态 action/cancel/IP
   reserve 充足、硬库存越限/重复订单/关键对账差异为 0，且 UNKNOWN/orphan 均在 SLA 内有终态。
-- 第一版保持 Python asyncio 单进程。只有 profile 证明 event-loop/CPU/receipt-to-send 成为瓶颈时才按 WS/订单簿、
-  feature/quote、diff/batch、签名热路径顺序迁移 Rust，优先 PyO3，不因“做市”名义提前拆微服务。
+- 当前为全栈 Rust 单进程模块化单体（§10、§20），无 Python 迁移路径。若 profile 证明 event-loop/CPU/receipt-to-send
+  成为瓶颈，在 Rust 内按 WS/订单簿、feature/quote、diff/batch、签名热路径顺序优化，不因“做市”名义提前拆微服务。
 
 ## 19. 多策略控制面与前端创建（2026-07）
 
@@ -805,8 +808,9 @@ Alembic 管理，应用启动禁止 `create_all`。
   归档后也不得复用；重复创建必须原子地返回 `409 STRATEGY_CREATE_CONFLICT`，不能泄露数据库唯一约束异常。
 - 统一策略控制面随完整 V2 `strategy_runner_v2` 链初始化；`market_making_enabled` 只启用做市专用实时执行组件，
   不得成为 trend-follow / funding-arb 控制面的总开关。
-- 实例参数以 Postgres 不可变配置版本为主；YAML 仅环境默认与上限。目标态删除 `app.py` 硬编码单一
-  `TrendFollowStrategy` 与实例级文件 watcher 双主（§15.2）。
+- 实例参数以 Postgres 不可变配置版本为主；YAML 仅环境默认与上限。旧 Python 版 `app.py` 硬编码单一
+  `TrendFollowStrategy` 与实例级文件 watcher 双主已删除（§15.2），策略统一经 `crates/api/src/state.rs`
+  的插件注册接线（§20）。
 - 新增策略类型的边际成本应为一份 plugin + typed 表 + ConfigFields，而不修改 create 壳与 Supervisor 核心。
 
 ## 20. 运行时装配现状（2026-08-10 Rust cutover 后）
@@ -833,5 +837,11 @@ Alembic 管理，应用启动禁止 `create_all`。
    durable SSE broker；`/orders` `/submit_order` `/cancel_order` `/close_position`
    调真实引擎。`from_wiring` 注册真实 trend_follow 插件（6f）。
 
-仍待接线（不在本次审计项内）：funding_arb / market_maker 真实插件（需各自 provider
-adapter）、持久化 outbox→SSE relay 发布任务、`MarketMakerRuntime` 快照方法。
+已接线（2026-08-10，commit 8d1e095）：
+
+- funding_arb / market_maker 真实插件已注册：funding_arb 经 `LiveFundingArbScanner` +
+  `PostgresFundingArbCycleStore`（`crates/trading/src/funding_arb/runtime.rs::build_funding_arb_plugin`）；
+  market_maker 经 provider adapters（inventory/budget/health/funding/quote slots，
+  `crates/trading/src/market_maker/adapters.rs`）。
+- 持久化 outbox→SSE relay 发布任务已接线（`crates/api/src/state.rs`：claim→publish→mark，`sse-relay` 租约）。
+- `MarketMakerRuntime::snapshot()` 已实现并供给 WS provider（`crates/trading/src/market_maker/runtime.rs`）。
